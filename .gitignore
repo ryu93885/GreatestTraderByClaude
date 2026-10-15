@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+GreatestTrader/python/.venv/
+GreatestTrader/python/logs/
+GreatestTrader/python/state/
+GreatestTrader/python/data/
+GreatestTrader/python/backtest_output/

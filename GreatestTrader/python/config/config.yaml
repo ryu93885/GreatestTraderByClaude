@@ -1,0 +1,112 @@
+# =====================================================================
+#  GreatestTrader 設定ファイル (config.yaml)
+#  ※ 文字コード UTF-8 で保存してください。
+#  ※ 記載のない項目はプログラム内の既定値が使われます。
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# MT5 口座 (空欄なら「起動中の MT5 ターミナルにログイン済みの口座」を使用)
+# ---------------------------------------------------------------------
+account:
+  login:                     # 例: 12345678
+  password:                  # 例: "your-password"   (平文保存に注意)
+  server:                    # 例: "ICMarketsSC-Live07"
+  terminal_path:             # 例: "C:/Program Files/MetaTrader 5/terminal64.exe"
+
+# ---------------------------------------------------------------------
+# ブローカー設定
+# ---------------------------------------------------------------------
+broker:
+  symbol_suffix: ""          # 通貨ペア名の接尾辞。例 ".raw" "-STD" "m" (EURUSD.raw など)
+  symbol_map: {}             # 個別に名前が違う場合: {"EURUSD": "EURUSDmicro"}
+  server_time_mode: auto     # auto=自動判定 / ny7=GMT+2(冬)/+3(夏) / fixed=固定オフセット
+  server_gmt_offset: 2.0     # fixed のときのサーバー時間の GMT オフセット(時間)
+  commission_per_lot: 0.0    # 1ロット往復の手数料(口座通貨)。ECN口座は必ず設定 例: 7.0(USD口座) / 1000(JPY口座)
+  deviation_points: 20       # 成行注文の許容スリッページ(ポイント)
+
+# ---------------------------------------------------------------------
+# リスク管理 (最重要)
+#   profile:
+#     conservative … 1取引あたり資産の 0.5% をリスク (目安 月+2%前後)
+#     standard     … 1.0%                           (目安 月+3.5〜5%)
+#     aggressive   … 1.5%  ★月利5%目標              (目安 月+5〜7%, 最大DD 30%前後)
+#     custom       … risk_nr / risk_es を直接指定
+#   ※目安は低コスト口座での過去検証値。将来の成績を保証しません。
+# ---------------------------------------------------------------------
+risk:
+  profile: standard
+  risk_nr: 0.010             # custom 時のみ有効: Night Reversion 1取引のリスク(0.01 = 1%)
+  risk_es: 0.010             # custom 時のみ有効: Euro Session   1取引のリスク
+  max_open_positions: 10     # 同時保有ポジション上限
+  max_positions_per_currency: 4   # 同一通貨を含むポジション数の上限 (例: JPY絡み最大4)
+  dd_scale_full: 0.30        # DD に応じてリスク縮小: 倍率 = max(下限, 1 - DD/0.30)
+  dd_scale_floor: 0.30       # 縮小倍率の下限
+  daily_loss_limit: 0.05     # 当日 -5% で当日の新規停止
+  max_drawdown_halt: 0.40    # 最高資産から -40% で全新規停止 (state/state.json を削除で解除)
+  min_lot_policy: skip       # 計算ロットが最小ロット未満: skip=見送り / min=最小ロットで発注
+
+# ---------------------------------------------------------------------
+# 戦略1: Night Reversion (主力) — 日付変更直後の平均回帰
+# ---------------------------------------------------------------------
+night_reversion:
+  enabled: true
+  symbols: [EURJPY, GBPJPY, USDJPY, GBPUSD, EURGBP, USDCHF, EURUSD,
+            GBPCAD, EURCAD, AUDCAD, GBPCHF, EURAUD, CHFJPY, GBPAUD]
+  bb_period: 15              # ボリンジャーバンド期間 (M15)
+  bb_deviation: 1.8          # ボリンジャーバンド σ
+  atr_period: 14             # ATR 期間 (M15)
+  atr_cost_mult: 2.0         # ATR が取引コストの何倍以上で取引するか (コスト高の口座は 2.5〜3.0 推奨)
+  sl_atr_mult: 3.0           # 損切り = ATR × 3
+  max_hold_bars: 12          # 最大保有 12本 (3時間)
+  entry_hours: [0, 1]        # エントリー判定する足の開始時刻 (マーケット時間 = NY+7)
+  skip_monday: true          # 月曜早朝は取引しない
+  slippage_pips: 0.5         # コスト計算に加えるスリッページ見込み(pips)
+  max_spread_pips: 5.0       # これより広いスプレッドでは取引しない
+  magic: 7101                # マジックナンバー (他EAと重複させない)
+
+# ---------------------------------------------------------------------
+# 戦略2: Euro Session (補助) — 欧州午前のユーロ安
+# ---------------------------------------------------------------------
+euro_session:
+  enabled: true
+  symbol: EURUSD
+  direction: -1              # -1 = 売り
+  entry_utc_hour: 7          # 07:00 UTC にエントリー
+  exit_utc_hour: 13          # 13:00 UTC に決済
+  weekdays: [0, 1, 2, 3, 4]  # 0=月 … 4=金 (UTC)
+  atr_period_h1: 24          # 損切り計算用 ATR(H1)
+  sl_atr_mult: 3.0           # 損切り = ATR(H1) × 3
+  max_spread_pips: 2.0
+  slippage_pips: 0.3
+  magic: 7102
+
+# ---------------------------------------------------------------------
+# 通知 (任意) — 約定・エラー・停止をスマホ等に通知
+# ---------------------------------------------------------------------
+notify:
+  discord_webhook: ""
+  slack_webhook: ""
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+
+# ---------------------------------------------------------------------
+# エンジン
+# ---------------------------------------------------------------------
+engine:
+  dry_run: true              # ★true = 注文を出さずにシグナルのみ記録。本番は false (または --live-orders)
+  poll_seconds: 5            # 監視間隔(秒)
+  state_file: state/state.json
+  log_dir: logs
+  log_level: INFO
+  history_bars: 300
+
+# ---------------------------------------------------------------------
+# Python バックテスト
+# ---------------------------------------------------------------------
+backtest:
+  data_dir: data             # {SYMBOL}_M15.csv を置くフォルダ (python main.py download で作成)
+  start:                     # 例 "2020-01-01" (空欄=データ全期間)
+  end:
+  initial_equity: 10000
+  commission_pips: 0.0       # データのスプレッドに手数料が含まれない場合に加算する往復手数料(pips)
+  output_dir: backtest_output
