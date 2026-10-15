@@ -112,6 +112,10 @@ class LiveEngine:
             log.warning(ev)
             self.notifier.send(ev)
         positions = self.broker.positions(self.magics)
+        if self.risk.flatten_reason and positions:
+            for p in positions:
+                self._close(CloseRequest(p.ticket, p.symbol, self.risk.flatten_reason))
+            positions = self.broker.positions(self.magics)
 
         # ---- Night Reversion: time stops every loop, signals on new M15 bars
         if self.cfg.night_reversion.enabled:
@@ -152,7 +156,7 @@ class LiveEngine:
         self.last_bar[sym] = bar_time
         prep = self.nr.prepare(df)
         row = prep.iloc[-1]
-        bar = {k: float(row[k]) for k in ("close", "mid", "upper", "lower", "atr")}
+        bar = {k: float(row[k]) for k in ("close", "mid", "upper", "lower", "atr", "high", "low")}
         spec = self.broker.symbol_spec(sym)
 
         # manage existing NR position on this symbol (TP -> SMA, time stop)
@@ -211,11 +215,18 @@ class LiveEngine:
             log.info("ES: no entry today (spread %.1fp, ATR %.1fp)", spread_pips, float(a) / spec.pip)
 
     # ------------------------------------------------------------------ execution
+    def _open_risk(self, positions: list[PositionView]) -> list[PositionView]:
+        """Attach the remaining risk (loss to stop, account currency) to each position."""
+        for p in positions:
+            p.risk_amount = 0.0
+            if p.sl and ((p.direction > 0 and p.sl < p.open_price) or (p.direction < 0 and p.sl > p.open_price)):
+                try:
+                    p.risk_amount = self.broker.loss_per_lot(p.symbol, p.direction, p.open_price, p.sl) * p.volume
+                except Exception:  # noqa: BLE001 - be conservative if the broker cannot price it
+                    p.risk_amount = 0.0
+        return positions
+
     def _enter(self, req: EntryRequest, positions: list[PositionView], equity: float) -> None:
-        ok, why = self.risk.can_open(req.strategy, req.symbol, positions, equity)
-        if not ok:
-            log.info("%s %s signal skipped: %s", req.strategy, req.symbol, why)
-            return
         spec = self.broker.symbol_spec(req.symbol)
         tick = self.broker.tick(req.symbol)
         entry = tick.ask if req.direction > 0 else tick.bid
@@ -230,8 +241,13 @@ class LiveEngine:
         if tp is not None and abs(tp - entry) < min_dist:
             log.info("%s %s: TP too close to price (stops level), skip", req.strategy, req.symbol)
             return
-        risk_frac = self.risk.risk_fraction(req.strategy, equity)
+        risk_frac = self.risk.risk_fraction(req.strategy, equity) * self.risk.symbol_mult(req.symbol)
         risk_amount = equity * risk_frac
+        ok, why = self.risk.can_open(req.strategy, req.symbol, self._open_risk(positions), equity, req.direction,
+                                     risk_amount)
+        if not ok:
+            log.info("%s %s signal skipped: %s", req.strategy, req.symbol, why)
+            return
         loss_lot = self.broker.loss_per_lot(req.symbol, req.direction, entry, sl)
         lots = self.risk.lot_size(risk_amount, loss_lot, spec.volume_min, spec.volume_max, spec.volume_step)
         side = "BUY" if req.direction > 0 else "SELL"

@@ -91,27 +91,33 @@ class BacktestResult:
     period_start: pd.Timestamp | None = None  # first bar of the backtest window (server time)
     period_end: pd.Timestamp | None = None  # last bar of the backtest window (server time)
     max_drawdown_mtm: float | None = None  # drawdown incl. floating P/L at every bar close
+    mtm: pd.Series | None = None  # mark-to-market equity at every bar close
 
     # -------------------------------------------------------------- periods
     def _bounds(self) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+        """(first bar OPEN time, last bar CLOSE time) of the window."""
         e = self.equity
         if self.period_start is None and len(e) == 0:
             return None
-        first = pd.Timestamp(self.period_start) if self.period_start is not None else e.index[0]
-        last = pd.Timestamp(self.period_end) if self.period_end is not None else e.index[-1]
+        first = pd.Timestamp(self.period_start) if self.period_start is not None else e.index[0] - _BAR
+        if self.period_end is not None:
+            last = pd.Timestamp(self.period_end)
+        else:
+            last = e.index[-1] if len(e) else first
         if len(e):
-            first, last = min(first, e.index[0]), max(last, e.index[-1])
+            first, last = min(first, e.index[0] - _BAR), max(last, e.index[-1])
         return first, last
 
     def month_end_equity(self) -> pd.Series:
         """Realized equity at the end of every calendar month; the first row is the month BEFORE
-        the first month and holds the initial equity."""
+        the first month and holds the initial equity. Equity is stamped at the exit-bar CLOSE, so a
+        trade closed on the last bar of a month (close = 00:00 of the 1st) belongs to that month."""
         b = self._bounds()
         if b is None:
             return pd.Series(dtype=float)
-        months = pd.period_range(b[0].to_period("M") - 1, b[1].to_period("M"), freq="M")
+        months = pd.period_range(b[0].to_period("M") - 1, _close_month(b[1]), freq="M")
         e = self.equity
-        me = e.groupby(e.index.to_period("M")).last() if len(e) else pd.Series(dtype=float)
+        me = e.groupby(_close_month(e.index)).last() if len(e) else pd.Series(dtype=float)
         me = me.reindex(months)
         me.iloc[0] = self.initial_equity
         me = me.ffill()
@@ -119,17 +125,18 @@ class BacktestResult:
         return me.astype(float)
 
     def partial_months(self) -> list[pd.Period]:
-        """First/last month of the window if the data does not cover all its business days."""
+        """First/last month of the window if the data does not cover all its business days
+        (fixed FX holidays Jan 1 and Dec 25 are ignored)."""
         b = self._bounds()
         if b is None:
             return []
         out = []
         first, last = b
-        m0, m1 = first.to_period("M"), last.to_period("M")
-        if len(pd.bdate_range(m0.start_time, first.normalize() - pd.Timedelta(days=1))) > 0:
+        m0, m1 = first.to_period("M"), _close_month(last)
+        if _business_days(m0.start_time, first.normalize() - pd.Timedelta(days=1)) > 0:
             out.append(m0)
-        if len(pd.bdate_range(last.normalize() + pd.Timedelta(days=1), m1.end_time.normalize())) > 0 \
-                and m1 not in out:
+        last_day = (last - _EPS).normalize()
+        if _business_days(last_day + pd.Timedelta(days=1), m1.end_time.normalize()) > 0 and m1 not in out:
             out.append(m1)
         return out
 
@@ -161,30 +168,37 @@ class BacktestResult:
         if len(t) == 0 or len(e) == 0:
             return {"trades": 0}
         m_all = self.monthly_returns()
-        partial = {p.to_timestamp(how="end").normalize() for p in self.partial_months()}
+        partial_p = self.partial_months()
+        partial = {p.to_timestamp(how="end").normalize() for p in partial_p}
         m = m_all[~m_all.index.isin(partial)]  # distribution stats on complete months only
-        full = pd.concat([pd.Series([self.initial_equity], index=[e.index[0] - pd.Timedelta(seconds=1)]), e])
+        full = pd.concat([pd.Series([self.initial_equity], index=[e.index[0] - _EPS]), e])
         dd = (full / full.cummax() - 1).min()
         first, last = self._bounds()
-        years = max((last - first).total_seconds() / (365.25 * 86400), 1e-9)
+        years = (last - first).total_seconds() / (365.25 * 86400)
         final = float(e.iloc[-1])
-        cagr = (final / self.initial_equity) ** (1 / years) - 1
+        ratio = final / self.initial_equity
+        if years < 1 / 365 or ratio <= 0:
+            cagr = float("nan")
+        else:
+            cagr = float(np.power(np.float64(ratio), 1.0 / years) - 1)
+        exit_month = pd.to_datetime(t.exit_time).dt.to_period("M")
+        complete_trades = int((~exit_month.isin(partial_p)).sum())
         wins, losses = t.pnl[t.pnl > 0].sum(), -t.pnl[t.pnl < 0].sum()
         out = {
-            "period": f"{first:%Y-%m-%d} - {last:%Y-%m-%d}",
+            "period": f"{first:%Y-%m-%d} - {(last - _EPS):%Y-%m-%d}",
             "trades": int(len(t)),
             "months": int(len(m_all)),
             "complete_months": int(len(m)),
-            "trades_per_month": len(t) / max(len(m_all), 1),
+            "trades_per_month": complete_trades / len(m) if len(m) else float("nan"),
             "win_rate": float((t.R > 0).mean()),
             "avg_R": float(t.R.mean()),
             "profit_factor": float(wins / losses) if losses > 0 else float("inf"),
             "final_equity": final,
-            "total_return": float(final / self.initial_equity - 1),
-            "CAGR": float(cagr),
-            "monthly_compound": float((1 + cagr) ** (1 / 12) - 1),
+            "total_return": float(ratio - 1),
+            "CAGR": cagr,
+            "monthly_compound": float(np.power(1 + cagr, 1 / 12) - 1) if np.isfinite(cagr) else float("nan"),
             "monthly_mean": float(m.mean()),
-            "monthly_geometric": float(np.prod(1 + m.to_numpy()) ** (1 / len(m)) - 1) if len(m) else float("nan"),
+            "monthly_geometric": _geo_mean(m.to_numpy()),
             "monthly_median": float(m.median()),
             "monthly_std": float(m.std()),
             "best_month": float(m.max()),
@@ -196,6 +210,31 @@ class BacktestResult:
         if self.max_drawdown_mtm is not None:
             out["max_drawdown_mtm"] = float(min(self.max_drawdown_mtm, dd))
         return out
+
+
+_BAR = pd.Timedelta(minutes=15)
+_EPS = pd.Timedelta(seconds=1)
+_FX_HOLIDAYS = {(1, 1), (12, 25)}
+
+
+def _close_month(ts):
+    """Calendar month of a bar-CLOSE timestamp (a close at 00:00 of the 1st belongs to the previous month)."""
+    if isinstance(ts, pd.DatetimeIndex):
+        return (ts - _EPS).to_period("M")
+    return (pd.Timestamp(ts) - _EPS).to_period("M")
+
+
+def _geo_mean(r: np.ndarray) -> float:
+    if len(r) == 0:
+        return float("nan")
+    prod = float(np.prod(1 + r))
+    return prod ** (1 / len(r)) - 1 if prod > 0 else float("nan")
+
+
+def _business_days(a: pd.Timestamp, b: pd.Timestamp) -> int:
+    if a > b:
+        return 0
+    return sum(1 for d in pd.bdate_range(a, b) if (d.month, d.day) not in _FX_HOLIDAYS)
 
 
 # ---------------------------------------------------------------- engine
@@ -255,7 +294,7 @@ class Backtester:
                 hrs = np.asarray(mkt.hour)
                 cand = np.where(np.isin(hrs, cfg.night_reversion.entry_hours)
                                 & ((df.close > df.upper) | (df.close < df.lower)).to_numpy())[0]
-                cols = ("close", "mid", "upper", "lower", "atr")
+                cols = ("close", "mid", "upper", "lower", "atr", "high", "low")
                 arrs = {k: df[k].to_numpy(float) for k in cols}
                 for i in cand:
                     if i + 1 >= len(df):
@@ -319,23 +358,22 @@ class Backtester:
         n_ent = len(entries)
         ticket = 0
         nr_cfg, es_cfg = cfg.night_reversion, cfg.euro_session
-        last_day = None
         mtm_peak, mtm_dd = equity, 0.0
+        mtm_arr = np.empty(len(timeline))
+        last_mtm = equity
 
         for ti, t in enumerate(timeline):
             day = tl_mkt[ti].date()
-            if day != last_day:
-                risk.update_equity(equity, day)
-                last_day = day
             # 1) entries at this bar open
             while ent_ptr < n_ent and entries[ent_ptr][0] < t:
                 ent_ptr += 1
             while ent_ptr < n_ent and entries[ent_ptr][0] == t:
                 _, _, strat, s, j, req = entries[ent_ptr]
                 ent_ptr += 1
-                views = [PositionView(p.ticket, p.strategy, p.sym, p.dir, 1.0, p.entry, p.entry_time, p.sl, None)
-                         for p in open_pos]
-                ok, _why = risk.can_open(strat, s, views, equity)
+                views = [PositionView(p.ticket, p.strategy, p.sym, p.dir, 1.0, p.entry, p.entry_time, p.sl, None,
+                                      risk_amount=p.risk_amt) for p in open_pos]
+                rfrac = risk.risk_fraction(strat, last_mtm) * risk.symbol_mult(s)
+                ok, _why = risk.can_open(strat, s, views, last_mtm, req.direction, equity * rfrac)
                 if not ok:
                     continue
                 d = sym_data[s]
@@ -347,7 +385,7 @@ class Backtester:
                 p.ticket, p.strategy, p.sym, p.dir, p.j = ticket, strat, s, req.direction, j
                 p.entry, p.sl_dist = entry, req.sl_distance
                 p.sl = entry - req.direction * req.sl_distance
-                p.risk_amt = equity * risk.risk_fraction(strat, equity)
+                p.risk_amt = equity * rfrac
                 slip = nr_cfg.slippage_pips if strat == "NR" else es_cfg.slippage_pips
                 sig_i = j - 1 if strat == "NR" else j
                 p.cost = (d["spr"][sig_i] + slip) * d["pip"]
@@ -403,7 +441,6 @@ class Backtester:
                                    exitp, p.sl_dist / p.pip, p.cost / p.pip, R, pnl, equity, why))
                     eq_t.append(exit_time + pd.Timedelta(minutes=15))
                     eq_v.append(equity)
-                    risk.update_equity(equity, day)
                 open_pos = still
 
             # 3) mark-to-market equity at this bar close (for the floating drawdown)
@@ -417,6 +454,24 @@ class Backtester:
                 mtm = equity + fl
             else:
                 mtm = equity
+            # 4) portfolio guards on mark-to-market equity (hard stops close everything at this bar close)
+            risk.update_equity(mtm, day)
+            if risk.flatten_reason and open_pos:
+                why = "month stop" if "month" in risk.flatten_reason else "day stop"
+                for p in open_pos:
+                    exitp = p.last_c
+                    move = p.dir * (exitp - p.entry) - p.cost
+                    R = move / p.sl_dist
+                    pnl = p.risk_amt * R
+                    equity += pnl
+                    trades.append((p.strategy, p.sym, p.dir, p.entry_time, t.to_pydatetime(), p.entry, exitp,
+                                   p.sl_dist / p.pip, p.cost / p.pip, R, pnl, equity, why))
+                    eq_t.append(t + pd.Timedelta(minutes=15))
+                    eq_v.append(equity)
+                open_pos = []
+                mtm = equity
+            last_mtm = mtm
+            mtm_arr[ti] = mtm
             if mtm > mtm_peak:
                 mtm_peak = mtm
             elif mtm / mtm_peak - 1 < mtm_dd:
@@ -427,6 +482,10 @@ class Backtester:
         tr = pd.DataFrame(trades, columns=cols)
         eq = pd.Series(eq_v, index=pd.DatetimeIndex(eq_t), name="equity")
         eq = eq.groupby(level=0).last()
-        period_start = pd.Timestamp(cfg.backtest.start) if cfg.backtest.start else timeline[0]
+        # the window starts at the requested start unless the data begins clearly later (> 4 days)
+        period_start = timeline[0]
+        if cfg.backtest.start and timeline[0] - pd.Timestamp(cfg.backtest.start) <= pd.Timedelta(days=4):
+            period_start = pd.Timestamp(cfg.backtest.start)
         return BacktestResult(tr, eq, cfg.backtest.initial_equity, period_start=period_start,
-                              period_end=timeline[-1], max_drawdown_mtm=mtm_dd)
+                              period_end=timeline[-1] + pd.Timedelta(minutes=15), max_drawdown_mtm=mtm_dd,
+                              mtm=pd.Series(mtm_arr, index=timeline + pd.Timedelta(minutes=15), name="mtm"))

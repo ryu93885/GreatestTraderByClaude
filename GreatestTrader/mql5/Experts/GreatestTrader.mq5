@@ -7,7 +7,7 @@
 //|   Logic is identical to the Python production engine.            |
 //+------------------------------------------------------------------+
 #property copyright   "GreatestTrader"
-#property version     "1.00"
+#property version     "1.10"
 #property description "Night Reversion (14 crosses, 00:00-02:00 market time) + Euro Session (EURUSD 07-13 UTC)."
 #property description "Attach to ONE chart (any symbol, any timeframe). The EA trades all configured symbols."
 
@@ -40,6 +40,18 @@ input double       InpDDScaleFloor     = 0.30;  // DD scaling: minimum multiplie
 input double       InpDailyLossLimit   = 5.0;   // Daily loss limit (% of day-start equity)
 input double       InpMaxDDHalt        = 40.0;  // Halt new entries at this DD (%) from peak
 input bool         InpUseMinLot        = false; // Use min lot when calculated lot is smaller
+input double       InpMaxTotalRisk     = 0.0;   // Max total open risk (% of equity, 0 = off)
+input int          InpMaxSameDirPerCcy = 0;     // Max same-direction positions per currency (0 = off)
+input double       InpDailyHardStop    = 0.0;   // Daily hard stop: close all at this loss (%, 0 = off)
+input double       InpMonthlyLossLimit = 0.0;   // Monthly loss limit: no new entries (%, 0 = off)
+input double       InpMonthlyHardStop  = 0.0;   // Monthly hard stop: close all at this loss (%, 0 = off)
+input string       InpSymbolRiskMult   = "";    // Per-symbol risk multipliers, e.g. EURUSD:0.5,EURJPY:0.5
+input double       InpVolTargetDaily   = 0.0;   // Volatility target, daily equity vol (%, 0 = off)
+input int          InpVolLookbackDays  = 20;    // Volatility target lookback (days)
+input double       InpVolMultMin       = 0.25;  // Volatility target min multiplier
+input double       InpVolMultMax       = 1.5;   // Volatility target max multiplier
+input int          InpEqFilterDays     = 0;     // Equity-curve filter SMA (days, 0 = off)
+input double       InpEqFilterMult     = 0.5;   // Equity-curve filter multiplier below SMA
 
 input group "=== Broker ==="
 input string              InpSymbolSuffix     = "";             // Symbol suffix (e.g. .raw  -STD  m)
@@ -62,6 +74,8 @@ input int    InpEntryHour2      = 1;     // Entry hour 2 (-1 = off)
 input bool   InpSkipMonday      = true;  // Skip Monday
 input double InpNRSlippagePips  = 0.5;   // Slippage allowance in cost filter (pips)
 input double InpNRMaxSpreadPips = 5.0;   // Max spread (pips)
+input double InpMaxBandZ        = 0.0;   // News filter: skip if |close-mid| > this x stdev (0 = off)
+input double InpMaxBarRangeATR  = 0.0;   // News filter: skip if bar range > this x ATR (0 = off)
 input long   InpNRMagic         = 7101;  // Magic number NR
 
 input group "=== Strategy 2: Euro Session ==="
@@ -95,6 +109,17 @@ bool     g_halted = false;
 datetime g_lastESDay = 0;
 string   g_gvPrefix = "";
 bool     g_tester = false;
+datetime g_month = 0;            // market-time month start
+double   g_monthStartEq = 0.0;
+bool     g_monthHalted = false;
+bool     g_dayHalted = false;
+double   g_dailyEq[];            // closing equity of past market days (oldest first)
+double   g_lastEq = 0.0;
+double   g_adaptMult = 1.0;
+bool     g_flatten = false;      // set when a hard stop requires closing all positions
+string   g_flattenReason = "";
+string   g_multSym[];
+double   g_multVal[];
 
 //+------------------------------------------------------------------+
 //| Time utilities (US DST rules, identical to Python timeutil.py)    |
@@ -217,6 +242,15 @@ void SaveState()
    GlobalVariableSet(g_gvPrefix + "dayeq", g_dayStartEq);
    GlobalVariableSet(g_gvPrefix + "halt", g_halted ? 1.0 : 0.0);
    GlobalVariableSet(g_gvPrefix + "esday", (double)g_lastESDay);
+   GlobalVariableSet(g_gvPrefix + "month", (double)g_month);
+   GlobalVariableSet(g_gvPrefix + "montheq", g_monthStartEq);
+   GlobalVariableSet(g_gvPrefix + "monthhalt", g_monthHalted ? 1.0 : 0.0);
+   GlobalVariableSet(g_gvPrefix + "dayhalt", g_dayHalted ? 1.0 : 0.0);
+   GlobalVariableSet(g_gvPrefix + "lasteq", g_lastEq);
+   int n = ArraySize(g_dailyEq);
+   GlobalVariableSet(g_gvPrefix + "deqn", (double)n);
+   for(int i = 0; i < n; i++)
+      GlobalVariableSet(g_gvPrefix + "deq" + IntegerToString(i), g_dailyEq[i]);
   }
 
 void LoadState()
@@ -231,6 +265,31 @@ void LoadState()
       g_halted = (GlobalVariableGet(g_gvPrefix + "halt") > 0.5);
    if(GlobalVariableCheck(g_gvPrefix + "esday"))
       g_lastESDay = (datetime)GlobalVariableGet(g_gvPrefix + "esday");
+   if(GlobalVariableCheck(g_gvPrefix + "month"))
+      g_month = (datetime)GlobalVariableGet(g_gvPrefix + "month");
+   if(GlobalVariableCheck(g_gvPrefix + "montheq"))
+      g_monthStartEq = GlobalVariableGet(g_gvPrefix + "montheq");
+   if(GlobalVariableCheck(g_gvPrefix + "monthhalt"))
+      g_monthHalted = (GlobalVariableGet(g_gvPrefix + "monthhalt") > 0.5);
+   if(GlobalVariableCheck(g_gvPrefix + "dayhalt"))
+      g_dayHalted = (GlobalVariableGet(g_gvPrefix + "dayhalt") > 0.5);
+   if(GlobalVariableCheck(g_gvPrefix + "lasteq"))
+      g_lastEq = GlobalVariableGet(g_gvPrefix + "lasteq");
+   if(GlobalVariableCheck(g_gvPrefix + "deqn"))
+     {
+      int n = (int)GlobalVariableGet(g_gvPrefix + "deqn");
+      ArrayResize(g_dailyEq, 0);
+      for(int i = 0; i < n; i++)
+        {
+         string name = g_gvPrefix + "deq" + IntegerToString(i);
+         if(!GlobalVariableCheck(name))
+            break;
+         int k = ArraySize(g_dailyEq);
+         ArrayResize(g_dailyEq, k + 1);
+         g_dailyEq[k] = GlobalVariableGet(name);
+        }
+     }
+   g_adaptMult = AdaptiveMult();
   }
 
 double BaseRisk(const bool isNR)
@@ -260,18 +319,100 @@ double RiskFraction(const bool isNR, const double eq)
    double mult = 1.0;
    if(InpDDScaleFull > 0.0)
       mult = MathMax(InpDDScaleFloor, 1.0 - Drawdown(eq) / (InpDDScaleFull / 100.0));
-   return BaseRisk(isNR) * mult;
+   return BaseRisk(isNR) * mult * g_adaptMult;
+  }
+
+// volatility-target and equity-curve multipliers (identical to Python RiskManager)
+double AdaptiveMult()
+  {
+   double mult = 1.0;
+   int n = ArraySize(g_dailyEq);
+   int minDays = (InpVolLookbackDays / 2 > 5) ? InpVolLookbackDays / 2 : 5;
+   if(InpVolTargetDaily > 0.0 && n >= minDays)
+     {
+      int first = (int)MathMax(0, n - (InpVolLookbackDays + 1));
+      double rets[];
+      int m = 0;
+      for(int i = first + 1; i < n; i++)
+        {
+         if(g_dailyEq[i - 1] <= 0.0)
+            continue;
+         ArrayResize(rets, m + 1);
+         rets[m] = g_dailyEq[i] / g_dailyEq[i - 1] - 1.0;
+         m++;
+        }
+      if(m >= 2)
+        {
+         double mu = 0.0;
+         for(int i = 0; i < m; i++)
+            mu += rets[i];
+         mu /= m;
+         double var = 0.0;
+         for(int i = 0; i < m; i++)
+            var += (rets[i] - mu) * (rets[i] - mu);
+         double sd = MathSqrt(var / (m - 1));
+         if(sd > 0.0)
+            mult *= MathMin(InpVolMultMax, MathMax(InpVolMultMin, (InpVolTargetDaily / 100.0) / sd));
+        }
+     }
+   if(InpEqFilterDays > 0 && n >= InpEqFilterDays)
+     {
+      double sum = 0.0;
+      for(int i = n - InpEqFilterDays; i < n; i++)
+         sum += g_dailyEq[i];
+      if(g_dailyEq[n - 1] < sum / InpEqFilterDays)
+         mult *= InpEqFilterMult;
+     }
+   return mult;
+  }
+
+datetime MonthStart(const datetime t)
+  {
+   MqlDateTime s;
+   TimeToStruct(t, s);
+   return MakeDate(s.year, s.mon, 1);
   }
 
 void UpdateEquityState(const double eq, const datetime nowSrv)
   {
+   g_flatten = false;
+   g_flattenReason = "";
    if(eq > g_peak)
       g_peak = eq;
-   datetime mday = DayStart(ServerToMarket(nowSrv));
+   datetime mkt = ServerToMarket(nowSrv);
+   datetime mday = DayStart(mkt);
    if(mday != g_day)
      {
+      if(g_day != 0 && g_lastEq > 0.0)
+        {
+         int n = ArraySize(g_dailyEq);
+         ArrayResize(g_dailyEq, n + 1);
+         g_dailyEq[n] = g_lastEq;
+         int keep = ((InpVolLookbackDays > InpEqFilterDays) ? InpVolLookbackDays : InpEqFilterDays) + 2;
+         int sz = ArraySize(g_dailyEq);
+         if(sz > keep)
+           {
+            double tmp[];
+            ArrayResize(tmp, keep);
+            for(int i = 0; i < keep; i++)
+               tmp[i] = g_dailyEq[sz - keep + i];
+            ArrayResize(g_dailyEq, keep);
+            for(int i = 0; i < keep; i++)
+               g_dailyEq[i] = tmp[i];
+           }
+        }
       g_day = mday;
       g_dayStartEq = eq;
+      g_dayHalted = false;
+      g_adaptMult = AdaptiveMult();
+     }
+   g_lastEq = eq;
+   datetime mmon = MonthStart(mkt);
+   if(mmon != g_month)
+     {
+      g_month = mmon;
+      g_monthStartEq = eq;
+      g_monthHalted = false;
      }
    double dd = Drawdown(eq);
    if(!g_halted && InpMaxDDHalt > 0.0 && dd * 100.0 >= InpMaxDDHalt)
@@ -279,6 +420,67 @@ void UpdateEquityState(const double eq, const datetime nowSrv)
       g_halted = true;
       Log(StringFormat("HALT: drawdown %.1f%% reached. New entries stopped. Delete global variables %s* to reset.",
                        dd * 100.0, g_gvPrefix), true);
+     }
+   if(InpMonthlyHardStop > 0.0 && !g_monthHalted && g_monthStartEq > 0.0 &&
+      eq <= g_monthStartEq * (1.0 - InpMonthlyHardStop / 100.0))
+     {
+      g_monthHalted = true;
+      g_flatten = true;
+      g_flattenReason = StringFormat("monthly hard stop %.1f%%", InpMonthlyHardStop);
+      Log("MONTH STOP: " + g_flattenReason, true);
+     }
+   if(InpDailyHardStop > 0.0 && !g_dayHalted && g_dayStartEq > 0.0 &&
+      eq <= g_dayStartEq * (1.0 - InpDailyHardStop / 100.0))
+     {
+      g_dayHalted = true;
+      g_flatten = true;
+      if(g_flattenReason == "")
+         g_flattenReason = StringFormat("daily hard stop %.1f%%", InpDailyHardStop);
+      Log(StringFormat("DAY STOP: daily hard stop %.1f%%", InpDailyHardStop), true);
+     }
+  }
+
+double SymbolMult(const string sym)
+  {
+   string b = BaseOf(sym);
+   for(int i = 0; i < ArraySize(g_multSym); i++)
+      if(g_multSym[i] == b)
+         return g_multVal[i];
+   return 1.0;
+  }
+
+void ParseSymbolMult()
+  {
+   ArrayResize(g_multSym, 0);
+   ArrayResize(g_multVal, 0);
+   string items[];
+   int n = StringSplit(InpSymbolRiskMult, ',', items);
+   for(int i = 0; i < n; i++)
+     {
+      string kv[];
+      if(StringSplit(items[i], ':', kv) != 2)
+         continue;
+      string k = kv[0];
+      StringTrimLeft(k);
+      StringTrimRight(k);
+      StringToUpper(k);
+      int m = ArraySize(g_multSym);
+      ArrayResize(g_multSym, m + 1);
+      ArrayResize(g_multVal, m + 1);
+      g_multSym[m] = k;
+      g_multVal[m] = StringToDouble(kv[1]);
+     }
+  }
+
+void CloseAllOurs(const string reason)
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0)
+         continue;
+      if(IsOurMagic(PositionGetInteger(POSITION_MAGIC)))
+         ClosePos(tk, reason);
      }
   }
 
@@ -354,16 +556,74 @@ bool HasESPosition()
    return false;
   }
 
-bool CanOpen(const string sym, const double eq, string &why)
+double OpenRiskTotal()
+  {
+   double total = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0)
+         continue;
+      if(!IsOurMagic(PositionGetInteger(POSITION_MAGIC)))
+         continue;
+      int dir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
+      double op = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl = PositionGetDouble(POSITION_SL);
+      if(sl <= 0.0 || (dir > 0 && sl >= op) || (dir < 0 && sl <= op))
+         continue;
+      double l = LossPerLot(PositionGetString(POSITION_SYMBOL), dir, op, sl);
+      if(l > 0.0)
+         total += l * PositionGetDouble(POSITION_VOLUME);
+     }
+   return total;
+  }
+
+// number of open positions that are long (sign=+1) or short (sign=-1) the currency ccy
+int CountCurrencyDir(const string ccy, const int sign)
+  {
+   int n = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0)
+         continue;
+      if(!IsOurMagic(PositionGetInteger(POSITION_MAGIC)))
+         continue;
+      int dir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
+      string b = BaseOf(PositionGetString(POSITION_SYMBOL));
+      if(StringSubstr(b, 0, 3) == ccy && dir == sign)
+         n++;
+      if(StringSubstr(b, 3, 3) == ccy && -dir == sign)
+         n++;
+     }
+   return n;
+  }
+
+bool CanOpen(const string sym, const double eq, const int dir, const double newRisk, string &why)
   {
    if(g_halted)
      {
       why = "halted (max drawdown)";
       return false;
      }
+   if(g_monthHalted)
+     {
+      why = "monthly stop";
+      return false;
+     }
+   if(g_dayHalted)
+     {
+      why = "daily stop";
+      return false;
+     }
    if(DailyLimitHit(eq))
      {
       why = "daily loss limit";
+      return false;
+     }
+   if(InpMonthlyLossLimit > 0.0 && g_monthStartEq > 0.0 && eq <= g_monthStartEq * (1.0 - InpMonthlyLossLimit / 100.0))
+     {
+      why = "monthly loss limit";
       return false;
      }
    if(CountOurPositions() >= InpMaxOpen)
@@ -380,6 +640,18 @@ bool CanOpen(const string sym, const double eq, string &why)
    if(CountCurrency(StringSubstr(b, 0, 3)) >= InpMaxPerCurrency || CountCurrency(StringSubstr(b, 3, 3)) >= InpMaxPerCurrency)
      {
       why = "max positions per currency";
+      return false;
+     }
+   if(InpMaxSameDirPerCcy > 0 && dir != 0 &&
+      (CountCurrencyDir(StringSubstr(b, 0, 3), dir) >= InpMaxSameDirPerCcy ||
+       CountCurrencyDir(StringSubstr(b, 3, 3), -dir) >= InpMaxSameDirPerCcy))
+     {
+      why = "max same-direction positions per currency";
+      return false;
+     }
+   if(InpMaxTotalRisk > 0.0 && eq > 0.0 && (OpenRiskTotal() + newRisk) / eq > InpMaxTotalRisk / 100.0 + 1e-12)
+     {
+      why = "max total open risk";
       return false;
      }
    why = "";
@@ -620,6 +892,11 @@ void NREntry(const string sym, const MqlRates &bar, const double mid, const doub
    double cost = spread + CommissionPips(sym, tick.ask) + InpNRSlippagePips;
    if(atrv / pip < InpATRCostMult * cost)
       return;
+   double sd = (InpBBDev > 0.0) ? (upper - mid) / InpBBDev : 0.0;
+   if(InpMaxBandZ > 0.0 && sd > 0.0 && MathAbs(bar.close - mid) > InpMaxBandZ * sd)
+      return;
+   if(InpMaxBarRangeATR > 0.0 && (bar.high - bar.low) > InpMaxBarRangeATR * atrv)
+      return;
    int dir = 0;
    if(bar.close > upper)
       dir = -1;
@@ -628,13 +905,6 @@ void NREntry(const string sym, const MqlRates &bar, const double mid, const doub
          dir = 1;
    if(dir == 0)
       return;
-   string why;
-   if(!CanOpen(sym, eq, why))
-     {
-      if(InpVerbose)
-         Log(StringFormat("NR %s signal skipped: %s", sym, why));
-      return;
-     }
    int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
    double point = SymbolInfoDouble(sym, SYMBOL_POINT);
    long stops = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
@@ -646,7 +916,14 @@ void NREntry(const string sym, const MqlRates &bar, const double mid, const doub
    tp = NormalizeDouble(tp, digits);
    if(MathAbs(tp - entry) < (stops + 2) * point)
       return;
-   double rf = RiskFraction(true, eq);
+   double rf = RiskFraction(true, eq) * SymbolMult(sym);
+   string why;
+   if(!CanOpen(sym, eq, dir, eq * rf, why))
+     {
+      if(InpVerbose)
+         Log(StringFormat("NR %s signal skipped: %s", sym, why));
+      return;
+     }
    double lossLot = LossPerLot(sym, dir, entry, sl);
    double lots = CalcLots(sym, eq * rf, lossLot);
    if(lots <= 0.0)
@@ -739,17 +1016,17 @@ void ProcessES(const datetime nowSrv, const double eq)
       Log(StringFormat("ES: no entry today (spread %.1fp, ATR %.1fp)", spread, a / pip));
       return;
      }
-   string why;
-   if(!CanOpen(g_esSym, eq, why))
-     {
-      Log("ES signal skipped: " + why);
-      return;
-     }
    int dir = (InpESDirection >= 0) ? 1 : -1;
    int digits = (int)SymbolInfoInteger(g_esSym, SYMBOL_DIGITS);
    double entry = (dir > 0) ? tick.ask : tick.bid;
    double sl = NormalizeDouble(entry - dir * InpESSLATRMult * a, digits);
-   double rf = RiskFraction(false, eq);
+   double rf = RiskFraction(false, eq) * SymbolMult(g_esSym);
+   string why;
+   if(!CanOpen(g_esSym, eq, dir, eq * rf, why))
+     {
+      Log("ES signal skipped: " + why);
+      return;
+     }
    double lots = CalcLots(g_esSym, eq * rf, LossPerLot(g_esSym, dir, entry, sl));
    if(lots <= 0.0)
      {
@@ -779,6 +1056,8 @@ void ProcessAll()
       return;
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    UpdateEquityState(eq, nowSrv);
+   if(g_flatten)
+      CloseAllOurs(g_flattenReason);
    if(InpNREnabled && g_nsym > 0)
       ProcessNR(nowSrv, eq);
    if(InpESEnabled && g_esOk)
@@ -806,6 +1085,8 @@ int OnInit()
       Print("[GT] custom risk must be between 0 and 5 percent");
       return INIT_PARAMETERS_INCORRECT;
      }
+
+   ParseSymbolMult();
 
    // symbols
    string parts[];

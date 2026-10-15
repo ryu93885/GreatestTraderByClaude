@@ -72,3 +72,38 @@ def test_empty_result_does_not_crash(tmp_path):
     assert len(r.monthly_returns()) == 0
     assert yearly_table(r).empty
     save_report(r, tmp_path)
+
+
+def test_first_month_partial_and_holiday():
+    mid = _result([("2020-01-20 10:30", 10100.0), ("2020-02-03 10:30", 10200.0)],
+                  start=pd.Timestamp("2020-01-15"), end=pd.Timestamp("2020-02-29"))
+    assert [str(p) for p in mid.partial_months()] == ["2020-01"]
+    # a window starting on Jan 2 after the New Year holiday is a COMPLETE month
+    hol = _result([("2007-01-03 10:30", 10100.0), ("2007-02-01 10:30", 10200.0)],
+                  start=pd.Timestamp("2007-01-02 03:00"), end=pd.Timestamp("2007-02-28 23:59"))
+    assert hol.partial_months() == []
+
+
+def test_exit_on_last_bar_of_month_stays_in_that_month():
+    # last trade closes on the 23:45 bar of Apr 30 (equity stamped at its close = May 1 00:00)
+    r = _result([("2021-03-10 10:30", 11000.0), ("2021-05-01 00:00", 13310.0)],
+                start=pd.Timestamp("2021-03-01"), end=pd.Timestamp("2021-05-01 00:00"))
+    m = r.monthly_returns()
+    assert list(m.index.strftime("%Y-%m")) == ["2021-03", "2021-04"]
+    assert np.allclose(m.values, [0.10, 0.21]) and r.partial_months() == []
+
+
+def test_two_partial_months_in_one_year_are_both_noted():
+    r = _result([("2022-01-20 10:30", 10100.0), ("2022-03-02 10:30", 10200.0)],
+                start=pd.Timestamp("2022-01-17"), end=pd.Timestamp("2022-03-05 00:00"))
+    assert annual_table(r).loc[2022, "備考"] == "部分期間（1月・3月は一部のみ）"
+
+
+def test_degenerate_inputs_do_not_raise():
+    short = _result([("2020-01-02 10:30", 20000.0)], start=pd.Timestamp("2020-01-02 10:00"),
+                    end=pd.Timestamp("2020-01-02 10:30"))
+    assert np.isnan(short.stats()["CAGR"])
+    neg = _result([("2020-01-10", -500.0)], start=pd.Timestamp("2020-01-01"), end=pd.Timestamp("2020-12-31"))
+    assert np.isnan(neg.stats()["CAGR"])
+    empty = BacktestResult(pd.DataFrame(), pd.Series(dtype=float), 10000.0, period_start=pd.Timestamp("2020-01-01"))
+    assert len(empty.monthly_returns()) == 0

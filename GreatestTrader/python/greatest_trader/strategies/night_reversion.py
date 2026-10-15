@@ -76,6 +76,11 @@ class NightReversion:
         if a / pip < c.atr_cost_mult * cost_pips:
             return None
         close = bar["close"]
+        sd = (bar["upper"] - bar["mid"]) / c.bb_deviation if c.bb_deviation > 0 else 0.0
+        if c.max_band_z > 0 and sd > 0 and abs(close - bar["mid"]) > c.max_band_z * sd:
+            return None
+        if c.max_bar_range_atr > 0 and "high" in bar and (bar["high"] - bar["low"]) > c.max_bar_range_atr * a:
+            return None
         if close > bar["upper"]:
             direction = -1
         elif close < bar["lower"]:

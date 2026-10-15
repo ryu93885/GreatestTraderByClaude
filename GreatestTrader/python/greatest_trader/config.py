@@ -63,6 +63,8 @@ class NightReversionConfig:
     skip_monday: bool = True
     slippage_pips: float = 0.5
     max_spread_pips: float = 5.0
+    max_band_z: float = 0.0  # skip when |close - mid| > this x stdev (news spike); 0 = off
+    max_bar_range_atr: float = 0.0  # skip when signal-bar range > this x ATR (news spike); 0 = off
     magic: int = 7101
 
 
@@ -93,6 +95,20 @@ class RiskConfig:
     daily_loss_limit: float = 0.05  # stop new entries for the day after -5% (from day start equity)
     max_drawdown_halt: float = 0.40  # stop ALL new entries when DD from peak >= 40%
     min_lot_policy: str = "skip"  # skip | min  (when calculated lot < broker minimum)
+    # --- additional portfolio guards (0 / empty = off)
+    max_total_risk: float = 0.0  # sum of open initial risk (fraction of equity) incl. the new trade
+    max_same_direction_per_currency: int = 0  # e.g. 2 -> at most 2 positions that are long JPY
+    daily_hard_stop: float = 0.0  # close everything and stop for the day after this loss (MTM)
+    monthly_loss_limit: float = 0.0  # no new entries for the rest of the month after this loss (MTM)
+    monthly_hard_stop: float = 0.0  # close everything and stop for the month after this loss (MTM)
+    symbol_risk_mult: dict[str, float] = field(default_factory=dict)  # e.g. {"EURUSD": 0.5}
+    # --- adaptive risk (0 = off)
+    vol_target_daily: float = 0.0  # target daily equity volatility, e.g. 0.01 = 1%/day
+    vol_lookback_days: int = 20
+    vol_mult_min: float = 0.25
+    vol_mult_max: float = 1.5
+    eq_filter_days: int = 0  # equity-curve filter: SMA length in days
+    eq_filter_mult: float = 0.5  # risk multiplier while equity < its SMA
 
     def base_risk(self, strategy: str) -> float:
         if self.profile == "custom":
@@ -141,6 +157,7 @@ class Config:
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
+    preset: str = ""
 
     def broker_symbol(self, base: str) -> str:
         return self.broker.symbol_map.get(base, base + self.broker.symbol_suffix)
@@ -182,11 +199,35 @@ def _merge(dc_obj: Any, data: dict, path: str) -> Any:
     return dc_obj
 
 
-def load_config(path: str | Path | None) -> Config:
+PRESET_DIR = Path(__file__).resolve().parent / "presets"
+
+
+def available_presets() -> list[str]:
+    return sorted(p.stem for p in PRESET_DIR.glob("*.yaml"))
+
+
+def load_preset(name: str) -> dict:
+    """Return the raw override dict of a bundled preset (greatest_trader/presets/<name>.yaml)."""
+    p = PRESET_DIR / f"{name}.yaml"
+    if not p.exists():
+        raise ValueError(f"unknown preset '{name}'. Available: {', '.join(available_presets())}")
+    with open(p, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def load_config(path: str | Path | None, preset: str | None = None) -> Config:
+    """Load config.yaml. If it contains `preset: <name>` (or `preset` is given), the bundled preset
+    is applied first and the user's settings are merged on top of it."""
     cfg = Config()
+    data: dict = {}
     if path:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        _merge(cfg, data, "")
+    name = preset or data.pop("preset", None)
+    data.pop("preset", None)
+    if name:
+        _merge(cfg, load_preset(name), "preset:")
+    _merge(cfg, data, "")
+    cfg.preset = name or ""
     cfg.validate()
     return cfg

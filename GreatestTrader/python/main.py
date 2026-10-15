@@ -111,9 +111,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--live-orders", action="store_true",
                     help="live: override engine.dry_run=false (send real orders)")
     ap.add_argument("--dry-run", action="store_true", help="live: force dry-run (never send orders)")
+    ap.add_argument("--preset", default=None,
+                    help="apply a bundled preset (overrides `preset:` in the config file), e.g. stable5 / safe2")
     args = ap.parse_args(argv)
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, preset=args.preset)
     # relative paths in the config are relative to this folder (python/)
     for obj, attr in ((cfg.engine, "state_file"), (cfg.engine, "log_dir"), (cfg.backtest, "data_dir"),
                       (cfg.backtest, "output_dir")):
@@ -127,8 +129,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         cfg.engine.dry_run = True
     setup_logging(cfg.engine.log_dir, cfg.engine.log_level)
-    logging.getLogger(__name__).info("GreatestTrader %s command=%s config=%s", __version__, args.command,
-                                     args.config)
+    logging.getLogger(__name__).info("GreatestTrader %s command=%s config=%s preset=%s", __version__, args.command,
+                                     args.config, cfg.preset or "-")
     if args.command == "check":
         return cmd_check(cfg)
     if args.command == "live":

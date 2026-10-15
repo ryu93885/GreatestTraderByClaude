@@ -53,7 +53,9 @@ def annual_table(res: BacktestResult) -> pd.DataFrame:
     a = res.annual_returns()
     if len(a) == 0:
         return pd.DataFrame()
-    partial = {p.year: p for p in res.partial_months()}
+    partial: dict[int, list[int]] = {}
+    for p in res.partial_months():
+        partial.setdefault(p.year, []).append(p.month)
     out = pd.DataFrame({
         "期首資産": a.start_equity.round(2),
         "期末資産": a.end_equity.round(2),
@@ -63,8 +65,7 @@ def annual_table(res: BacktestResult) -> pd.DataFrame:
     notes = []
     for y in a.index:
         if y in partial:
-            p = partial[y]
-            notes.append(f"部分期間（{p.month}月は一部のみ）")
+            notes.append("部分期間（" + "・".join(f"{mm}月" for mm in partial[y]) + "は一部のみ）")
         elif a.loc[y, "months"] < 12:
             notes.append("部分期間")
         else:
