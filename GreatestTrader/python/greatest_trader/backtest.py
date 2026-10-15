@@ -74,38 +74,117 @@ def load_data_dir(data_dir: str | Path, symbols: list[str]) -> dict[str, pd.Data
 # ---------------------------------------------------------------- result
 @dataclass
 class BacktestResult:
+    """Backtest output.
+
+    Return definitions (all calendar periods in broker server time = market time NY+7; for this
+    system the month/year buckets are identical in Japan time because no position is ever open at
+    a month end):
+      * equity         : realized equity after each closed trade (timestamp = exit bar close).
+      * monthly return : month-end equity / previous month-end equity - 1. The month before the
+                         first month holds the initial equity, months without trades return 0%.
+      * annual return  : year-end equity / previous year-end equity - 1 (first year: initial equity).
+      * partial months : first/last month of the period when the data does not cover the whole month.
+    """
     trades: pd.DataFrame
     equity: pd.Series  # realized equity after each closed trade
     initial_equity: float
+    period_start: pd.Timestamp | None = None  # first bar of the backtest window (server time)
+    period_end: pd.Timestamp | None = None  # last bar of the backtest window (server time)
+    max_drawdown_mtm: float | None = None  # drawdown incl. floating P/L at every bar close
+
+    # -------------------------------------------------------------- periods
+    def _bounds(self) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+        e = self.equity
+        if self.period_start is None and len(e) == 0:
+            return None
+        first = pd.Timestamp(self.period_start) if self.period_start is not None else e.index[0]
+        last = pd.Timestamp(self.period_end) if self.period_end is not None else e.index[-1]
+        if len(e):
+            first, last = min(first, e.index[0]), max(last, e.index[-1])
+        return first, last
+
+    def month_end_equity(self) -> pd.Series:
+        """Realized equity at the end of every calendar month; the first row is the month BEFORE
+        the first month and holds the initial equity."""
+        b = self._bounds()
+        if b is None:
+            return pd.Series(dtype=float)
+        months = pd.period_range(b[0].to_period("M") - 1, b[1].to_period("M"), freq="M")
+        e = self.equity
+        me = e.groupby(e.index.to_period("M")).last() if len(e) else pd.Series(dtype=float)
+        me = me.reindex(months)
+        me.iloc[0] = self.initial_equity
+        me = me.ffill()
+        me.index = months.to_timestamp(how="end").normalize()
+        return me.astype(float)
+
+    def partial_months(self) -> list[pd.Period]:
+        """First/last month of the window if the data does not cover all its business days."""
+        b = self._bounds()
+        if b is None:
+            return []
+        out = []
+        first, last = b
+        m0, m1 = first.to_period("M"), last.to_period("M")
+        if len(pd.bdate_range(m0.start_time, first.normalize() - pd.Timedelta(days=1))) > 0:
+            out.append(m0)
+        if len(pd.bdate_range(last.normalize() + pd.Timedelta(days=1), m1.end_time.normalize())) > 0 \
+                and m1 not in out:
+            out.append(m1)
+        return out
 
     def monthly_returns(self) -> pd.Series:
-        e = self.equity.copy()
-        start = pd.Series([self.initial_equity], index=[e.index[0] - pd.Timedelta(seconds=1)])
-        e = pd.concat([start, e])
-        m = e.resample("ME").last().ffill()
-        return m.pct_change().dropna()
+        me = self.month_end_equity()
+        if len(me) < 2:
+            return pd.Series(dtype=float)
+        return (me / me.shift(1) - 1).iloc[1:]
 
+    def annual_returns(self) -> pd.DataFrame:
+        """Per calendar year: start equity, end equity, annual return, months covered, partial flag."""
+        me = self.month_end_equity()
+        if len(me) < 2:
+            return pd.DataFrame(columns=["start_equity", "end_equity", "return", "months", "partial"])
+        partial = {p.year for p in self.partial_months()}
+        rows = []
+        prev = float(me.iloc[0])
+        body = me.iloc[1:]
+        for y, grp in body.groupby(body.index.year):
+            end = float(grp.iloc[-1])
+            rows.append((int(y), prev, end, end / prev - 1, len(grp), y in partial or len(grp) < 12))
+            prev = end
+        df = pd.DataFrame(rows, columns=["year", "start_equity", "end_equity", "return", "months", "partial"])
+        return df.set_index("year")
+
+    # -------------------------------------------------------------- stats
     def stats(self) -> dict:
         t, e = self.trades, self.equity
-        if len(t) == 0:
+        if len(t) == 0 or len(e) == 0:
             return {"trades": 0}
-        m = self.monthly_returns()
+        m_all = self.monthly_returns()
+        partial = {p.to_timestamp(how="end").normalize() for p in self.partial_months()}
+        m = m_all[~m_all.index.isin(partial)]  # distribution stats on complete months only
         full = pd.concat([pd.Series([self.initial_equity], index=[e.index[0] - pd.Timedelta(seconds=1)]), e])
         dd = (full / full.cummax() - 1).min()
-        years = max((e.index[-1] - t.entry_time.min()).days / 365.25, 1e-9)
-        cagr = (e.iloc[-1] / self.initial_equity) ** (1 / years) - 1
+        first, last = self._bounds()
+        years = max((last - first).total_seconds() / (365.25 * 86400), 1e-9)
+        final = float(e.iloc[-1])
+        cagr = (final / self.initial_equity) ** (1 / years) - 1
         wins, losses = t.pnl[t.pnl > 0].sum(), -t.pnl[t.pnl < 0].sum()
-        return {
-            "period": f"{t.entry_time.min():%Y-%m-%d} - {t.exit_time.max():%Y-%m-%d}",
+        out = {
+            "period": f"{first:%Y-%m-%d} - {last:%Y-%m-%d}",
             "trades": int(len(t)),
-            "trades_per_month": len(t) / max(len(m), 1),
+            "months": int(len(m_all)),
+            "complete_months": int(len(m)),
+            "trades_per_month": len(t) / max(len(m_all), 1),
             "win_rate": float((t.R > 0).mean()),
             "avg_R": float(t.R.mean()),
             "profit_factor": float(wins / losses) if losses > 0 else float("inf"),
-            "final_equity": float(e.iloc[-1]),
-            "total_return": float(e.iloc[-1] / self.initial_equity - 1),
+            "final_equity": final,
+            "total_return": float(final / self.initial_equity - 1),
             "CAGR": float(cagr),
+            "monthly_compound": float((1 + cagr) ** (1 / 12) - 1),
             "monthly_mean": float(m.mean()),
+            "monthly_geometric": float(np.prod(1 + m.to_numpy()) ** (1 / len(m)) - 1) if len(m) else float("nan"),
             "monthly_median": float(m.median()),
             "monthly_std": float(m.std()),
             "best_month": float(m.max()),
@@ -114,12 +193,15 @@ class BacktestResult:
             "max_drawdown": float(dd),
             "sharpe_monthly": float(m.mean() / m.std() * np.sqrt(12)) if m.std() > 0 else float("nan"),
         }
+        if self.max_drawdown_mtm is not None:
+            out["max_drawdown_mtm"] = float(min(self.max_drawdown_mtm, dd))
+        return out
 
 
 # ---------------------------------------------------------------- engine
 class _Pos:
     __slots__ = ("strategy", "sym", "dir", "j", "entry", "sl", "sl_dist", "risk_amt", "cost", "pip",
-                 "entry_time", "exit_utc", "ticket")
+                 "entry_time", "exit_utc", "ticket", "last_c")
 
 
 class Backtester:
@@ -238,6 +320,7 @@ class Backtester:
         ticket = 0
         nr_cfg, es_cfg = cfg.night_reversion, cfg.euro_session
         last_day = None
+        mtm_peak, mtm_dd = equity, 0.0
 
         for ti, t in enumerate(timeline):
             day = tl_mkt[ti].date()
@@ -270,6 +353,7 @@ class Backtester:
                 p.cost = (d["spr"][sig_i] + slip) * d["pip"]
                 p.pip = d["pip"]
                 p.entry_time = t.to_pydatetime()
+                p.last_c = entry
                 if strat == "ES":
                     u = d["utc"][j]
                     p.exit_utc = u.replace(hour=es_cfg.exit_utc_hour, minute=0)
@@ -322,9 +406,27 @@ class Backtester:
                     risk.update_equity(equity, day)
                 open_pos = still
 
+            # 3) mark-to-market equity at this bar close (for the floating drawdown)
+            if open_pos:
+                fl = 0.0
+                for p in open_pos:
+                    k = pos_map[p.sym][ti]
+                    if k >= 0:
+                        p.last_c = sym_data[p.sym]["c"][k]
+                    fl += p.risk_amt * (p.dir * (p.last_c - p.entry) - p.cost) / p.sl_dist
+                mtm = equity + fl
+            else:
+                mtm = equity
+            if mtm > mtm_peak:
+                mtm_peak = mtm
+            elif mtm / mtm_peak - 1 < mtm_dd:
+                mtm_dd = mtm / mtm_peak - 1
+
         cols = ["strategy", "symbol", "direction", "entry_time", "exit_time", "entry_price", "exit_price",
                 "sl_pips", "cost_pips", "R", "pnl", "equity", "exit_reason"]
         tr = pd.DataFrame(trades, columns=cols)
         eq = pd.Series(eq_v, index=pd.DatetimeIndex(eq_t), name="equity")
         eq = eq.groupby(level=0).last()
-        return BacktestResult(tr, eq, cfg.backtest.initial_equity)
+        period_start = pd.Timestamp(cfg.backtest.start) if cfg.backtest.start else timeline[0]
+        return BacktestResult(tr, eq, cfg.backtest.initial_equity, period_start=period_start,
+                              period_end=timeline[-1], max_drawdown_mtm=mtm_dd)

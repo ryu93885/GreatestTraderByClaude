@@ -97,3 +97,13 @@ def test_backtest_es_times(tmp_path):
         assert pd.Timestamp(r.entry_time).hour == 9 and pd.Timestamp(r.entry_time).minute == 0
         if r.exit_reason == "session end":
             assert pd.Timestamp(r.exit_time).hour == 14 and pd.Timestamp(r.exit_time).minute == 45
+
+
+def test_backtest_mtm_drawdown_not_smaller_than_realized(tmp_path):
+    data = {"EURJPY": synthetic_m15(datetime(2021, 3, 1), 10, 130.0, 0.01, spike_at=SPIKE)}
+    cfg = make_cfg(tmp_path)
+    res = Backtester(cfg, data).run()
+    st = res.stats()
+    assert st["max_drawdown_mtm"] <= st["max_drawdown"] <= 0
+    m = res.monthly_returns()
+    assert abs(float((1 + m).prod()) - res.equity.iloc[-1] / res.initial_equity) < 1e-9

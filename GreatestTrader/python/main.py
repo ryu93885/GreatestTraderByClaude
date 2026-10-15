@@ -81,7 +81,7 @@ def cmd_download(cfg, years: float) -> int:
 
 def cmd_backtest(cfg, out: str | None) -> int:
     from greatest_trader.backtest import Backtester, load_data_dir
-    from greatest_trader.report import format_stats, save_report, yearly_table
+    from greatest_trader.report import annual_table, format_stats, save_report, yearly_table
 
     syms = list(dict.fromkeys(cfg.night_reversion.symbols + [cfg.euro_session.symbol]))
     data = load_data_dir(cfg.backtest.data_dir, syms)
@@ -93,7 +93,9 @@ def cmd_backtest(cfg, out: str | None) -> int:
         print("no trades")
         return 1
     print(format_stats(res.stats()))
-    print()
+    print("\n[年利（各年）]")
+    print(annual_table(res).to_string())
+    print("\n[月利（%）]")
     print(yearly_table(res).to_string())
     path = save_report(res, out or cfg.backtest.output_dir)
     print(f"\nreport saved to {path}")
