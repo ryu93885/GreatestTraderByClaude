@@ -5,11 +5,18 @@
 //|   Strategy 1  Night Reversion (NR)  - core                       |
 //|   Strategy 2  Euro Session   (ES)  - satellite                   |
 //|   Logic is identical to the Python production engine.            |
+//|                                                                  |
+//|   v1.2 long-term operation:                                      |
+//|   - lot caps (InpMaxLotsPerOrder / InpMaxRiskAmount / broker)    |
+//|   - deposits / withdrawals / credit are not profit or loss       |
+//|   - broker clock verified from live ticks (GT_SERVER_AUTO)       |
+//|   - start-up and state safety, instance lock, hedging only       |
+//|   - order retries, close back-off, monitoring alerts             |
 //+------------------------------------------------------------------+
 #property copyright   "GreatestTrader"
-#property version     "1.10"
-#property description "Night Reversion (14 crosses, 00:00-02:00 market time) + Euro Session (EURUSD 07-13 UTC). v1.1: defaults = STABLE5 preset."
-#property description "Attach to ONE chart (any symbol, any timeframe). The EA trades all configured symbols."
+#property version     "1.20"
+#property description "Night Reversion (14 crosses, 00:00-02:00 market time) + Euro Session (EURUSD 07-13 UTC). Defaults = STABLE5 preset."
+#property description "Attach to ONE chart (any symbol, any timeframe) of a HEDGING account. The EA trades all configured symbols."
 
 #include <Trade/Trade.mqh>
 
@@ -25,7 +32,8 @@ enum ENUM_GT_RISK
 enum ENUM_GT_SERVER_TIME
   {
    GT_SERVER_NY7   = 0, // GMT+2 winter / GMT+3 summer (US DST) - most brokers
-   GT_SERVER_FIXED = 1  // Fixed GMT offset (InpServerGMTOffset)
+   GT_SERVER_FIXED = 1, // Fixed GMT offset (InpServerGMTOffset)
+   GT_SERVER_AUTO  = 2  // Auto: measured from live ticks (tester: NY7)
   };
 
 //--- inputs
@@ -38,9 +46,11 @@ input int          InpMaxPerCurrency   = 4;     // Max positions per currency
 input double       InpDDScaleFull      = 10.0;  // DD scaling: risk x max(floor, 1 - DD%/this)
 input double       InpDDScaleFloor     = 0.10;  // DD scaling: minimum multiplier
 input double       InpDailyLossLimit   = 1.0;   // Daily loss limit (% of day-start equity)
-input double       InpMaxDDHalt        = 40.0;  // Halt new entries at this DD (%) from peak
+input double       InpMaxDDHalt        = 20.0;  // Halt new entries at this DD (%) from peak (InpResetHalt clears it)
 input bool         InpUseMinLot        = false; // Use min lot when calculated lot is smaller
 input double       InpMaxTotalRisk     = 8.75;  // Max total open risk (% of equity, 0 = off)
+input double       InpMaxLotsPerOrder  = 20.0;  // Max lots per order, all strategies (0 = off; broker volume max still applies)
+input double       InpMaxRiskAmount    = 0.0;   // Max risk per trade in account currency, entry to stop (0 = off)
 input int          InpMaxSameDirPerCcy = 2;     // Max same-direction positions per currency (0 = off)
 input double       InpDailyHardStop    = 0.0;   // Daily hard stop: close all at this loss (%, 0 = off)
 input double       InpMonthlyLossLimit = 0.0;   // Monthly loss limit: no new entries (%, 0 = off)
@@ -57,7 +67,7 @@ input string       InpBlackoutEnd      = "01-05"; // Year-end blackout end MM-DD
 
 input group "=== Broker ==="
 input string              InpSymbolSuffix     = "";             // Symbol suffix (e.g. .raw  -STD  m)
-input ENUM_GT_SERVER_TIME InpServerTime       = GT_SERVER_NY7;  // Broker server time convention
+input ENUM_GT_SERVER_TIME InpServerTime       = GT_SERVER_AUTO; // Broker server time (AUTO = measured from live ticks)
 input double              InpServerGMTOffset  = 2.0;            // Fixed GMT offset (hours) if Fixed
 input double              InpCommissionPerLot = 0.0;            // Round-trip commission per lot (account ccy)
 input int                 InpDeviationPoints  = 20;             // Max slippage (points)
@@ -92,9 +102,24 @@ input double InpESMaxSpreadPips = 2.0;      // Max spread (pips)
 input long   InpESMagic         = 7102;     // Magic number ES
 
 input group "=== Misc ==="
-input bool InpPushNotify  = false; // Push notifications (MetaQuotes ID required)
-input int  InpTimerSec    = 5;     // Timer (seconds, live). Tester uses 60s
-input bool InpVerbose     = false; // Verbose log
+input bool   InpPushNotify  = false; // Push notifications (MetaQuotes ID required)
+input int    InpTimerSec    = 5;     // Timer (seconds, live). Tester uses 60s
+input bool   InpVerbose     = false; // Verbose log
+input double InpDDAlert     = 15.0;  // Alert when drawdown from peak >= this % (notification only, 0 = off)
+input bool   InpResetHalt   = false; // Clear the max-DD halt once at start (peak := equity), then set back to false
+
+//--- constants
+#define GT_FRESH_SEC        150     // act on a closed M15 bar only within this many seconds of its close (Python FRESH_SIGNAL)
+#define GT_CLOCK_TOL_SEC    120     // a tick is fresh when server - UTC is within this of a half-hour step
+#define GT_CLOCK_ADV_SEC    120     // ... and the server time advanced within this many seconds
+#define GT_CLOCK_OBS_SEC    60      // spacing of counted clock observations
+#define GT_CLOCK_CONFIRM    3       // identical observations to adopt / mismatches to block
+#define GT_LOCK_STALE_SEC   60      // instance lock: heartbeat older than this = holder gone
+#define GT_LOCK_BEAT_SEC    10      // instance lock: heartbeat interval
+#define GT_REPEAT_SEC       21600   // repeat a standing alert at most every 6 hours
+#define GT_STALE_FEED_SEC   900     // no new quote for this long while the market is open = stale feed
+#define GT_NOTIFY_MAX       30      // push queue length
+#define GT_FAR_FUTURE       D'2100.01.01 00:00:00'
 
 //--- globals
 CTrade   g_trade;
@@ -124,6 +149,126 @@ string   g_multSym[];
 double   g_multVal[];
 int      g_boStart = 0;          // blackout start as month*100+day (0 = off)
 int      g_boEnd = 0;
+
+//--- state persistence
+bool     g_stateLoaded = false;  // state loaded for this login; SaveState() is a no-op before (failed OnInit safe)
+bool     g_stateDirty = false;   // an important value changed: flush the global variables to disk now
+datetime g_lastFlush = 0;
+bool     g_gvWritten = false;    // a global variable was written since the last flush
+bool     g_gvRefresh = false;    // rewrite every value this time (manual deletion / 4-week expiry)
+datetime g_gvRefreshAt = 0;
+string   g_gvName[];             // cache of the values last written, to write only on change
+double   g_gvVal[];
+bool     g_resetHaltDone = false; // InpResetHalt already applied (persisted; re-armed when InpResetHalt=false)
+
+//--- cash flows (deposits / withdrawals / credit / bonus)
+ulong    g_flowTicket = 0;       // newest cash-flow deal ticket already applied (persisted "flowtk")
+datetime g_flowScan = 0;         // server time of the last history scan (persisted "flowtm")
+ulong    g_allTicket = 0;        // newest deal ticket of any type seen (in memory)
+double   g_lastBalCred = 0.0;    // balance + credit at the last explained change (0 = scan at the next cycle)
+datetime g_pendingSince = 0;     // balance changed but no new deal in the history yet
+
+//--- broker clock
+ENUM_GT_SERVER_TIME g_clockMode = GT_SERVER_NY7; // effective mode (AUTO -> NY7 in the tester)
+long     g_clkOffset = 0;        // AUTO: adopted server - UTC offset in seconds (persisted "clkoff")
+bool     g_clkHave = false;      // AUTO: an adopted offset exists
+bool     g_clkVerified = false;  // a valid observation confirmed the clock since start-up
+bool     g_clkBlocked = false;   // repeated mismatches: new entries blocked
+int      g_clkMismatch = 0;      // consecutive observations that disagree with the clock in use
+long     g_clkCand = 0;          // AUTO: candidate new offset
+int      g_clkCandN = 0;         // AUTO: consecutive identical observations of the candidate
+datetime g_clkLastObs = 0;       // local time of the last counted observation
+datetime g_lastSrvSeen = 0;      // newest TimeCurrent() seen
+datetime g_srvAdvAt = 0;         // local time when TimeCurrent() last advanced
+
+//--- monitoring
+datetime g_ddAlertDay = 0;       // market day of the last drawdown alert (persisted "ddalert")
+bool     g_sumPending = false;   // a market day ended: send the daily summary
+datetime g_sumDay = 0;
+double   g_sumMonthRet = 0.0;
+int      g_permit = -1;          // -1 unknown, 0 trading blocked, 1 trading permitted
+datetime g_permitNote = 0;
+datetime g_discSince = 0;
+bool     g_discNotified = false;
+datetime g_discNote = 0;
+bool     g_staleNotified = false;
+datetime g_staleNote = 0;
+datetime g_startLocal = 0;
+string   g_capSym[];             // lot-cap notices: once per market day per symbol
+datetime g_capDay[];
+
+//--- close back-off (bounded by the open positions, see PruneFails)
+ulong    g_failTk[];
+datetime g_failNext[];
+datetime g_failNote[];
+
+//--- push notifications (MT5 accepts at most 2 per second and 10 per minute)
+string   g_nq[];
+datetime g_lastPush = 0;
+
+//--- single instance per account (terminal global variable GT_<login>_lock + heartbeat GT_<login>_lockhb)
+double   g_lockToken = 0.0;
+bool     g_lockHeld = false;
+long     g_lockLogin = 0;
+datetime g_lockBeat = 0;
+bool     g_stopping = false;     // ExpertRemove() requested: ignore the remaining events
+
+//+------------------------------------------------------------------+
+//| Small helpers                                                     |
+//+------------------------------------------------------------------+
+long Secs(const datetime a, const datetime b)
+  {
+   return (long)a - (long)b;
+  }
+
+//+------------------------------------------------------------------+
+//| Notifications and log                                             |
+//+------------------------------------------------------------------+
+void Notify(const string msg)
+  {
+   if(!InpPushNotify || g_tester)
+      return;
+   int n = ArraySize(g_nq);
+   if(n >= GT_NOTIFY_MAX)
+     {
+      g_nq[n - 1] = "(more messages in the Experts log)";
+      return;
+     }
+   ArrayResize(g_nq, n + 1);
+   g_nq[n] = msg;
+  }
+
+// merges queued messages into one push of at most 255 characters, at most every 6 seconds
+void FlushNotify(const bool force = false)
+  {
+   int n = ArraySize(g_nq);
+   if(n == 0)
+      return;
+   if(!force && Secs(TimeLocal(), g_lastPush) < 6 && Secs(TimeLocal(), g_lastPush) >= 0)
+      return;
+   string m = "[GT] ";
+   int used = 0;
+   for(int i = 0; i < n; i++)
+     {
+      if(used > 0 && StringLen(m) + StringLen(g_nq[i]) + 3 > 255)
+         break;
+      if(used > 0)
+         m += " | ";
+      m += g_nq[i];
+      used++;
+     }
+   if(!SendNotification(StringSubstr(m, 0, 255)))
+      Print("[GT] push notification failed (error ", GetLastError(), ")");
+   g_lastPush = TimeLocal();
+   ArrayRemove(g_nq, 0, used);
+  }
+
+void Log(const string msg, const bool notify = false)
+  {
+   Print("[GT] ", msg);
+   if(notify)
+      Notify(msg);
+  }
 
 //+------------------------------------------------------------------+
 //| Time utilities (US DST rules, identical to Python timeutil.py)    |
@@ -173,10 +318,14 @@ bool IsUSDST(const datetime utc)
    return (utc >= st && utc < en);
   }
 
+// server time -> UTC with the clock in use. AUTO uses the adopted (measured or persisted) offset and the NY7 rule
+// until one exists; entries stay blocked until a live observation confirms the clock (CheckClock / CanOpen).
 datetime ServerToUTC(const datetime srv)
   {
-   if(InpServerTime == GT_SERVER_FIXED)
+   if(g_clockMode == GT_SERVER_FIXED)
       return srv - (int)MathRound(InpServerGMTOffset * 3600.0);
+   if(g_clockMode == GT_SERVER_AUTO && g_clkHave)
+      return (datetime)((long)srv - g_clkOffset);
    datetime cand = srv - 3 * 3600;
    if(IsUSDST(cand))
       return cand;
@@ -190,7 +339,7 @@ datetime UTCToMarket(const datetime utc)
 
 datetime ServerToMarket(const datetime srv)
   {
-   if(InpServerTime == GT_SERVER_NY7)
+   if(g_clockMode == GT_SERVER_NY7 || (g_clockMode == GT_SERVER_AUTO && !g_clkHave))
       return srv;
    return UTCToMarket(ServerToUTC(srv));
   }
@@ -229,34 +378,106 @@ double SymPip(const string sym)
    return PipSize(BaseOf(sym), (int)SymbolInfoInteger(sym, SYMBOL_DIGITS));
   }
 
-void Log(const string msg, const bool notify = false)
-  {
-   Print("[GT] ", msg);
-   if(notify && InpPushNotify && !g_tester)
-      SendNotification("[GT] " + msg);
-  }
-
 //+------------------------------------------------------------------+
-//| Risk state (persisted in terminal global variables)              |
+//| Risk state (persisted in terminal global variables GT_<login>_*)  |
 //+------------------------------------------------------------------+
-void SaveState()
+// writes one value only when it differs from the value last written (or on a full refresh)
+void GVPut(const string key, const double v)
   {
-   GlobalVariableSet(g_gvPrefix + "peak", g_peak);
-   GlobalVariableSet(g_gvPrefix + "day", (double)g_day);
-   GlobalVariableSet(g_gvPrefix + "dayeq", g_dayStartEq);
-   GlobalVariableSet(g_gvPrefix + "halt", g_halted ? 1.0 : 0.0);
-   GlobalVariableSet(g_gvPrefix + "esday", (double)g_lastESDay);
-   GlobalVariableSet(g_gvPrefix + "month", (double)g_month);
-   GlobalVariableSet(g_gvPrefix + "montheq", g_monthStartEq);
-   GlobalVariableSet(g_gvPrefix + "monthhalt", g_monthHalted ? 1.0 : 0.0);
-   GlobalVariableSet(g_gvPrefix + "dayhalt", g_dayHalted ? 1.0 : 0.0);
-   GlobalVariableSet(g_gvPrefix + "lasteq", g_lastEq);
-   int n = ArraySize(g_dailyEq);
-   GlobalVariableSet(g_gvPrefix + "deqn", (double)n);
+   string name = g_gvPrefix + key;
+   int n = ArraySize(g_gvName);
+   int idx = -1;
    for(int i = 0; i < n; i++)
-      GlobalVariableSet(g_gvPrefix + "deq" + IntegerToString(i), g_dailyEq[i]);
+      if(g_gvName[i] == name)
+        {
+         idx = i;
+         break;
+        }
+   if(idx >= 0 && g_gvVal[idx] == v && !g_gvRefresh)
+      return;
+   if(GlobalVariableSet(name, v) == 0)
+     {
+      Print("[GT] could not write global variable ", name, " (error ", GetLastError(), ")");
+      return;
+     }
+   g_gvWritten = true;
+   if(idx < 0)
+     {
+      idx = n;
+      ArrayResize(g_gvName, n + 1);
+      ArrayResize(g_gvVal, n + 1);
+      g_gvName[idx] = name;
+     }
+   g_gvVal[idx] = v;
   }
 
+void SaveState(const bool force = false)
+  {
+   if(g_tester || !g_stateLoaded)
+      return;   // never overwrite the persisted state with unloaded defaults (e.g. OnDeinit after a failed OnInit)
+   datetime now = TimeLocal();
+   g_gvRefresh = (force || now >= g_gvRefreshAt);
+   if(g_gvRefresh)
+      g_gvRefreshAt = now + 3600;
+   GVPut("peak", g_peak);
+   GVPut("day", (double)g_day);
+   GVPut("dayeq", g_dayStartEq);
+   GVPut("halt", g_halted ? 1.0 : 0.0);
+   GVPut("esday", (double)g_lastESDay);
+   GVPut("month", (double)g_month);
+   GVPut("montheq", g_monthStartEq);
+   GVPut("monthhalt", g_monthHalted ? 1.0 : 0.0);
+   GVPut("dayhalt", g_dayHalted ? 1.0 : 0.0);
+   GVPut("lasteq", g_lastEq);
+   int n = ArraySize(g_dailyEq);
+   GVPut("deqn", (double)n);
+   for(int i = 0; i < n; i++)
+      GVPut("deq" + IntegerToString(i), g_dailyEq[i]);
+   GVPut("flowtk", (double)g_flowTicket);   // deal tickets are far below 2^53: exact in a double
+   GVPut("flowtm", (double)g_flowScan);
+   if(g_clkHave)
+      GVPut("clkoff", (double)g_clkOffset);
+   GVPut("ddalert", (double)g_ddAlertDay);
+   GVPut("rsthalt", g_resetHaltDone ? 1.0 : 0.0);
+   g_gvRefresh = false;
+   // the terminal writes gvariables.dat only at a clean exit: flush so that a VPS crash cannot roll the
+   // peak / halt / month stop back to old values
+   if(force || g_stateDirty || (g_gvWritten && Secs(now, g_lastFlush) >= 60) || Secs(now, g_lastFlush) < 0)
+     {
+      GlobalVariablesFlush();
+      g_lastFlush = now;
+      g_stateDirty = false;
+      g_gvWritten = false;
+     }
+  }
+
+void ResetStateVars()
+  {
+   g_peak = 0.0;
+   g_day = 0;
+   g_dayStartEq = 0.0;
+   g_halted = false;
+   g_lastESDay = 0;
+   g_month = 0;
+   g_monthStartEq = 0.0;
+   g_monthHalted = false;
+   g_dayHalted = false;
+   g_lastEq = 0.0;
+   ArrayResize(g_dailyEq, 0);
+   g_adaptMult = 1.0;
+   g_flowTicket = 0;
+   g_flowScan = 0;
+   g_allTicket = 0;
+   g_lastBalCred = 0.0;
+   g_pendingSince = 0;
+   g_clkHave = false;
+   g_clkOffset = 0;
+   g_ddAlertDay = 0;
+   g_resetHaltDone = false;
+   g_sumPending = false;
+  }
+
+// every key is optional: state written by v1.1 (no flow / clock / alert keys) loads unchanged
 void LoadState()
   {
    if(GlobalVariableCheck(g_gvPrefix + "peak"))
@@ -293,6 +514,23 @@ void LoadState()
          g_dailyEq[k] = GlobalVariableGet(name);
         }
      }
+   if(GlobalVariableCheck(g_gvPrefix + "flowtk"))
+      g_flowTicket = (ulong)GlobalVariableGet(g_gvPrefix + "flowtk");
+   if(GlobalVariableCheck(g_gvPrefix + "flowtm"))
+      g_flowScan = (datetime)GlobalVariableGet(g_gvPrefix + "flowtm");
+   if(GlobalVariableCheck(g_gvPrefix + "clkoff"))
+     {
+      long off = (long)MathRound(GlobalVariableGet(g_gvPrefix + "clkoff"));
+      if(off >= -14 * 3600 && off <= 14 * 3600)
+        {
+         g_clkOffset = off;
+         g_clkHave = true;
+        }
+     }
+   if(GlobalVariableCheck(g_gvPrefix + "ddalert"))
+      g_ddAlertDay = (datetime)GlobalVariableGet(g_gvPrefix + "ddalert");
+   if(GlobalVariableCheck(g_gvPrefix + "rsthalt"))
+      g_resetHaltDone = (GlobalVariableGet(g_gvPrefix + "rsthalt") > 0.5);
    g_adaptMult = AdaptiveMult();
   }
 
@@ -381,6 +619,8 @@ void UpdateEquityState(const double eq, const datetime nowSrv)
   {
    g_flatten = false;
    g_flattenReason = "";
+   if(eq <= 0.0)
+      return;   // an equity reading of 0 (terminal not ready) must never set a halt, a stop or a baseline
    if(eq > g_peak)
       g_peak = eq;
    datetime mkt = ServerToMarket(nowSrv);
@@ -405,10 +645,18 @@ void UpdateEquityState(const double eq, const datetime nowSrv)
                g_dailyEq[i] = tmp[i];
            }
         }
+      if(g_day != 0)
+        {
+         // daily summary of the market day that just ended (sent from ProcessAll, live only)
+         g_sumPending = true;
+         g_sumDay = g_day;
+         g_sumMonthRet = (g_monthStartEq > 0.0) ? eq / g_monthStartEq - 1.0 : 0.0;
+        }
       g_day = mday;
       g_dayStartEq = eq;
       g_dayHalted = false;
       g_adaptMult = AdaptiveMult();
+      g_stateDirty = true;
      }
    g_lastEq = eq;
    datetime mmon = MonthStart(mkt);
@@ -417,19 +665,22 @@ void UpdateEquityState(const double eq, const datetime nowSrv)
       g_month = mmon;
       g_monthStartEq = eq;
       g_monthHalted = false;
+      g_stateDirty = true;
      }
    double dd = Drawdown(eq);
    if(!g_halted && InpMaxDDHalt > 0.0 && dd * 100.0 >= InpMaxDDHalt)
      {
       g_halted = true;
-      Log(StringFormat("HALT: drawdown %.1f%% reached. New entries stopped. Delete global variables %s* to reset.",
-                       dd * 100.0, g_gvPrefix), true);
+      g_stateDirty = true;
+      Log(StringFormat("HALT: drawdown %.1f%% reached (limit %.1f%%). New entries stopped; closes and stops keep working. "
+                       "To resume set InpResetHalt=true once (other state is kept).", dd * 100.0, InpMaxDDHalt), true);
      }
    if(InpMonthlyHardStop > 0.0 && !g_monthHalted && g_monthStartEq > 0.0 &&
       eq <= g_monthStartEq * (1.0 - InpMonthlyHardStop / 100.0))
      {
       g_monthHalted = true;
       g_flatten = true;
+      g_stateDirty = true;
       g_flattenReason = StringFormat("monthly hard stop %.1f%%", InpMonthlyHardStop);
       Log("MONTH STOP: " + g_flattenReason, true);
      }
@@ -438,6 +689,7 @@ void UpdateEquityState(const double eq, const datetime nowSrv)
      {
       g_dayHalted = true;
       g_flatten = true;
+      g_stateDirty = true;
       if(g_flattenReason == "")
          g_flattenReason = StringFormat("daily hard stop %.1f%%", InpDailyHardStop);
       Log(StringFormat("DAY STOP: daily hard stop %.1f%%", InpDailyHardStop), true);
@@ -587,6 +839,28 @@ bool HasPositionOnSymbol(const string sym)
    return false;
   }
 
+// a position or an in-flight order of this strategy (magic) on the symbol: used after a timeout / no reply
+bool OwnTradeOnSymbol(const string sym, const long magic)
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) == magic && PositionGetString(POSITION_SYMBOL) == sym)
+         return true;
+     }
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong ot = OrderGetTicket(i);
+      if(ot == 0)
+         continue;
+      if(OrderGetInteger(ORDER_MAGIC) == magic && OrderGetString(ORDER_SYMBOL) == sym)
+         return true;
+     }
+   return false;
+  }
+
 int CountCurrency(const string ccy)
   {
    int n = 0;
@@ -630,8 +904,14 @@ double OpenRiskTotal()
       int dir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
       double op = PositionGetDouble(POSITION_PRICE_OPEN);
       double sl = PositionGetDouble(POSITION_SL);
-      if(sl <= 0.0 || (dir > 0 && sl >= op) || (dir < 0 && sl <= op))
-         continue;
+      if(sl <= 0.0)
+        {
+         // fail closed: an own position without a stop loss has unlimited risk and fills the total-risk cap
+         Log("open position without stop loss on " + PositionGetString(POSITION_SYMBOL) + ": open risk treated as unlimited");
+         return 1e300;
+        }
+      if((dir > 0 && sl >= op) || (dir < 0 && sl <= op))
+         continue;   // stop at or beyond the entry price: no remaining risk
       double l = LossPerLot(PositionGetString(POSITION_SYMBOL), dir, op, sl);
       if(l <= 0.0)
         {
@@ -667,6 +947,11 @@ int CountCurrencyDir(const string ccy, const int sign)
 
 bool CanOpen(const string sym, const double eq, const int dir, const double newRisk, string &why)
   {
+   if(!ClockAllowsEntries())
+     {
+      why = ClockBlockReason();
+      return false;
+     }
    if(g_halted)
      {
       why = "halted (max drawdown)";
@@ -729,6 +1014,9 @@ bool CanOpen(const string sym, const double eq, const int dir, const double newR
    return true;
   }
 
+//+------------------------------------------------------------------+
+//| Sizing: risk amount, absolute caps, lots                          |
+//+------------------------------------------------------------------+
 double LossPerLot(const string sym, const int dir, const double entry, const double stop)
   {
    double profit = 0.0;
@@ -738,12 +1026,76 @@ double LossPerLot(const string sym, const int dir, const double entry, const dou
    return MathAbs(profit);
   }
 
-double CalcLots(const string sym, const double riskAmount, const double lossPerLot)
+// per-order volume ceiling: SYMBOL_VOLUME_MAX, InpMaxLotsPerOrder and the room left under SYMBOL_VOLUME_LIMIT
+// (aggregate volume of positions and pending orders in one direction on the symbol, 0 = no limit)
+double VolumeCap(const string sym, const int dir, string &by)
+  {
+   double vmax = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+   by = "broker volume max";
+   if(InpMaxLotsPerOrder > 0.0 && InpMaxLotsPerOrder < vmax)
+     {
+      vmax = InpMaxLotsPerOrder;
+      by = "InpMaxLotsPerOrder";
+     }
+   double lim = SymbolInfoDouble(sym, SYMBOL_VOLUME_LIMIT);
+   if(lim > 0.0)
+     {
+      double used = 0.0;
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+         ulong tk = PositionGetTicket(i);
+         if(tk == 0 || PositionGetString(POSITION_SYMBOL) != sym)
+            continue;
+         int pd = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
+         if(pd == dir)
+            used += PositionGetDouble(POSITION_VOLUME);
+        }
+      for(int i = OrdersTotal() - 1; i >= 0; i--)
+        {
+         ulong ot = OrderGetTicket(i);
+         if(ot == 0 || OrderGetString(ORDER_SYMBOL) != sym)
+            continue;
+         ENUM_ORDER_TYPE t = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         int od = (t == ORDER_TYPE_BUY || t == ORDER_TYPE_BUY_LIMIT || t == ORDER_TYPE_BUY_STOP ||
+                   t == ORDER_TYPE_BUY_STOP_LIMIT) ? 1 : -1;
+         if(od == dir)
+            used += OrderGetDouble(ORDER_VOLUME_CURRENT);
+        }
+      double room = lim - used;
+      if(room < vmax)
+        {
+         vmax = MathMax(0.0, room);
+         by = "broker volume limit";
+        }
+     }
+   return vmax;
+  }
+
+// risk amount after the absolute caps, computed BEFORE CanOpen so that the total-risk cap sees the real size:
+// min(equity x risk fraction x symbol mult, InpMaxRiskAmount, InpMaxLotsPerOrder x loss/lot, volume max x loss/lot)
+// (shared contract with Python RiskManager.capped_risk)
+double CappedRisk(const double riskAmount, const double lossPerLot, const double vcap, const string vcapBy, string &by)
+  {
+   double r = riskAmount;
+   by = "";
+   if(InpMaxRiskAmount > 0.0 && InpMaxRiskAmount < r)
+     {
+      r = InpMaxRiskAmount;
+      by = "InpMaxRiskAmount";
+     }
+   if(lossPerLot > 0.0 && vcap * lossPerLot < r)
+     {
+      r = vcap * lossPerLot;
+      by = vcapBy;
+     }
+   return r;
+  }
+
+double CalcLots(const string sym, const double riskAmount, const double lossPerLot, const double vmax)
   {
    if(lossPerLot <= 0.0 || riskAmount <= 0.0)
       return 0.0;
    double vmin  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
-   double vmax  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
    double vstep = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
    if(vstep <= 0.0)
       vstep = 0.01;
@@ -757,9 +1109,44 @@ double CalcLots(const string sym, const double riskAmount, const double lossPerL
          return 0.0;
      }
    if(lots > vmax)
-      lots = vmax;
+      lots = MathFloor(vmax / vstep + 1e-9) * vstep;
+   if(lots < vmin || lots <= 0.0)
+      return 0.0;   // the volume ceiling is below the broker minimum: no valid order size
    int stepDigits = (int)MathMax(0, MathCeil(-MathLog10(vstep) - 1e-9));
    return NormalizeDouble(lots, stepDigits);
+  }
+
+// lot-cap notice: notify at most once per market day per symbol (the OPEN line shows every capped trade)
+bool CapNoticeDue(const string sym)
+  {
+   int n = ArraySize(g_capSym);
+   for(int i = 0; i < n; i++)
+      if(g_capSym[i] == sym)
+        {
+         if(g_capDay[i] == g_day)
+            return false;
+         g_capDay[i] = g_day;
+         return true;
+        }
+   ArrayResize(g_capSym, n + 1);
+   ArrayResize(g_capDay, n + 1);
+   g_capSym[n] = sym;
+   g_capDay[n] = g_day;
+   return true;
+  }
+
+void ReportCap(const string strat, const string sym, const double rawRisk, const double lossPerLot, const double lots,
+               const string by)
+  {
+   if(by == "" || lossPerLot <= 0.0)
+      return;
+   string msg = StringFormat("lot cap: intended %.2f lots, sending %.2f (%s %s, limited by %s)",
+                             rawRisk / lossPerLot, lots, strat, sym, by);
+   if(CapNoticeDue(sym))
+      Log(msg, true);
+   else
+      if(InpVerbose)
+         Log(msg);
   }
 
 bool MarginOK(const string sym, const int dir, const double lots, const double price)
@@ -788,18 +1175,218 @@ double CommissionPips(const string sym, const double ask)
    return InpCommissionPerLot / pv;
   }
 
+//+------------------------------------------------------------------+
+//| Order execution: retries, filling fallback, close back-off        |
+//+------------------------------------------------------------------+
+void AddFilling(ENUM_ORDER_TYPE_FILLING &arr[], const ENUM_ORDER_TYPE_FILLING f)
+  {
+   int n = ArraySize(arr);
+   for(int i = 0; i < n; i++)
+      if(arr[i] == f)
+         return;
+   ArrayResize(arr, n + 1);
+   arr[n] = f;
+  }
+
+// filling modes to try, in the same order as Python mt5_broker._fillings: allowed FOK / IOC, RETURN, then the rest
+int FillingList(const string sym, ENUM_ORDER_TYPE_FILLING &out[])
+  {
+   ArrayResize(out, 0);
+   long fm = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+   if((fm & SYMBOL_FILLING_FOK) != 0)
+      AddFilling(out, ORDER_FILLING_FOK);
+   if((fm & SYMBOL_FILLING_IOC) != 0)
+      AddFilling(out, ORDER_FILLING_IOC);
+   AddFilling(out, ORDER_FILLING_RETURN);
+   AddFilling(out, ORDER_FILLING_FOK);
+   AddFilling(out, ORDER_FILLING_IOC);
+   return ArraySize(out);
+  }
+
+bool IsDone(const bool sent, const uint rc)
+  {
+   return sent && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED || rc == TRADE_RETCODE_DONE_PARTIAL);
+  }
+
+bool IsPriceRetcode(const uint rc)
+  {
+   return (rc == TRADE_RETCODE_REQUOTE || rc == TRADE_RETCODE_PRICE_CHANGED || rc == TRADE_RETCODE_PRICE_OFF ||
+           rc == TRADE_RETCODE_TOO_MANY_REQUESTS);
+  }
+
+// the request may have reached the server: never re-send before checking for the position
+bool IsNoReply(const bool sent, const uint rc)
+  {
+   return (rc == TRADE_RETCODE_TIMEOUT || rc == TRADE_RETCODE_CONNECTION || (!sent && rc == 0));
+  }
+
+bool WaitOwnTrade(const string sym, const long magic)
+  {
+   for(int k = 0; k < 3; k++)
+     {
+      Sleep(1000);
+      if(OwnTradeOnSymbol(sym, magic))
+         return true;
+     }
+   return false;
+  }
+
+// market entry with SL/TP absolute (as in Python): up to 3 sends on requote / price changed / off quotes with
+// fresh prices (price 0.0 -> CTrade reads the current bid/ask), filling-mode fallback on INVALID_FILL, and
+// after a timeout / no reply a check for the new position before any re-send
+bool SendEntry(const int dir, const double lots, const string sym, const double sl, const double tp,
+               const long magic, const string cmt, string &err)
+  {
+   err = "";
+   g_trade.SetExpertMagicNumber((ulong)magic);
+   ENUM_ORDER_TYPE_FILLING fills[];
+   int nf = FillingList(sym, fills);
+   int fstep = 0;
+   int priceFails = 0;
+   int noReply = 0;
+   for(int guard = 0; guard < 12; guard++)
+     {
+      g_trade.SetTypeFilling(fills[fstep]);
+      bool sent = (dir > 0) ? g_trade.Buy(lots, sym, 0.0, sl, tp, cmt) : g_trade.Sell(lots, sym, 0.0, sl, tp, cmt);
+      uint rc = g_trade.ResultRetcode();
+      if(IsDone(sent, rc))
+         return true;
+      err = StringFormat("%u %s", rc, g_trade.ResultRetcodeDescription());
+      if(rc == TRADE_RETCODE_INVALID_FILL && fstep + 1 < nf)
+        {
+         fstep++;
+         continue;
+        }
+      if(IsNoReply(sent, rc))
+        {
+         if(WaitOwnTrade(sym, magic))
+           {
+            Log(StringFormat("%s %s: no reply to the order (%s) but the position exists - not re-sent", cmt, sym, err));
+            return true;
+           }
+         noReply++;
+         if(noReply >= 3)
+            return false;
+         continue;
+        }
+      if(IsPriceRetcode(rc))
+        {
+         priceFails++;
+         if(priceFails >= 3)
+            return false;
+         Sleep(300);
+         continue;
+        }
+      return false;
+     }
+   return false;
+  }
+
+int FailIdx(const ulong tk)
+  {
+   for(int i = 0; i < ArraySize(g_failTk); i++)
+      if(g_failTk[i] == tk)
+         return i;
+   return -1;
+  }
+
+void DropFail(const int i)
+  {
+   ArrayRemove(g_failTk, i, 1);
+   ArrayRemove(g_failNext, i, 1);
+   ArrayRemove(g_failNote, i, 1);
+  }
+
+// once per cycle: forget back-off entries of positions that no longer exist
+void PruneFails()
+  {
+   for(int i = ArraySize(g_failTk) - 1; i >= 0; i--)
+      if(!PositionSelectByTicket(g_failTk[i]))
+         DropFail(i);
+  }
+
+// returns true when the position is gone. A failed close is retried with a back-off per ticket (20 s, or 300 s
+// while the market is closed / trading is disabled) and pushed at most once per hour per ticket.
 bool ClosePos(const ulong ticket, const string reason)
   {
    if(!PositionSelectByTicket(ticket))
       return true;
+   int fi = FailIdx(ticket);
+   if(fi >= 0 && Secs(TimeLocal(), g_failNext[fi]) < 0)
+      return false;
    string sym = PositionGetString(POSITION_SYMBOL);
-   g_trade.SetTypeFillingBySymbol(sym);
-   bool ok = g_trade.PositionClose(ticket, (ulong)InpDeviationPoints);
-   if(ok)
+   ENUM_ORDER_TYPE_FILLING fills[];
+   int nf = FillingList(sym, fills);
+   int fstep = 0;
+   int priceFails = 0;
+   int noReply = 0;
+   uint rc = 0;
+   bool done = false;
+   for(int guard = 0; guard < 12; guard++)
+     {
+      g_trade.SetTypeFilling(fills[fstep]);
+      bool sent = g_trade.PositionClose(ticket, (ulong)InpDeviationPoints);
+      rc = g_trade.ResultRetcode();
+      if(IsDone(sent, rc) || rc == TRADE_RETCODE_POSITION_CLOSED || !PositionSelectByTicket(ticket))
+        {
+         done = true;
+         break;
+        }
+      if(rc == TRADE_RETCODE_INVALID_FILL && fstep + 1 < nf)
+        {
+         fstep++;
+         continue;
+        }
+      if(IsNoReply(sent, rc))
+        {
+         noReply++;
+         if(noReply >= 3)
+            break;
+         Sleep(1000);
+         if(!PositionSelectByTicket(ticket))
+           {
+            done = true;
+            break;
+           }
+         continue;
+        }
+      if(IsPriceRetcode(rc))
+        {
+         priceFails++;
+         if(priceFails >= 3)
+            break;
+         Sleep(300);
+         continue;
+        }
+      break;
+     }
+   if(done)
+     {
+      if(fi >= 0)
+         DropFail(fi);
       Log(StringFormat("CLOSE %s #%s (%s)", sym, IntegerToString((long)ticket), reason), true);
-   else
-      Log(StringFormat("CLOSE FAILED %s #%s: %s", sym, IntegerToString((long)ticket), g_trade.ResultRetcodeDescription()), true);
-   return ok;
+      return true;
+     }
+   if(fi < 0)
+     {
+      fi = ArraySize(g_failTk);
+      ArrayResize(g_failTk, fi + 1);
+      ArrayResize(g_failNext, fi + 1);
+      ArrayResize(g_failNote, fi + 1);
+      g_failTk[fi] = ticket;
+      g_failNote[fi] = 0;
+     }
+   bool slow = (rc == TRADE_RETCODE_MARKET_CLOSED || rc == TRADE_RETCODE_TRADE_DISABLED ||
+                rc == TRADE_RETCODE_CLIENT_DISABLES_AT || rc == TRADE_RETCODE_SERVER_DISABLES_AT);
+   int wait = slow ? 300 : 20;
+   datetime now = TimeLocal();
+   g_failNext[fi] = now + wait;
+   bool notify = (g_failNote[fi] == 0 || Secs(now, g_failNote[fi]) >= 3600 || Secs(now, g_failNote[fi]) < 0);
+   if(notify)
+      g_failNote[fi] = now;
+   Log(StringFormat("CLOSE FAILED %s #%s (%s): %u %s - next try in %d s", sym, IntegerToString((long)ticket), reason,
+                    rc, g_trade.ResultRetcodeDescription(), wait), notify);
+   return false;
   }
 
 //+------------------------------------------------------------------+
@@ -939,9 +1526,21 @@ void NRManage(const string sym, const double mid, const datetime nowSrv)
            }
          else
            {
-            Log(StringFormat("modify failed %s: %s", sym, g_trade.ResultRetcodeDescription()));
-            if(tp > 0.0)
-               ClosePos(tk, "TP not placeable");
+            uint rc = g_trade.ResultRetcode();
+            // close only when the price is already beyond the TP (fresh quote); on any other failure (no connection,
+            // too many requests, ...) the position keeps its SL and the time stop, and the TP is retried next bar
+            bool beyond = false;
+            MqlTick t2;
+            if(tp > 0.0 && SymbolInfoTick(sym, t2))
+              {
+               double px2 = (dir > 0) ? t2.bid : t2.ask;
+               beyond = ((dir > 0 && px2 >= tp) || (dir < 0 && px2 <= tp));
+              }
+            if(beyond)
+               ClosePos(tk, "price beyond TP (TP not placeable)");
+            else
+               Log(StringFormat("modify failed %s: %u %s (SL kept, TP retried next bar)", sym, rc,
+                                g_trade.ResultRetcodeDescription()));
            }
         }
      }
@@ -988,33 +1587,41 @@ void NREntry(const string sym, const MqlRates &bar, const double mid, const doub
    if(MathAbs(tp - entry) < (stops + 2) * point)
       return;
    double rf = RiskFraction(true, eq) * SymbolMult(sym);
+   double rawRisk = eq * rf;
+   double lossLot = LossPerLot(sym, dir, entry, sl);
+   string capBy = "";
+   double vcap = VolumeCap(sym, dir, capBy);
+   string by = "";
+   double risk = CappedRisk(rawRisk, lossLot, vcap, capBy, by);
    string why;
-   if(!CanOpen(sym, eq, dir, eq * rf, why))
+   if(!CanOpen(sym, eq, dir, risk, why))
      {
       if(InpVerbose)
          Log(StringFormat("NR %s signal skipped: %s", sym, why));
       return;
      }
-   double lossLot = LossPerLot(sym, dir, entry, sl);
-   double lots = CalcLots(sym, eq * rf, lossLot);
+   double lots = CalcLots(sym, risk, lossLot, vcap);
    if(lots <= 0.0)
      {
       if(InpVerbose)
-         Log(StringFormat("NR %s skipped: lot below minimum (risk %.2f)", sym, eq * rf));
+         Log(StringFormat("NR %s skipped: lot below minimum (risk %.2f)", sym, risk));
       return;
      }
    if(!MarginOK(sym, dir, lots, entry))
       return;
-   g_trade.SetExpertMagicNumber((ulong)InpNRMagic);
-   g_trade.SetTypeFillingBySymbol(sym);
-   bool ok = (dir > 0) ? g_trade.Buy(lots, sym, 0.0, sl, tp, "GT_NR") : g_trade.Sell(lots, sym, 0.0, sl, tp, "GT_NR");
-   string desc = StringFormat("NR %s %s lots=%.2f SL=%s TP=%s risk=%.2f%% ATR=%.1fp cost=%.1fp",
+   ReportCap("NR", sym, rawRisk, lossLot, lots, by);
+   string err = "";
+   bool ok = SendEntry(dir, lots, sym, sl, tp, InpNRMagic, "GT_NR", err);
+   string capTxt = "";
+   if(by != "")
+      capTxt = StringFormat(" [capped from %.2f%%]", rf * 100.0);
+   string desc = StringFormat("NR %s %s lots=%.2f SL=%s TP=%s risk=%.2f%%%s ATR=%.1fp cost=%.1fp",
                               (dir > 0 ? "BUY" : "SELL"), sym, lots, DoubleToString(sl, digits),
-                              DoubleToString(tp, digits), rf * 100.0, atrv / pip, cost);
-   if(ok && (g_trade.ResultRetcode() == TRADE_RETCODE_DONE || g_trade.ResultRetcode() == TRADE_RETCODE_PLACED))
+                              DoubleToString(tp, digits), (eq > 0.0 ? risk / eq : rf) * 100.0, capTxt, atrv / pip, cost);
+   if(ok)
       Log("OPEN " + desc, true);
    else
-      Log("ORDER FAILED " + desc + ": " + g_trade.ResultRetcodeDescription(), true);
+      Log("ORDER FAILED " + desc + ": " + err, true);
   }
 
 void ProcessNR(const datetime nowSrv, const double eq)
@@ -1030,13 +1637,11 @@ void ProcessNR(const datetime nowSrv, const double eq)
       double mid, upper, lower, atrv;
       if(!NRIndicators(sym, bar, mid, upper, lower, atrv))
          continue;
-      bool first = (g_lastBar[i] == 0);
       g_lastBar[i] = bar.time;
       NRManage(sym, mid, nowSrv);
-      // entries only on a fresh bar close (avoid acting on stale bars after restarts / data gaps)
-      if(nowSrv - (bar.time + 900) > 150)
-         continue;
-      if(first && !g_tester && nowSrv - (bar.time + 900) > 60)
+      // entries only on a fresh bar close (avoid acting on stale bars after restarts / data gaps);
+      // the same 150 s window as Python (engine.py FRESH_SIGNAL), also for the first bar after a start
+      if(nowSrv - (bar.time + 900) > GT_FRESH_SEC)
          continue;
       NREntry(sym, bar, mid, upper, lower, atrv, eq);
      }
@@ -1073,6 +1678,8 @@ void ProcessES(const datetime nowSrv, const double eq)
       return;
    if(u.day_of_week < 1 || u.day_of_week > 5 || u.hour != InpESEntryUTC || u.min >= 15)
       return;
+   if(!ClockAllowsEntries())
+      return;   // decide only on a verified broker clock (the day stays open until the clock is verified)
    if(HasESPosition())
       return;
    MqlTick tick;
@@ -1092,13 +1699,19 @@ void ProcessES(const datetime nowSrv, const double eq)
    double entry = (dir > 0) ? tick.ask : tick.bid;
    double sl = NormalizeDouble(entry - dir * InpESSLATRMult * a, digits);
    double rf = RiskFraction(false, eq) * SymbolMult(g_esSym);
+   double rawRisk = eq * rf;
+   double lossLot = LossPerLot(g_esSym, dir, entry, sl);
+   string capBy = "";
+   double vcap = VolumeCap(g_esSym, dir, capBy);
+   string by = "";
+   double risk = CappedRisk(rawRisk, lossLot, vcap, capBy, by);
    string why;
-   if(!CanOpen(g_esSym, eq, dir, eq * rf, why))
+   if(!CanOpen(g_esSym, eq, dir, risk, why))
      {
       Log("ES signal skipped: " + why);
       return;
      }
-   double lots = CalcLots(g_esSym, eq * rf, LossPerLot(g_esSym, dir, entry, sl));
+   double lots = CalcLots(g_esSym, risk, lossLot, vcap);
    if(lots <= 0.0)
      {
       Log("ES skipped: lot below minimum");
@@ -1106,15 +1719,790 @@ void ProcessES(const datetime nowSrv, const double eq)
      }
    if(!MarginOK(g_esSym, dir, lots, entry))
       return;
-   g_trade.SetExpertMagicNumber((ulong)InpESMagic);
-   g_trade.SetTypeFillingBySymbol(g_esSym);
-   bool ok = (dir > 0) ? g_trade.Buy(lots, g_esSym, 0.0, sl, 0.0, "GT_ES") : g_trade.Sell(lots, g_esSym, 0.0, sl, 0.0, "GT_ES");
-   string desc = StringFormat("ES %s %s lots=%.2f SL=%s risk=%.2f%% ATR(H1)=%.1fp", (dir > 0 ? "BUY" : "SELL"),
-                              g_esSym, lots, DoubleToString(sl, digits), rf * 100.0, a / pip);
-   if(ok && (g_trade.ResultRetcode() == TRADE_RETCODE_DONE || g_trade.ResultRetcode() == TRADE_RETCODE_PLACED))
+   ReportCap("ES", g_esSym, rawRisk, lossLot, lots, by);
+   string err = "";
+   bool ok = SendEntry(dir, lots, g_esSym, sl, 0.0, InpESMagic, "GT_ES", err);
+   string capTxt = "";
+   if(by != "")
+      capTxt = StringFormat(" [capped from %.2f%%]", rf * 100.0);
+   string desc = StringFormat("ES %s %s lots=%.2f SL=%s risk=%.2f%%%s ATR(H1)=%.1fp", (dir > 0 ? "BUY" : "SELL"),
+                              g_esSym, lots, DoubleToString(sl, digits), (eq > 0.0 ? risk / eq : rf) * 100.0, capTxt,
+                              a / pip);
+   if(ok)
       Log("OPEN " + desc, true);
    else
-      Log("ORDER FAILED " + desc + ": " + g_trade.ResultRetcodeDescription(), true);
+      Log("ORDER FAILED " + desc + ": " + err, true);
+  }
+
+//+------------------------------------------------------------------+
+//| Cash flows: deposits / withdrawals / credit / bonus are not P/L   |
+//+------------------------------------------------------------------+
+bool IsCashFlow(const long dealType)
+  {
+   return (dealType == DEAL_TYPE_BALANCE || dealType == DEAL_TYPE_CREDIT || dealType == DEAL_TYPE_BONUS);
+  }
+
+// first run (no persisted cursor): every deal already in the history counts as seen and is NOT applied
+void PrimeFlowCursor()
+  {
+   ulong mx = 0;
+   int n = 0;
+   if(HistorySelect(0, GT_FAR_FUTURE))
+     {
+      n = HistoryDealsTotal();
+      for(int i = 0; i < n; i++)
+        {
+         ulong tk = HistoryDealGetTicket(i);
+         if(tk > mx)
+            mx = tk;
+        }
+     }
+   g_flowTicket = mx;
+   g_allTicket = mx;
+   g_flowScan = TimeCurrent();
+   Log(StringFormat("cash-flow tracking started: %d existing deals marked as seen (cursor #%s)", n,
+                    IntegerToString((long)mx)));
+  }
+
+// sums new cash-flow deals (ticket > cursor). Returns true when the history holds any deal newer than the
+// newest one seen before (the balance change is explained).
+bool ScanDeals(double &flow, int &count)
+  {
+   flow = 0.0;
+   count = 0;
+   datetime base = (g_flowScan > 0) ? g_flowScan : TimeCurrent();
+   long fromL = (long)base - 2 * 86400;          // overlap; de-duplicated by ticket
+   if(fromL < 0)
+      fromL = 0;
+   if(!HistorySelect((datetime)fromL, GT_FAR_FUTURE))
+      return false;
+   bool fresh = false;
+   ulong maxFlow = g_flowTicket;
+   int n = HistoryDealsTotal();
+   for(int i = 0; i < n; i++)
+     {
+      ulong tk = HistoryDealGetTicket(i);
+      if(tk == 0)
+         continue;
+      if(tk > g_allTicket)
+        {
+         g_allTicket = tk;
+         fresh = true;
+        }
+      if(tk <= g_flowTicket)
+         continue;
+      if(!IsCashFlow(HistoryDealGetInteger(tk, DEAL_TYPE)))
+         continue;
+      flow += HistoryDealGetDouble(tk, DEAL_PROFIT);
+      count++;
+      if(tk > maxFlow)
+         maxFlow = tk;
+     }
+   g_flowTicket = maxFlow;
+   g_flowScan = TimeCurrent();
+   return fresh;
+  }
+
+// rescale every equity baseline by k = E / (E - F) so that the percentage guards (DD scaling, max-DD halt,
+// daily limit, monthly stop, vol target / equity filter) stay exactly where they were before the flow
+void ApplyCashFlow(const double flow, const int count, const double eq)
+  {
+   g_stateDirty = true;
+   if(flow == 0.0)
+     {
+      Log(StringFormat("CASH FLOW: %d deals netting to 0 detected, guards unchanged", count));
+      return;
+     }
+   double before = eq - flow;
+   double k = (before > 0.0) ? eq / before : 0.0;
+   string how = "";
+   if(k >= 0.02 && k <= 50.0)
+     {
+      g_peak *= k;
+      g_dayStartEq *= k;
+      g_monthStartEq *= k;
+      g_lastEq *= k;
+      for(int i = 0; i < ArraySize(g_dailyEq); i++)
+         g_dailyEq[i] *= k;
+      how = StringFormat("x%.4f", k);
+     }
+   else
+     {
+      g_peak = eq;
+      g_dayStartEq = eq;
+      g_monthStartEq = eq;
+      g_lastEq = eq;
+      for(int i = 0; i < ArraySize(g_dailyEq); i++)
+         g_dailyEq[i] = eq;
+      how = "rebased to current equity";
+     }
+   if(count > 1)
+      how += StringFormat(", %d deals", count);
+   Log(StringFormat("CASH FLOW %+.2f detected, guards rebased (%s)", flow, how), true);
+  }
+
+// returns false while a balance change is not yet explained by the deal history (no guard decision this cycle,
+// at most 60 s); live only
+bool HandleCashFlows(const double eq)
+  {
+   if(g_tester)
+      return true;
+   double bc = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT);
+   if(g_lastBalCred != 0.0 && MathAbs(bc - g_lastBalCred) < 0.005)
+      return true;
+   double flow = 0.0;
+   int count = 0;
+   bool fresh = ScanDeals(flow, count);
+   if(count > 0)
+      ApplyCashFlow(flow, count, eq);
+   if(fresh || g_lastBalCred == 0.0)
+     {
+      g_lastBalCred = bc;
+      g_pendingSince = 0;
+      return true;
+     }
+   datetime now = TimeLocal();
+   if(g_pendingSince == 0)
+      g_pendingSince = now;
+   if(Secs(now, g_pendingSince) > 60 || Secs(now, g_pendingSince) < 0)
+     {
+      Log(StringFormat("balance changed by %+.2f without a matching deal in the history: treated as profit/loss",
+                       bc - g_lastBalCred), true);
+      g_lastBalCred = bc;
+      g_pendingSince = 0;
+      return true;
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Broker clock verification (live only; the tester uses the rule)   |
+//+------------------------------------------------------------------+
+void TrackServerTime(const datetime srv)
+  {
+   if(srv > g_lastSrvSeen)
+     {
+      if(g_lastSrvSeen > 0)
+         g_srvAdvAt = TimeLocal();
+      g_lastSrvSeen = srv;
+     }
+  }
+
+// server - UTC offset from the newest tick, rounded to 30 min; valid only for a fresh tick
+// (same test as Python engine: within 120 s of a half-hour step, and the server time advanced recently)
+bool ObserveOffset(long &obs)
+  {
+   datetime srv = TimeCurrent();
+   datetime gmt = TimeGMT();
+   if(srv <= 0 || gmt <= 0)
+      return false;
+   if(g_srvAdvAt == 0 || Secs(TimeLocal(), g_srvAdvAt) > GT_CLOCK_ADV_SEC || Secs(TimeLocal(), g_srvAdvAt) < 0)
+      return false;
+   long diff = (long)srv - (long)gmt;
+   long nearest = (long)MathRound((double)diff / 1800.0) * 1800;
+   if(MathAbs((double)(diff - nearest)) > GT_CLOCK_TOL_SEC || MathAbs((double)nearest) > 14.0 * 3600.0)
+      return false;
+   obs = nearest;
+   return true;
+  }
+
+bool ClockAllowsEntries()
+  {
+   if(g_tester)
+      return true;
+   return (g_clkVerified && !g_clkBlocked);
+  }
+
+string ClockBlockReason()
+  {
+   if(g_clkBlocked)
+      return "broker clock mismatch";
+   return "broker clock not verified yet";
+  }
+
+void AdoptOffset(const long obs)
+  {
+   bool had = g_clkHave;
+   long old = g_clkOffset;
+   g_clkOffset = obs;
+   g_clkHave = true;
+   g_clkVerified = true;
+   g_clkBlocked = false;
+   g_clkMismatch = 0;
+   g_clkCandN = 0;
+   g_stateDirty = true;
+   if(!had)
+      Log(StringFormat("broker clock measured: server = UTC%+.1f h (AUTO); new entries enabled", obs / 3600.0), true);
+   else
+      Log(StringFormat("broker clock offset changed: UTC%+.1f h -> UTC%+.1f h (AUTO, %d identical observations)",
+                       old / 3600.0, obs / 3600.0, GT_CLOCK_CONFIRM), true);
+  }
+
+void ClockMatch(const long obs)
+  {
+   bool wasBlocked = g_clkBlocked;
+   bool wasVerified = g_clkVerified;
+   g_clkVerified = true;
+   g_clkBlocked = false;
+   g_clkMismatch = 0;
+   g_clkCandN = 0;
+   if(wasBlocked)
+      Log(StringFormat("broker clock matches again (UTC%+.1f h): new entries re-enabled", obs / 3600.0), true);
+   else
+      if(!wasVerified)
+         Log(StringFormat("broker clock verified: server = UTC%+.1f h (%s)", obs / 3600.0, EnumToString(g_clockMode)));
+  }
+
+// one counted observation per minute (the first one at once). AUTO adopts a changed offset after 3 identical
+// observations; explicit modes block new entries after 3 consecutive mismatches. Closes, time stops, TP
+// management and hard stops always run with the clock in use (last persisted offset, or NY7 if none).
+void CheckClock()
+  {
+   if(g_tester)
+      return;
+   datetime now = TimeLocal();
+   if(g_clkLastObs != 0 && Secs(now, g_clkLastObs) < GT_CLOCK_OBS_SEC && Secs(now, g_clkLastObs) >= 0)
+      return;
+   long obs = 0;
+   if(!ObserveOffset(obs))
+      return;   // market closed / stale ticks: keep the last verdict
+   g_clkLastObs = now;
+   if(g_clockMode == GT_SERVER_AUTO)
+     {
+      if(!g_clkHave)
+        {
+         AdoptOffset(obs);
+         return;
+        }
+      if(obs == g_clkOffset)
+        {
+         ClockMatch(obs);
+         return;
+        }
+      if(g_clkCandN > 0 && obs == g_clkCand)
+         g_clkCandN++;
+      else
+        {
+         g_clkCand = obs;
+         g_clkCandN = 1;
+        }
+      g_clkMismatch++;
+      Log(StringFormat("broker clock observation UTC%+.1f h differs from UTC%+.1f h in use (%d/%d)",
+                       obs / 3600.0, g_clkOffset / 3600.0, g_clkCandN, GT_CLOCK_CONFIRM));
+      if(g_clkCandN >= GT_CLOCK_CONFIRM)
+        {
+         AdoptOffset(obs);
+         return;
+        }
+      if(g_clkMismatch >= GT_CLOCK_CONFIRM && !g_clkBlocked)
+        {
+         g_clkBlocked = true;
+         Log(StringFormat("broker clock unstable: observations disagree with UTC%+.1f h - new entries blocked",
+                          g_clkOffset / 3600.0), true);
+        }
+      return;
+     }
+   datetime srv = TimeCurrent();
+   long expected = (long)srv - (long)ServerToUTC(srv);
+   if(obs == expected)
+     {
+      ClockMatch(obs);
+      return;
+     }
+   g_clkMismatch++;
+   if(g_clkMismatch >= GT_CLOCK_CONFIRM && !g_clkBlocked)
+     {
+      g_clkBlocked = true;
+      Log(StringFormat("broker clock mismatch: observed %+.1f h, expected %+.1f h (InpServerTime=%s). New entries blocked; "
+                       "closes and stops keep working. Use GT_SERVER_AUTO or correct the setting / PC clock.",
+                       obs / 3600.0, expected / 3600.0, EnumToString(InpServerTime)), true);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Monitoring (notification only, never changes trading)             |
+//+------------------------------------------------------------------+
+bool Ready()
+  {
+   if(g_tester)
+      return true;
+   return (TerminalInfoInteger(TERMINAL_CONNECTED) != 0 && AccountInfoInteger(ACCOUNT_LOGIN) > 0 &&
+           AccountInfoDouble(ACCOUNT_EQUITY) > 0.0);
+  }
+
+void MonitorConnection()
+  {
+   if(g_tester)
+      return;
+   datetime now = TimeLocal();
+   if(TerminalInfoInteger(TERMINAL_CONNECTED) != 0)
+     {
+      if(g_discNotified)
+         Log("connection to the trade server restored", true);
+      g_discSince = 0;
+      g_discNotified = false;
+      return;
+     }
+   if(g_discSince == 0)
+      g_discSince = now;
+   if(Secs(now, g_discSince) >= 600 && (!g_discNotified || Secs(now, g_discNote) >= GT_REPEAT_SEC))
+     {
+      Log(StringFormat("DISCONNECTED from the trade server for %d min", (int)(Secs(now, g_discSince) / 60)), true);
+      g_discNotified = true;
+      g_discNote = now;
+     }
+  }
+
+// run-time permission checks; while trading is blocked no close or entry is sent, state keeps updating
+bool TradingPermitted(string &why)
+  {
+   why = "";
+   if(g_tester)
+      return true;
+   if(TerminalInfoInteger(TERMINAL_CONNECTED) == 0)
+      why = "terminal not connected to the trade server";
+   else
+      if(TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) == 0)
+         why = "Algo Trading is disabled in the terminal";
+      else
+         if(MQLInfoInteger(MQL_TRADE_ALLOWED) == 0)
+            why = "'Allow Algo Trading' is unchecked in the EA properties";
+         else
+            if(AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) == 0)
+               why = "trading is disabled for this account (investor password?)";
+            else
+               if(AccountInfoInteger(ACCOUNT_TRADE_EXPERT) == 0)
+                  why = "the broker does not allow expert trading on this account";
+   int now = (why == "") ? 1 : 0;
+   datetime t = TimeLocal();
+   if(now != g_permit)
+     {
+      if(now == 0)
+         Log("TRADING BLOCKED: " + why, true);
+      else
+         if(g_permit == 0)
+            Log("trading permitted again", true);
+      g_permit = now;
+      g_permitNote = t;
+     }
+   else
+      if(now == 0 && Secs(t, g_permitNote) >= GT_REPEAT_SEC)
+        {
+         Log("TRADING STILL BLOCKED: " + why, true);
+         g_permitNote = t;
+        }
+   return (now == 1);
+  }
+
+string StatusText()
+  {
+   string s = "";
+   if(g_halted)
+      s += ", HALTED (max DD)";
+   if(g_monthHalted)
+      s += ", month stop";
+   if(g_dayHalted)
+      s += ", day stop";
+   if(InBlackout())
+      s += ", blackout";
+   if(!ClockAllowsEntries())
+      s += ", entries blocked: " + ClockBlockReason();
+   if(g_permit == 0)
+      s += ", trading blocked";
+   if(s == "")
+      return "ok";
+   return StringSubstr(s, 2);
+  }
+
+void CheckDDAlert(const double eq)
+  {
+   if(g_tester || InpDDAlert <= 0.0 || eq <= 0.0)
+      return;
+   double dd = Drawdown(eq);
+   if(dd * 100.0 < InpDDAlert || g_ddAlertDay == g_day)
+      return;
+   g_ddAlertDay = g_day;   // at most once per market day while above the level
+   Log(StringFormat("DD ALERT: drawdown %.1f%% from peak %.2f (equity %.2f; alert at %.1f%%, halt at %.1f%%)",
+                    dd * 100.0, g_peak, eq, InpDDAlert, InpMaxDDHalt), true);
+  }
+
+// our deals of the market day mday (entries opened, exits closed, net P/L incl. swap and commission)
+void CountDayTrades(const datetime mday, int &opened, int &closed, double &pl)
+  {
+   opened = 0;
+   closed = 0;
+   pl = 0.0;
+   long fromL = (long)mday - 3 * 86400;
+   if(fromL < 0)
+      fromL = 0;
+   if(!HistorySelect((datetime)fromL, (datetime)((long)mday + 3 * 86400)))
+      return;
+   int n = HistoryDealsTotal();
+   long ids[];
+   int nid = 0;
+   for(int i = 0; i < n; i++)
+     {
+      ulong tk = HistoryDealGetTicket(i);
+      if(tk == 0)
+         continue;
+      if(IsOurMagic(HistoryDealGetInteger(tk, DEAL_MAGIC)) && HistoryDealGetInteger(tk, DEAL_ENTRY) == DEAL_ENTRY_IN)
+        {
+         ArrayResize(ids, nid + 1);
+         ids[nid] = HistoryDealGetInteger(tk, DEAL_POSITION_ID);
+         nid++;
+        }
+     }
+   for(int i = 0; i < n; i++)
+     {
+      ulong tk = HistoryDealGetTicket(i);
+      if(tk == 0)
+         continue;
+      long type = HistoryDealGetInteger(tk, DEAL_TYPE);
+      if(type != DEAL_TYPE_BUY && type != DEAL_TYPE_SELL)
+         continue;
+      bool ours = IsOurMagic(HistoryDealGetInteger(tk, DEAL_MAGIC));
+      long pid = HistoryDealGetInteger(tk, DEAL_POSITION_ID);
+      for(int j = 0; j < nid && !ours; j++)
+         if(ids[j] == pid)
+            ours = true;
+      if(!ours)
+         continue;
+      datetime dt = (datetime)HistoryDealGetInteger(tk, DEAL_TIME);
+      if(DayStart(ServerToMarket(dt)) != mday)
+         continue;
+      if(HistoryDealGetInteger(tk, DEAL_ENTRY) == DEAL_ENTRY_IN)
+         opened++;
+      else
+         closed++;
+      pl += HistoryDealGetDouble(tk, DEAL_PROFIT) + HistoryDealGetDouble(tk, DEAL_SWAP) +
+            HistoryDealGetDouble(tk, DEAL_COMMISSION);
+     }
+  }
+
+// at each market-day change (live): equity, DD, month-to-date flow-adjusted return, trades of the day, state
+void DailySummary(const double eq)
+  {
+   if(!g_sumPending)
+      return;
+   g_sumPending = false;
+   if(g_tester)
+      return;
+   int opened = 0;
+   int closed = 0;
+   double pl = 0.0;
+   CountDayTrades(g_sumDay, opened, closed, pl);
+   Log(StringFormat("DAILY %s: equity %.2f, DD %.2f%%, month-to-date %+.2f%% (flow-adjusted), "
+                    "trades %d opened / %d closed, P/L %.2f, state: %s",
+                    TimeToString(g_sumDay, TIME_DATE), eq, Drawdown(eq) * 100.0, g_sumMonthRet * 100.0,
+                    opened, closed, pl, StatusText()), true);
+  }
+
+// FX market hours in market time (NY+7): Monday 00:00 to Friday 24:00, without Dec 25 and Jan 1
+bool MarketOpenNow()
+  {
+   datetime mkt = UTCToMarket(TimeGMT());
+   MqlDateTime s;
+   TimeToStruct(mkt, s);
+   if(s.day_of_week == 0 || s.day_of_week == 6)
+      return false;
+   if((s.mon == 12 && s.day == 25) || (s.mon == 1 && s.day == 1))
+      return false;
+   if(s.day_of_week == 1 && s.hour == 0 && s.min < 30)
+      return false;   // weekly open: some brokers start quoting late
+   return true;
+  }
+
+void CheckStaleFeed()
+  {
+   if(g_tester || TerminalInfoInteger(TERMINAL_CONNECTED) == 0)
+      return;
+   datetime now = TimeLocal();
+   datetime ref = (g_srvAdvAt > g_startLocal) ? g_srvAdvAt : g_startLocal;
+   bool stale = (Secs(now, ref) > GT_STALE_FEED_SEC && MarketOpenNow());
+   if(stale)
+     {
+      if(!g_staleNotified || Secs(now, g_staleNote) >= GT_REPEAT_SEC)
+        {
+         Log(StringFormat("STALE FEED: no new quote for %d min while the market should be open (last server time %s)",
+                          (int)(Secs(now, ref) / 60), TimeToString(g_lastSrvSeen, TIME_DATE | TIME_MINUTES)), true);
+         g_staleNotified = true;
+         g_staleNote = now;
+        }
+     }
+   else
+      if(g_staleNotified && g_srvAdvAt > g_staleNote)
+        {
+         Log("quotes are coming in again", true);
+         g_staleNotified = false;
+        }
+  }
+
+//+------------------------------------------------------------------+
+//| Single instance per account                                       |
+//+------------------------------------------------------------------+
+string LockName(const long login)
+  {
+   return "GT_" + IntegerToString(login) + "_lock";
+  }
+
+// 1 = lock held, 0 = account not known yet (retry later), -1 = held by another live instance
+int AcquireLock()
+  {
+   if(g_tester)
+      return 1;
+   long login = AccountInfoInteger(ACCOUNT_LOGIN);
+   if(login <= 0)
+      return 0;
+   if(g_lockToken <= 0.0)
+     {
+      long cid = ChartID();
+      if(cid < 0)
+         cid = -cid;
+      g_lockToken = 1.0 + (double)(cid % 1000000000);   // per chart; kept across chart/parameter changes
+     }
+   string nm = LockName(login);
+   string hb = nm + "hb";
+   double holder = 0.0;
+   if(GlobalVariableCheck(nm))
+      holder = GlobalVariableGet(nm);
+   else
+     {
+      GlobalVariableTemp(nm);   // temporary: never written to disk, gone when the terminal stops
+      GlobalVariableSet(nm, 0.0);
+     }
+   double beat = 0.0;
+   if(GlobalVariableCheck(hb))
+      beat = GlobalVariableGet(hb);
+   bool fresh = (beat > 0.0 && MathAbs((double)TimeLocal() - beat) <= GT_LOCK_STALE_SEC);
+   if(holder != 0.0 && holder != g_lockToken && fresh)
+      return -1;
+   if(holder != g_lockToken && !GlobalVariableSetOnCondition(nm, g_lockToken, holder))
+      return -1;
+   if(!GlobalVariableCheck(hb))
+      GlobalVariableTemp(hb);
+   GlobalVariableSet(hb, (double)TimeLocal());
+   g_lockHeld = true;
+   g_lockLogin = login;
+   g_lockBeat = TimeLocal();
+   return 1;
+  }
+
+// stops this copy (and returns false) when another instance holds the lock; the losing copy does not save state
+void StopThisCopy(const string msg)
+  {
+   g_stopping = true;
+   g_lockHeld = false;
+   g_stateLoaded = false;
+   Log(msg, true);
+   FlushNotify(true);
+   ExpertRemove();
+  }
+
+bool LockHeartbeat()
+  {
+   if(g_tester || !g_lockHeld)
+      return true;
+   datetime now = TimeLocal();
+   if(Secs(now, g_lockBeat) < GT_LOCK_BEAT_SEC && Secs(now, g_lockBeat) >= 0)
+      return true;
+   string nm = LockName(g_lockLogin);
+   double holder = 0.0;
+   if(GlobalVariableCheck(nm))
+      holder = GlobalVariableGet(nm);
+   if(holder != g_lockToken)
+     {
+      if(holder != 0.0)
+        {
+         StopThisCopy("another GreatestTrader instance took over this account - this copy stops");
+         return false;
+        }
+      g_lockHeld = false;   // lock deleted by hand: take it again
+      if(AcquireLock() < 0)
+        {
+         StopThisCopy("another GreatestTrader instance runs on this account - this copy stops");
+         return false;
+        }
+      return true;
+     }
+   GlobalVariableSet(nm + "hb", (double)now);
+   g_lockBeat = now;
+   return true;
+  }
+
+void ReleaseLock()
+  {
+   if(g_tester || !g_lockHeld)
+      return;
+   string nm = LockName(g_lockLogin);
+   if(GlobalVariableCheck(nm) && GlobalVariableGet(nm) == g_lockToken)
+     {
+      GlobalVariableSet(nm, 0.0);
+      if(GlobalVariableCheck(nm + "hb"))
+         GlobalVariableSet(nm + "hb", 0.0);
+     }
+   g_lockHeld = false;
+  }
+
+//+------------------------------------------------------------------+
+//| Start-up: state is loaded on the first Ready() cycle               |
+//+------------------------------------------------------------------+
+// InpResetHalt: clears the max-DD halt and rebases the peak once; a persisted marker stops a forgotten
+// InpResetHalt=true from clearing a later halt at every restart (re-armed by a start with InpResetHalt=false)
+void ApplyResetHalt(const double eq)
+  {
+   if(g_tester)
+      return;
+   if(!InpResetHalt)
+     {
+      g_resetHaltDone = false;
+      return;
+     }
+   if(g_resetHaltDone)
+     {
+      Log("InpResetHalt=true was already applied: set it back to false (the halt is not cleared again)", true);
+      return;
+     }
+   bool was = g_halted;
+   double oldPeak = g_peak;
+   g_halted = false;
+   g_peak = eq;
+   g_resetHaltDone = true;
+   g_stateDirty = true;
+   Log(StringFormat("RESET HALT (InpResetHalt): halt %s -> off, peak %.2f -> %.2f (current equity); other state kept. "
+                    "Set InpResetHalt back to false.", was ? "on" : "off", oldPeak, eq), true);
+  }
+
+bool EnsureState()
+  {
+   if(g_stateLoaded)
+      return true;
+   long login = AccountInfoInteger(ACCOUNT_LOGIN);
+   if(!g_tester)
+     {
+      // the margin mode is reliable only after authorisation (netting = 0 before it), hence checked here too
+      if(AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+        {
+         Log("NETTING / exchange account: GreatestTrader needs a HEDGING account (on netting, closing the EA position "
+             "would also close manual or other-EA volume on the same symbol). The EA stops.", true);
+         g_stopping = true;
+         FlushNotify(true);
+         ExpertRemove();
+         return false;
+        }
+      int lk = AcquireLock();
+      if(lk < 0)
+        {
+         StopThisCopy("another GreatestTrader instance runs on this account - this copy stops");
+         return false;
+        }
+      if(lk == 0)
+         return false;
+     }
+   g_gvPrefix = "GT_" + IntegerToString(login) + "_";
+   ArrayResize(g_gvName, 0);
+   ArrayResize(g_gvVal, 0);
+   g_gvRefreshAt = 0;
+   ResetStateVars();
+   bool flowKnown = false;
+   if(!g_tester)
+     {
+      flowKnown = GlobalVariableCheck(g_gvPrefix + "flowtk");
+      LoadState();
+     }
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(g_peak <= 0.0)
+      g_peak = eq;
+   if(!g_tester && !flowKnown)
+      PrimeFlowCursor();
+   ApplyResetHalt(eq);
+   g_stateLoaded = true;
+   g_stateDirty = true;
+   if(!g_tester)
+     {
+      string clk = "none";
+      if(g_clkHave)
+         clk = "UTC" + DoubleToString(g_clkOffset / 3600.0, 1) + " h";
+      Log(StringFormat("state loaded (%s*): peak %.2f, DD %.1f%%, halted=%s, month stop=%s, persisted clock offset=%s",
+                       g_gvPrefix, g_peak, Drawdown(eq) * 100.0, g_halted ? "yes" : "no", g_monthHalted ? "yes" : "no",
+                       clk));
+     }
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Input validation (parity with Python Config.validate)             |
+//+------------------------------------------------------------------+
+bool Bad(const string msg)
+  {
+   Print("[GT] invalid input: ", msg);
+   return false;
+  }
+
+bool PctOK(const double v)
+  {
+   return (v >= 0.0 && v <= 100.0);
+  }
+
+bool ValidateInputs()
+  {
+   if(InpRiskProfile != GT_RISK_CONSERVATIVE && InpRiskProfile != GT_RISK_STANDARD &&
+      InpRiskProfile != GT_RISK_AGGRESSIVE && InpRiskProfile != GT_RISK_CUSTOM)
+      return Bad("InpRiskProfile must be 0..3");
+   if(InpServerTime != GT_SERVER_NY7 && InpServerTime != GT_SERVER_FIXED && InpServerTime != GT_SERVER_AUTO)
+      return Bad("InpServerTime must be 0 (NY7), 1 (Fixed) or 2 (Auto)");
+   if(BaseRisk(true) < 0.0 || BaseRisk(true) > 0.05 + 1e-12 || BaseRisk(false) < 0.0 || BaseRisk(false) > 0.05 + 1e-12)
+      return Bad("risk per trade (InpRiskNR / InpRiskES) must be between 0 and 5 percent");
+   if(InpBBPeriod < 2 || InpATRPeriod < 2 || InpMaxHoldBars < 1 || InpESATRPeriodH1 < 1)
+      return Bad("indicator periods must be >= 2 (ES ATR >= 1) and InpMaxHoldBars >= 1");
+   if(InpBBDev <= 0.0 || InpSLATRMult <= 0.0 || InpESSLATRMult <= 0.0 || InpATRCostMult < 0.0)
+      return Bad("InpBBDev, InpSLATRMult and InpESSLATRMult must be > 0, InpATRCostMult >= 0");
+   if(InpMaxOpen < 1 || InpMaxPerCurrency < 1)
+      return Bad("InpMaxOpen and InpMaxPerCurrency must be >= 1");
+   if(InpMaxSameDirPerCcy < 0 || InpVolLookbackDays < 0 || InpEqFilterDays < 0)
+      return Bad("InpMaxSameDirPerCcy, InpVolLookbackDays and InpEqFilterDays must be >= 0");
+   if(!PctOK(InpMaxTotalRisk) || !PctOK(InpDailyLossLimit) || !PctOK(InpDailyHardStop) || !PctOK(InpMonthlyLossLimit) ||
+      !PctOK(InpMonthlyHardStop) || !PctOK(InpMaxDDHalt) || !PctOK(InpDDScaleFull) || !PctOK(InpVolTargetDaily) ||
+      !PctOK(InpDDAlert))
+      return Bad("percentage limits (total risk, daily/monthly limits and stops, max DD halt, DD scaling, vol target, "
+                 "DD alert) must be between 0 and 100");
+   if(InpDDScaleFloor < 0.0 || InpDDScaleFloor > 1.0 || InpEqFilterMult < 0.0 || InpEqFilterMult > 1.0)
+      return Bad("InpDDScaleFloor and InpEqFilterMult must be between 0 and 1");
+   if(InpVolMultMin < 0.0 || InpVolMultMin > InpVolMultMax)
+      return Bad("need 0 <= InpVolMultMin <= InpVolMultMax");
+   if(InpMaxLotsPerOrder < 0.0 || InpMaxRiskAmount < 0.0)
+      return Bad("InpMaxLotsPerOrder and InpMaxRiskAmount must be >= 0 (0 = off)");
+   if(InpEntryHour1 < 0 || InpEntryHour1 > 23 || InpEntryHour2 < -1 || InpEntryHour2 > 23)
+      return Bad("NR entry hours must be 0..23 (InpEntryHour2 may be -1)");
+   if(InpMaxBandZ < 0.0 || InpMaxBarRangeATR < 0.0)
+      return Bad("news filters InpMaxBandZ / InpMaxBarRangeATR must be >= 0 (0 = off)");
+   if(InpNRSlippagePips < 0.0 || InpNRMaxSpreadPips < 0.0 || InpESMaxSpreadPips < 0.0)
+      return Bad("slippage and max spread inputs must be >= 0");
+   if(!(0 <= InpESEntryUTC && InpESEntryUTC < InpESExitUTC && InpESExitUTC <= 23))
+      return Bad("need 0 <= InpESEntryUTC < InpESExitUTC <= 23");
+   if(InpESDirection != -1 && InpESDirection != 1)
+      return Bad("InpESDirection must be -1 (sell) or 1 (buy)");
+   if(InpNRMagic <= 0 || InpESMagic <= 0 || InpNRMagic == InpESMagic)
+      return Bad("InpNRMagic and InpESMagic must be > 0 and different (magic 0 = manual trades)");
+   if(InpDeviationPoints < 0 || InpCommissionPerLot < 0.0)
+      return Bad("InpDeviationPoints and InpCommissionPerLot must be >= 0");
+   if(InpServerTime == GT_SERVER_FIXED)
+     {
+      double h2 = InpServerGMTOffset * 2.0;
+      if(InpServerGMTOffset < -12.0 || InpServerGMTOffset > 14.0 || MathAbs(h2 - MathRound(h2)) > 1e-9)
+         return Bad("InpServerGMTOffset must be within -12..+14 hours in steps of 0.5");
+     }
+   if(!ParseSymbolMult())
+      return false;
+   for(int i = 0; i < ArraySize(g_multVal); i++)
+      if(g_multVal[i] < 0.0 || BaseRisk(true) * g_multVal[i] > 0.05 + 1e-12 || BaseRisk(false) * g_multVal[i] > 0.05 + 1e-12)
+         return Bad("InpSymbolRiskMult: " + g_multSym[i] + " must be >= 0 and risk x multiplier must be <= 5 percent");
+   g_boStart = ParseMMDD(InpBlackoutStart);
+   g_boEnd = ParseMMDD(InpBlackoutEnd);
+   if((StringLen(InpBlackoutStart) > 0 && g_boStart == 0) || (StringLen(InpBlackoutEnd) > 0 && g_boEnd == 0))
+      return Bad("blackout start/end must be MM-DD (e.g. 12-20) or empty");
+   if((g_boStart == 0) != (g_boEnd == 0))
+      return Bad("blackout start/end must both be MM-DD or both empty");
+   return true;
   }
 
 //+------------------------------------------------------------------+
@@ -1122,63 +2510,85 @@ void ProcessES(const datetime nowSrv, const double eq)
 //+------------------------------------------------------------------+
 void ProcessAll()
   {
+   if(g_stopping || !LockHeartbeat())
+      return;
+   if(!Ready())
+     {
+      MonitorConnection();
+      return;   // terminal not connected / not authorised / equity 0: no state change, no save, no orders
+     }
+   MonitorConnection();
+   if(!EnsureState())
+      return;
    datetime nowSrv = TimeCurrent();
    if(nowSrv <= 0)
       return;
+   TrackServerTime(nowSrv);
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-   UpdateEquityState(eq, nowSrv);
-   // while a hard stop is in force our positions must stay flat (also retries failed closes)
-   if(g_flatten)
-      CloseAllOurs(g_flattenReason);
-   else if(g_monthHalted || g_dayHalted)
-      CloseAllOurs(g_monthHalted ? "monthly hard stop" : "daily hard stop");
-   if(InpNREnabled && g_nsym > 0)
-      ProcessNR(nowSrv, eq);
-   if(InpESEnabled && g_esOk)
-      ProcessES(nowSrv, eq);
-   if(!g_tester)
+   if(eq <= 0.0)
+      return;
+   // cash flows are detected BEFORE the equity guards of this cycle
+   if(!HandleCashFlows(eq))
+     {
       SaveState();
+      return;   // balance change not yet in the deal history: decide next cycle (max 60 s)
+     }
+   CheckClock();
+   PruneFails();
+   UpdateEquityState(eq, nowSrv);
+   CheckDDAlert(eq);
+   DailySummary(eq);
+   string why;
+   if(TradingPermitted(why))
+     {
+      // while a hard stop is in force our positions must stay flat (also retries failed closes)
+      if(g_flatten)
+         CloseAllOurs(g_flattenReason);
+      else
+         if(g_monthHalted || g_dayHalted)
+            CloseAllOurs(g_monthHalted ? "monthly hard stop" : "daily hard stop");
+      if(InpNREnabled && g_nsym > 0)
+         ProcessNR(nowSrv, eq);
+      if(InpESEnabled && g_esOk)
+         ProcessES(nowSrv, eq);
+     }
+   CheckStaleFeed();
+   SaveState();
   }
 
 //+------------------------------------------------------------------+
 int OnInit()
   {
    g_tester = (bool)MQLInfoInteger(MQL_TESTER);
-   g_gvPrefix = "GT_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_";
+   g_stopping = false;
+   g_stateLoaded = false;   // (re)loaded from the global variables on the first Ready() cycle
+   g_startLocal = TimeLocal();
+   g_clockMode = (g_tester && InpServerTime == GT_SERVER_AUTO) ? GT_SERVER_NY7 : InpServerTime;
+   g_clkVerified = false;   // a clock must be confirmed by a live observation after every start-up
+   g_clkBlocked = false;
+   g_clkMismatch = 0;
+   g_clkCandN = 0;
+   g_clkLastObs = 0;
+   g_permit = -1;
+
+   if(!ValidateInputs())
+      return INIT_PARAMETERS_INCORRECT;
+
    g_trade.SetDeviationInPoints((ulong)InpDeviationPoints);
    g_trade.SetMarginMode();
    g_trade.LogLevel(LOG_LEVEL_ERRORS);
 
-   if(InpBBPeriod < 2 || InpATRPeriod < 2 || InpMaxHoldBars < 1)
+   if((g_tester || Ready()) && AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
      {
-      Print("[GT] invalid indicator parameters");
-      return INIT_PARAMETERS_INCORRECT;
+      Print("[GT] this account uses NETTING (or exchange) position accounting. GreatestTrader requires a HEDGING "
+            "account: on netting, closing the EA position would also close manual / other-EA volume on the same symbol.");
+      return INIT_FAILED;
      }
-   if(InpRiskProfile == GT_RISK_CUSTOM && (InpRiskNR < 0.0 || InpRiskNR > 5.0 || InpRiskES < 0.0 || InpRiskES > 5.0))
+   if(!g_tester && AcquireLock() < 0)
      {
-      Print("[GT] custom risk must be between 0 and 5 percent");
-      return INIT_PARAMETERS_INCORRECT;
-     }
-
-   if(!ParseSymbolMult())
-      return INIT_PARAMETERS_INCORRECT;
-   for(int i = 0; i < ArraySize(g_multVal); i++)
-      if(g_multVal[i] < 0.0 || BaseRisk(true) * g_multVal[i] > 0.05 + 1e-12 || BaseRisk(false) * g_multVal[i] > 0.05 + 1e-12)
-        {
-         Print("[GT] InpSymbolRiskMult: ", g_multSym[i], " must be >= 0 and risk x multiplier must be <= 5 percent");
-         return INIT_PARAMETERS_INCORRECT;
-        }
-   g_boStart = ParseMMDD(InpBlackoutStart);
-   g_boEnd = ParseMMDD(InpBlackoutEnd);
-   if((StringLen(InpBlackoutStart) > 0 && g_boStart == 0) || (StringLen(InpBlackoutEnd) > 0 && g_boEnd == 0))
-     {
-      Print("[GT] blackout start/end must be MM-DD (e.g. 12-20) or empty");
-      return INIT_PARAMETERS_INCORRECT;
-     }
-   if((g_boStart == 0) != (g_boEnd == 0))
-     {
-      Print("[GT] blackout start/end must both be MM-DD or both empty");
-      return INIT_PARAMETERS_INCORRECT;
+      Print("[GT] another GreatestTrader instance is already running on account ", AccountInfoInteger(ACCOUNT_LOGIN),
+            " (lock ", LockName(AccountInfoInteger(ACCOUNT_LOGIN)), " held by another chart). Remove the other copy first.");
+      return INIT_FAILED;
      }
 
    // symbols
@@ -1198,7 +2608,7 @@ int OnInit()
       string s = b + InpSymbolSuffix;
       if(!SymbolSelect(s, true))
         {
-         Print("[GT] WARNING symbol not available: ", s, " (check InpSymbolSuffix)");
+         Log("WARNING symbol not available: " + s + " (check InpSymbolSuffix) - it is NOT traded", true);
          continue;
         }
       ArrayResize(g_sym, g_nsym + 1);
@@ -1228,7 +2638,7 @@ int OnInit()
    g_esSym = eb + InpSymbolSuffix;
    g_esOk = SymbolSelect(g_esSym, true);
    if(InpESEnabled && !g_esOk)
-      Print("[GT] WARNING Euro Session symbol not available: ", g_esSym);
+      Log("WARNING Euro Session symbol not available: " + g_esSym + " - ES is NOT traded", true);
 
    // warm up history for all symbols (tester downloads data on first request)
    MqlRates tmp[];
@@ -1237,18 +2647,15 @@ int OnInit()
    if(g_esOk)
       CopyRates(g_esSym, PERIOD_H1, 0, 50, tmp);
 
-   if(!g_tester)
-      LoadState();
-   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-   if(g_peak <= 0.0)
-      g_peak = eq;
    EventSetTimer(g_tester ? 60 : (InpTimerSec < 1 ? 1 : InpTimerSec));
 
    string prof = EnumToString(InpRiskProfile);
-   Log(StringFormat("started: %d NR symbols, ES=%s, profile=%s, NR risk=%.2f%% (x InpSymbolRiskMult), ES risk=%.2f%%, server=%s",
+   Log(StringFormat("started: %d NR symbols, ES=%s, profile=%s, NR risk=%.2f%% (x InpSymbolRiskMult), ES risk=%.2f%%, "
+                    "max lots/order=%.2f, max risk amount=%.2f, max DD halt=%.1f%%, server=%s%s",
                     g_nsym, (InpESEnabled && g_esOk) ? g_esSym : "off", prof, BaseRisk(true) * 100.0,
-                    BaseRisk(false) * SymbolMult(g_esSym) * 100.0, EnumToString(InpServerTime)), true);
-   if(!g_tester && !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+                    BaseRisk(false) * SymbolMult(g_esSym) * 100.0, InpMaxLotsPerOrder, InpMaxRiskAmount, InpMaxDDHalt,
+                    EnumToString(InpServerTime), g_tester ? "" : " (new entries wait for a verified broker clock)"), true);
+   if(!g_tester && TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) == 0)
       Print("[GT] WARNING: Algo Trading is disabled in the terminal.");
    return INIT_SUCCEEDED;
   }
@@ -1256,8 +2663,19 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    EventKillTimer();
-   if(!g_tester)
-      SaveState();
+   SaveState(true);   // no-op unless the state was loaded (REASON_INITFAILED cannot overwrite it)
+   if(!g_tester && g_stateLoaded &&
+      (reason == REASON_REMOVE || reason == REASON_CHARTCLOSE || reason == REASON_TEMPLATE || reason == REASON_PROGRAM ||
+       reason == REASON_CLOSE))
+     {
+      int n = CountOurPositions();
+      if(n > 0)
+         Log(StringFormat("EA stopped (reason %d) with %d open position(s): time stop / session exit are no longer managed "
+                          "(SL/TP stay at the broker)", reason, n), true);
+     }
+   FlushNotify(true);
+   ReleaseLock();
+   g_stateLoaded = false;
   }
 
 void OnTick()
@@ -1268,6 +2686,7 @@ void OnTick()
 void OnTimer()
   {
    ProcessAll();
+   FlushNotify();
   }
 
 //+------------------------------------------------------------------+
