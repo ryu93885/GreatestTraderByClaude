@@ -103,6 +103,19 @@ def test_cash_flow_first_run_dedup_and_restart(tmp_path):
     assert not sent(eng2, "CASH FLOW")
 
 
+def test_flow_booked_between_the_equity_read_and_the_scan(tmp_path):
+    eng, br = make(cfg_for(tmp_path, preset="stable5"), eurjpy())
+    br.set_time(datetime(2021, 3, 2, 22, 0, 5))
+    eng.step()
+    br.add_cash(-400)
+    reads = iter([10_000.0, 9_600.0])  # the first read of the loop still saw the old equity
+    br.account_equity = lambda: next(reads, 9_600.0)
+    br.set_time(datetime(2021, 3, 2, 22, 0, 10))
+    eng.step()
+    assert eng.state.peak_equity == pytest.approx(9_600) and eng.state.last_equity == 9_600
+    assert not sent(eng, "MONTH STOP")
+
+
 def test_several_flows_in_one_loop_compound_exactly(tmp_path):
     eng, br = make(cfg_for(tmp_path), eurjpy())
     br.set_time(datetime(2021, 3, 2, 10, 0, 5))

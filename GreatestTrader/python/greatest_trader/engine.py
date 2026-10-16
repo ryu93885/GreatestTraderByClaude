@@ -169,7 +169,8 @@ class LiveEngine:
         log.info(msg)
         self.notifier.send(msg)
         if self.state.restored_from:
-            self._alert(f"state file was unreadable -> restored from: {self.state.restored_from}", level=logging.ERROR)
+            self._alert(f"state file was unreadable or missing -> restored from: {self.state.restored_from}",
+                        level=logging.ERROR)
         if self.state.halted:
             self._alert(f"HALTED: {self.state.halt_reason} (no new entries; `python main.py reset-halt` to resume)",
                         level=logging.ERROR)
@@ -249,8 +250,7 @@ class LiveEngine:
             return
         now_utc = self.clock.server_to_utc(now_server)
         now_mkt = self.clock.server_to_market(now_server)
-        equity = self.broker.account_equity()
-        self._scan_cash_flows(equity)  # BEFORE the equity guards: a withdrawal is not a loss
+        equity = self._scan_cash_flows(self.broker.account_equity())  # BEFORE the guards: a withdrawal is no loss
         st = self.state
         before = (st.day, st.month, st.last_equity, st.peak_equity, st.month_start_equity, st.day_opens,
                   st.day_closes)
@@ -426,9 +426,10 @@ class LiveEngine:
         return self.clock_problem
 
     # ------------------------------------------------------------------ cash flows
-    def _scan_cash_flows(self, equity: float) -> None:
+    def _scan_cash_flows(self, equity: float) -> float:
         """Deposits / withdrawals / credit / bonus since the last loop, de-duplicated by deal ticket. On the very
-        first scan the existing deals are only marked as seen (they are history, not new flows)."""
+        first scan the existing deals are only marked as seen (they are history, not new flows). Returns the
+        equity the guards must use (read again when new flows were found, so that it contains them)."""
         flows = self.broker.cash_flows()
         st = self.state
         seen = {int(t) for t, _ in st.cash_tickets}
@@ -447,12 +448,16 @@ class LiveEngine:
             st.cash_init = True
             if new:
                 log.info("cash flows: %d existing balance/credit/bonus deals marked as seen (not applied)", len(new))
-            return
+            return equity
+        if not new:
+            return equity
+        equity = self.broker.account_equity()  # a flow booked after the first read must be in E
         rest = sum(f.amount for f in new)
         for f in new:  # in time order; E_i = equity without the flows booked after this one
             rest -= f.amount
             msg = self.risk.apply_cash_flow(f.amount, equity - rest)
             self._alert(f"{msg} [deal {f.ticket}{' ' + f.comment if f.comment else ''}]")
+        return equity
 
     # ------------------------------------------------------------------ monitoring
     def _new_day(self, before: tuple, utc: datetime) -> None:

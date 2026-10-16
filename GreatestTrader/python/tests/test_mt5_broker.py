@@ -180,6 +180,19 @@ def test_cash_flows_and_closed_trade_from_history(b, clock):
     assert len(b.cash_flows()) == 1 and S.calls["history_deals_get"] == n  # balance unchanged: no re-scan
     S.balance -= 500
     assert len(b.cash_flows()) == 2  # balance changed: history re-read
+    S.balance -= 100  # a withdrawal whose deal reaches the history one call later
+    assert len(b.cash_flows()) == 2
+    S.deals.append(dict(ticket=3, time=S.now, time_msc=0, type=2, entry=0, magic=0, position_id=0, symbol="",
+                        volume=0, price=0, profit=-100.0, commission=0, swap=0, fee=0, reason=0, comment=""))
+    clock.t += 5
+    assert len(b.cash_flows()) == 3  # re-read on every call during the minute after the change
+    clock.t += 61
+    n = S.calls["history_deals_get"]
+    b.cash_flows()
+    assert S.calls["history_deals_get"] == n  # then cached again (until the next change / 10 minutes)
+    clock.t += 600
+    b.cash_flows()
+    assert S.calls["history_deals_get"] == n + 1
     r = b.open_position("EURJPY", 1, 0.1, 129.5, 130.5, 7101, "GT_NR")
     assert b.closed_trade(r.ticket) is None  # still open
     S.ticks["EURJPY"].update(bid=130.10, ask=130.11)

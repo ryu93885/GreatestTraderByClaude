@@ -34,6 +34,7 @@ RETCODE_INVALID_FILL = 10030  # unsupported filling mode -> try the next one
 RETCODE_RETRY = {10004, 10020, 10021}  # requote / price changed / no prices: proven NOT executed -> send again
 SPEC_TTL = 6 * 3600.0  # symbol specs are re-read after this many seconds
 CASH_RESCAN = 600.0  # deal history re-scanned at least this often (and whenever balance / credit change)
+CASH_BURST = 60.0  # ... and on every call for this long after a balance / credit change
 CASH_WINDOW_DAYS = 30
 RECONNECT_FIRST_DELAY, RECONNECT_MAX_DELAY = 5.0, 60.0
 DEAL_ENTRY_EXIT = (1, 2, 3)  # DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY
@@ -59,7 +60,7 @@ class MT5Broker(Broker):
         self._tick_t: dict[str, datetime] = {}  # latest tick time per symbol (server time)
         self._money: tuple[float, float] | None = None
         self._cash: list[CashFlow] = []
-        self._cash_t = -1e18
+        self._cash_t = self._cash_burst_until = -1e18
         self._reconnect_delay = RECONNECT_FIRST_DELAY
         self._next_reconnect = 0.0
         self._tf = {"M15": mt5.TIMEFRAME_M15, "H1": mt5.TIMEFRAME_H1, "M1": mt5.TIMEFRAME_M1}
@@ -92,7 +93,7 @@ class MT5Broker(Broker):
         self._specs.clear()
         self._spec_t.clear()
         self._tick_t.clear()  # the server clock may legitimately go back (new server / offset change)
-        self._money, self._cash, self._cash_t = None, [], -1e18
+        self._money, self._cash, self._cash_t, self._cash_burst_until = None, [], -1e18, -1e18
 
     def reconnect(self) -> None:
         try:
@@ -172,12 +173,15 @@ class MT5Broker(Broker):
         return float(m) if m is not None else float("inf")
 
     def cash_flows(self) -> list[CashFlow]:
-        """BALANCE / CREDIT / BONUS deals of the last 30 days. The history is only re-read when balance or
-        credit changed, or every 10 minutes."""
+        """BALANCE / CREDIT / BONUS deals of the last 30 days. The history is re-read when balance or credit
+        changed (and on every call during the following minute, in case the deal reaches the history a moment
+        after the balance), otherwise every 10 minutes."""
         info = self._account()
         money = (round(float(info.balance), 2), round(float(getattr(info, "credit", 0.0)), 2))
         now = time.monotonic()
-        if money == self._money and now - self._cash_t < CASH_RESCAN:
+        if money != self._money and self._money is not None:
+            self._cash_burst_until = now + CASH_BURST
+        if money == self._money and now - self._cash_t < CASH_RESCAN and now >= self._cash_burst_until:
             return list(self._cash)
         end = datetime.now() + timedelta(days=2)  # generous window: history times are server-time based
         deals = mt5.history_deals_get(end - timedelta(days=CASH_WINDOW_DAYS + 2), end)
