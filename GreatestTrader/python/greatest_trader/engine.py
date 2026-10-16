@@ -493,8 +493,9 @@ class LiveEngine:
         if auto:
             self._clock_n = self._clock_n + 1 if self._clock_cand == observed else 1
             self._clock_cand = observed
-            log.info("server clock observation %+.1f h differs from %+.1f h in use (%d/%d identical)", observed,
-                     expected, self._clock_n, CLOCK_CONFIRM)
+            if self._clock_mis <= CLOCK_CONFIRM:
+                log.info("server clock observation %+.1f h differs from %+.1f h in use (%d/%d identical)", observed,
+                         expected, self._clock_n, CLOCK_CONFIRM)
             if self._clock_n >= CLOCK_CONFIRM:
                 old, first = self.clock, not self.state.clock_mode
                 mode, off = detect_server_mode(fresh, utc)
@@ -506,7 +507,7 @@ class LiveEngine:
                 self._alert(f"server clock {'detected' if first else 'CHANGED'}: {self.clock} (observed offset "
                             f"{observed:+.1f} h, was {old}; persisted)")
                 return
-        else:
+        elif self._clock_mis <= CLOCK_CONFIRM:
             log.info("server clock observation %+.1f h differs from the configured %+.1f h (%d/%d)", observed,
                      expected, self._clock_mis, CLOCK_CONFIRM)
         if self._clock_mis >= CLOCK_CONFIRM:
