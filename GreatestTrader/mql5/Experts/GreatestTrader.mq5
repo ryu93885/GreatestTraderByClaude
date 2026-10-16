@@ -192,7 +192,7 @@ int      g_clkCandN = 0;         // AUTO: consecutive identical observations of 
 datetime g_clkLastObs = 0;       // local time of the last counted observation
 datetime g_lastSrvSeen = 0;      // newest TimeCurrent() seen
 datetime g_srvAdvAt = 0;         // local time when TimeCurrent() last advanced
-datetime g_lastSrvRead = 0;      // local time of the previous TimeCurrent() read (TrackServerTime)
+datetime g_lastSrvSeenAt = 0;    // local time when g_lastSrvSeen was first seen (TrackServerTime)
 int      g_clkOffGridN = 0;      // consecutive fresh observations off the half-hour grid (PC clock off)
 long     g_clkOffGridSec = 0;    // ... seconds off the grid at the last one
 datetime g_clkDriftNote = 0;     // local time of the last PC clock alert
@@ -1989,19 +1989,19 @@ bool HandleCashFlows(double &eq)
 //+------------------------------------------------------------------+
 //| Broker clock verification (live only; the tester uses the rule)   |
 //+------------------------------------------------------------------+
-// an advance of the server time counts as a new tick only when it is not larger than the time that passed since
-// the previous read (+ GT_CLOCK_ADV_SEC): the jump from an old cached time to Friday's last tick after a weekend
-// terminal start is no new tick
+// an advance of the server time counts as a new tick only when it is not larger than the local time that passed
+// since the previous server time was first seen (+ GT_CLOCK_ADV_SEC): the jump from an old cached time to Friday's
+// last tick after a weekend terminal start is no new tick, while the first tick after a quiet minute or the weekly
+// open (the server time moved as far as the local clock) is one
 void TrackServerTime(const datetime srv)
   {
+   if(srv <= g_lastSrvSeen)
+      return;
    datetime now = TimeLocal();
-   if(srv > g_lastSrvSeen)
-     {
-      if(g_lastSrvSeen > 0 && Secs(srv, g_lastSrvSeen) <= Secs(now, g_lastSrvRead) + GT_CLOCK_ADV_SEC)
-         g_srvAdvAt = now;
-      g_lastSrvSeen = srv;
-     }
-   g_lastSrvRead = now;
+   if(g_lastSrvSeen > 0 && Secs(srv, g_lastSrvSeen) <= Secs(now, g_lastSrvSeenAt) + GT_CLOCK_ADV_SEC)
+      g_srvAdvAt = now;
+   g_lastSrvSeen = srv;
+   g_lastSrvSeenAt = now;
   }
 
 // clock observation from the newest tick (same rule as the Python engine):
