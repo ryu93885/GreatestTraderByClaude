@@ -11,6 +11,7 @@ risk:
   monthly_hard_stop: 0.015
   dd_scale_full: 0.15
   dd_scale_floor: 0.1
+  max_drawdown_halt: 0.2  # stop new entries at 20% drawdown from the peak (reset: python main.py reset-halt)
   daily_loss_limit: 0.01
   symbol_risk_mult:
     EURJPY: 0.5

@@ -3,18 +3,26 @@
 * Fixed-fractional sizing: each trade risks `risk_per_trade x equity` between entry and stop,
   times the per-symbol multiplier (symbol_risk_mult) and the adaptive multiplier (vol target /
   equity-curve filter, 1.0 when off).
+* Capacity caps: the money at risk of one trade is capped by max_risk_amount, max_lots_per_order and the
+  broker's volume_max (lots x loss of 1.0 lot at the stop) BEFORE the portfolio guards see it.
 * Drawdown scaling: risk x max(floor, 1 - DD / dd_scale_full)   (DD measured from equity peak).
 * Daily / monthly loss limits: no new entries for the rest of the market day / month.
 * Daily / monthly hard stops: close everything and stay flat for the rest of the day / month.
-* Max drawdown halt: no new entries at all once DD >= max_drawdown_halt (manual reset).
+* Max drawdown halt: no new entries at all once DD >= max_drawdown_halt (reset: `python main.py reset-halt`).
 * Position limits: total open positions, positions per currency, one position per symbol,
   same-direction positions per currency and total open risk.
 * Year-end blackout: no new entries between blackout_start and blackout_end (market dates).
+* Cash flows (deposits / withdrawals / credit / bonus) are not profit or loss: every equity baseline is
+  scaled by equity_after / equity_before (time-weighted), see apply_cash_flow.
 """
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
+import shutil
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
@@ -22,9 +30,14 @@ from pathlib import Path
 from .config import RiskConfig
 from .strategies.base import PositionView, currencies
 
+log = logging.getLogger(__name__)
+CASH_K_MIN, CASH_K_MAX = 0.02, 50.0  # outside this range a cash flow rebases the baselines to current equity
+
 
 @dataclass
 class RiskState:
+    """Persistent engine state (state/state.json). New fields always get defaults so that older state files
+    still load; unknown keys in a file are ignored."""
     peak_equity: float = 0.0
     day: str = ""  # market-time date (YYYY-MM-DD)
     day_start_equity: float = 0.0
@@ -37,24 +50,88 @@ class RiskState:
     day_halted: bool = False
     daily_equity: list = field(default_factory=list)  # closing equity of past market days (most recent last)
     last_equity: float = 0.0  # last equity seen (= the current day's close so far; survives restarts)
+    # --- long-term operation: account binding, cash flows, server clock, monitoring, trade journal
+    account_login: int = 0  # the account this state belongs to (0 = not bound yet)
+    account_server: str = ""
+    cash_init: bool = False  # existing cash deals were marked as seen on the first scan
+    cash_tickets: list = field(default_factory=list)  # [[deal ticket, server epoch], ...] already seen
+    cash_flow_total: float = 0.0  # sum of the cash flows applied since cash_init
+    clock_mode: str = ""  # last verified server clock (auto mode): ny7 | fixed
+    clock_offset: float = 0.0
+    dd_alert_day: str = ""  # market day of the last drawdown alert
+    edge_month: str = ""  # last month evaluated by the R monitor (YYYY-MM)
+    edge_neg_months: int = 0  # consecutive month ends with a negative risk-weighted R
+    day_opens: int = 0  # entries / closes of the current market day (daily summary)
+    day_closes: int = 0
+    open_trades: dict = field(default_factory=dict)  # str(ticket) -> journal data of an open position
 
+    # ------------------------------------------------------------- persistence
     @classmethod
     def load(cls, path: str | Path) -> "RiskState":
+        """Load the state; fall back to the newest readable daily backup. If no copy is readable, start
+        HALTED (the peak equity was lost: a human must check the account and run reset-halt).
+        `restored_from` tells the caller what happened ("" = normal load or a fresh start)."""
         p = Path(path)
-        if p.exists():
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
-            return cls(**known)
-        return cls()
+        cands = [p] + sorted(p.parent.glob(f"{p.stem}.*.bak.json"), reverse=True)
+        errors = []
+        for c in cands:
+            if not c.exists():
+                continue
+            try:
+                with open(c, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("not a JSON object")
+                st = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+            except (ValueError, TypeError, OSError) as exc:  # JSONDecodeError is a ValueError
+                errors.append(f"{c.name}: {exc}")
+                continue
+            st.restored_from = "" if c == p else c.name
+            if c != p:
+                log.error("state file %s unreadable or missing (%s) -> restored from backup %s", p.name,
+                          "; ".join(errors) or "missing", c.name)
+            return st
+        st = cls()
+        st.restored_from = ""
+        if errors:
+            st.halted = True
+            st.halt_reason = "state file corrupt and no readable backup: check the account, then run reset-halt"
+            st.restored_from = "none (" + "; ".join(errors) + ")"
+            log.error("no readable state file (%s): starting HALTED", "; ".join(errors))
+        return st
 
-    def save(self, path: str | Path) -> None:
+    def save(self, path: str | Path, keep_backups: int = 14) -> bool:
+        """Write the state only if it changed: fsync + atomic replace (retried: on Windows an anti-virus or
+        indexer may hold the file for a moment), plus one backup per calendar day (the newest `keep_backups`
+        are kept). Returns True when the file was written."""
         p = Path(path)
+        data = json.dumps(asdict(self), indent=2, ensure_ascii=False)
+        if getattr(self, "_saved", None) == (str(p), data) and p.exists():
+            return False
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(asdict(self), f, indent=2, ensure_ascii=False)
-        tmp.replace(p)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(tmp, p)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
+        self._saved = (str(p), data)
+        bak = p.with_name(f"{p.stem}.{date.today():%Y%m%d}.bak.json")
+        if not bak.exists():
+            try:
+                shutil.copy2(p, bak)
+                for old in sorted(p.parent.glob(f"{p.stem}.*.bak.json"))[:-keep_backups]:
+                    old.unlink()
+            except OSError as exc:  # a backup problem must never stop trading
+                log.warning("state backup failed: %s", exc)
+        return True
 
 
 class RiskManager:
@@ -156,7 +233,8 @@ class RiskManager:
     # ------------------------------------------------------------- limits
     def can_open(self, strategy: str, symbol: str, positions: list[PositionView], equity: float,
                  direction: int = 0, new_risk: float = 0.0) -> tuple[bool, str]:
-        """new_risk: risk amount (account currency) of the candidate trade; positions carry risk_amount."""
+        """new_risk: risk amount (account currency) of the candidate trade AFTER the capacity caps;
+        positions carry risk_amount."""
         c, st = self.cfg, self.state
         if st.halted:
             return False, f"halted ({st.halt_reason})"
@@ -214,16 +292,67 @@ class RiskManager:
     def symbol_mult(self, symbol: str) -> float:
         return float(self.cfg.symbol_risk_mult.get(symbol, 1.0))
 
+    # ------------------------------------------------------------- cash flows / halt
+    def apply_cash_flow(self, amount: float, equity_now: float) -> str:
+        """A deposit (+) / withdrawal (-) of `amount` that is already contained in `equity_now`: scale every
+        equity baseline by k = E / (E - F) so that drawdown, day and month returns stay time-weighted (a
+        withdrawal is not a loss and a deposit hides none). Outside k = 0.02..50 they are rebased to E."""
+        st = self.state
+        before = equity_now - amount
+        k = equity_now / before if before > 0 and equity_now > 0 else 0.0
+        if CASH_K_MIN <= k <= CASH_K_MAX:
+            st.peak_equity *= k
+            st.day_start_equity *= k
+            st.month_start_equity *= k
+            st.last_equity *= k
+            st.daily_equity = [float(x) * k for x in st.daily_equity]
+            how = f"baselines x{k:.4f}"
+        else:
+            e = float(equity_now)
+            st.peak_equity = st.day_start_equity = st.month_start_equity = st.last_equity = e
+            st.daily_equity = [e for _ in st.daily_equity]
+            how = "baselines rebased to current equity"
+        st.cash_flow_total += amount
+        self._adaptive_mult = self._compute_adaptive_mult()
+        return f"CASH FLOW {amount:+,.2f} detected, guards rebased ({how}; not counted as profit/loss)"
+
+    def reset_halt(self, rebase_peak_to: float | None = None) -> str:
+        """Clear a max-drawdown halt and keep every other piece of state. Optionally rebase the peak."""
+        st = self.state
+        msg = f"halt cleared (was: {st.halt_reason or 'not halted'})"
+        st.halted, st.halt_reason = False, ""
+        if rebase_peak_to is not None and rebase_peak_to > 0:
+            msg += f"; peak equity rebased {st.peak_equity:,.2f} -> {rebase_peak_to:,.2f}"
+            st.peak_equity = float(rebase_peak_to)
+        return msg
+
     # ------------------------------------------------------------- sizing
+    def capped_risk(self, risk_amount: float, loss_per_lot: float, volume_max: float = 0.0) -> float:
+        """Money at risk (account currency) after the capacity caps: max_risk_amount, max_lots_per_order and
+        the broker's volume_max, the lot caps converted with the loss of 1.0 lot at the stop. Call it BEFORE
+        can_open so that the total-risk cap sees the real size."""
+        c = self.cfg
+        if c.max_risk_amount > 0:
+            risk_amount = min(risk_amount, c.max_risk_amount)
+        if loss_per_lot > 0:
+            if c.max_lots_per_order > 0:
+                risk_amount = min(risk_amount, c.max_lots_per_order * loss_per_lot)
+            if volume_max > 0:
+                risk_amount = min(risk_amount, volume_max * loss_per_lot)
+        return risk_amount
+
     def lot_size(self, risk_amount: float, loss_per_lot: float, vol_min: float, vol_max: float,
                  vol_step: float) -> float:
-        """Lots so that hitting the stop loses `risk_amount` (account currency).
+        """Lots so that hitting the stop loses `risk_amount` (account currency), at most
+        min(vol_max, max_lots_per_order).
 
         loss_per_lot: loss of 1.0 lot at the stop (account currency, positive number).
         Returns 0.0 when the trade must be skipped.
         """
         if loss_per_lot <= 0 or risk_amount <= 0:
             return 0.0
+        if self.cfg.max_lots_per_order > 0:
+            vol_max = min(vol_max, self.cfg.max_lots_per_order)
         raw = risk_amount / loss_per_lot
         steps = math.floor(raw / vol_step + 1e-9)
         lots = round(steps * vol_step, 8)
