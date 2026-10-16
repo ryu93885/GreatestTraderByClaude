@@ -25,25 +25,36 @@ broker:
   deviation_points: 20       # 成行注文の許容スリッページ(ポイント)
 
 # ---------------------------------------------------------------------
-# リスク管理 (最重要)
-#   profile:
-#     conservative … 1取引あたり資産の 0.5% をリスク (目安 月+2%前後)
-#     standard     … 1.0%                           (目安 月+3.5〜5%)
-#     aggressive   … 1.5%  ★月利5%目標              (目安 月+5〜7%, 最大DD 30%前後)
-#     custom       … risk_nr / risk_es を直接指定
-#   ※目安は低コスト口座での過去検証値。将来の成績を保証しません。
+# リスク設定 = プリセット (v1.1)
+#   preset: stable5               ★既定。月利5%目標＋ドローダウン抑制（過去検証: 月利5.4% / 最大DD約12% / 最悪月-4.8%）
+#           stable4               より堅牢（中核ペアの1取引リスク2%）。過去検証: 月利4.4% / 最大DD約11% / 最悪月-3.7%
+#           safe2                 最悪月 -2% 前後を優先。過去検証: 月利2.0% / 最大DD約12% / 最悪月-2.0%
+#           classic_conservative / classic_standard / classic_aggressive   v1.0 と同じ考え方（保護機能なし）
+#   ※ 3つの目標（月利5%・DD20%以内・最悪月-2%）を同時に満たすプリセットはありません。詳細は docs/05_安定化改修報告書.md
+#   ※ 本番の最初は、下の risk: でリスクを半分にして始めてください（例: risk_nr: 0.0175, risk_es: 0.00875）。
+#   プリセットの中身は python/greatest_trader/presets/*.yaml にあります。
+#   下の risk: に書いた項目はプリセットより優先されます（書かなかった項目はプリセットの値のまま）。
 # ---------------------------------------------------------------------
-risk:
-  profile: standard
-  risk_nr: 0.010             # custom 時のみ有効: Night Reversion 1取引のリスク(0.01 = 1%)
-  risk_es: 0.010             # custom 時のみ有効: Euro Session   1取引のリスク
-  max_open_positions: 10     # 同時保有ポジション上限
-  max_positions_per_currency: 4   # 同一通貨を含むポジション数の上限 (例: JPY絡み最大4)
-  dd_scale_full: 0.30        # DD に応じてリスク縮小: 倍率 = max(下限, 1 - DD/0.30)
-  dd_scale_floor: 0.30       # 縮小倍率の下限
-  daily_loss_limit: 0.05     # 当日 -5% で当日の新規停止
-  max_drawdown_halt: 0.40    # 最高資産から -40% で全新規停止 (state/state.json を削除で解除)
-  min_lot_policy: skip       # 計算ロットが最小ロット未満: skip=見送り / min=最小ロットで発注
+preset: stable5
+
+# risk:                            # ← 個別に上書きしたい場合だけコメントを外して記入
+#   risk_nr: 0.035                 # 中核4ペア(GBPCAD/EURCAD/AUDCAD/GBPCHF)の1取引リスク (0.035 = 3.5%)
+#   risk_es: 0.0175                # Euro Session の1取引リスク
+#   # symbol_risk_mult: 中核以外のペアのリスク倍率。書くと表全体が置き換わる（書かなかったペアは 1.0）ため、
+#   #                   変更する場合はプリセットの 10 ペアをすべて書くこと
+#   max_total_risk: 0.0875         # 同時に抱える損切りまでの合計リスク上限 (8.75%)
+#   max_same_direction_per_currency: 2   # 同じ通貨を同じ方向に賭けるポジションは最大2
+#   max_open_positions: 10         # 同時保有ポジション上限
+#   max_positions_per_currency: 4  # 同一通貨を含むポジション数の上限
+#   dd_scale_full: 0.10            # DD連動縮小: 倍率 = max(下限, 1 - DD/0.10)
+#   dd_scale_floor: 0.10           # 縮小倍率の下限
+#   daily_loss_limit: 0.01         # 当日 -1% で当日の新規停止
+#   monthly_loss_limit: 0.0        # 当月 -x% で当月の新規停止 (0=オフ)
+#   monthly_hard_stop: 0.03        # 当月 -3% で全決済し当月停止
+#   max_drawdown_halt: 0.40        # 最高資産から -40% で全新規停止 (state/state.json を削除で解除)
+#   blackout_start: "12-20"        # 年末年始は新規エントリーしない（12/20〜1/5、空欄でオフ）
+#   blackout_end: "01-05"
+#   min_lot_policy: skip           # 計算ロットが最小ロット未満: skip=見送り / min=最小ロットで発注
 
 # ---------------------------------------------------------------------
 # 戦略1: Night Reversion (主力) — 日付変更直後の平均回帰

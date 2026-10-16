@@ -1,0 +1,4 @@
+# v1.0 aggressive (1.5% per trade, no portfolio guards)
+# Applied by `preset: classic_aggressive` in config.yaml (values in config.yaml override these).
+risk:
+  profile: aggressive

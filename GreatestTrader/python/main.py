@@ -4,6 +4,7 @@
   python main.py live      -c config/config.yaml   # run the trading engine (dry_run setting in config!)
   python main.py download  -c config/config.yaml --years 5   # fetch M15 history from MT5 into backtest.data_dir
   python main.py backtest  -c config/config.yaml   # Python backtest on CSV data in backtest.data_dir
+  python main.py backtest --preset safe2           # any command: use a bundled risk preset instead of `preset:`
 """
 from __future__ import annotations
 
@@ -92,12 +93,14 @@ def cmd_backtest(cfg, out: str | None) -> int:
     if len(res.trades) == 0:
         print("no trades")
         return 1
+    print(f"preset: {cfg.preset or '-'}")
     print(format_stats(res.stats()))
     print("\n[年利（各年）]")
     print(annual_table(res).to_string())
     print("\n[月利（%）]")
     print(yearly_table(res).to_string())
-    path = save_report(res, out or cfg.backtest.output_dir)
+    path = save_report(res, out or cfg.backtest.output_dir,
+                       title=f"GreatestTrader {__version__} backtest (preset: {cfg.preset or '-'})")
     print(f"\nreport saved to {path}")
     return 0
 

@@ -1,0 +1,24 @@
+# STABLE4 - more robust: core risk capped at 2% (about 4.3%/month)
+# core crosses at full risk_nr: GBPCAD, EURCAD, AUDCAD, GBPCHF; other pairs use symbol_risk_mult
+# Applied by `preset: stable4` in config.yaml (values in config.yaml override these).
+risk:
+  profile: custom
+  risk_nr: 0.02
+  risk_es: 0.01
+  max_same_direction_per_currency: 2
+  max_total_risk: 0.06
+  monthly_hard_stop: 0.03
+  dd_scale_full: 0.1
+  dd_scale_floor: 0.1
+  daily_loss_limit: 0.01
+  symbol_risk_mult:
+    EURJPY: 0.4375
+    GBPJPY: 0.4375
+    USDJPY: 0.4375
+    GBPUSD: 0.4375
+    EURGBP: 0.4375
+    USDCHF: 0.4375
+    EURUSD: 0.4375
+    EURAUD: 0.4375
+    CHFJPY: 0.4375
+    GBPAUD: 0.4375

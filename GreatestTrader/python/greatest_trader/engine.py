@@ -112,9 +112,10 @@ class LiveEngine:
             log.warning(ev)
             self.notifier.send(ev)
         positions = self.broker.positions(self.magics)
-        if self.risk.flatten_reason and positions:
+        stop_reason = self.risk.flatten_reason or self.risk.hard_stop_active()
+        if stop_reason and positions:  # also retries closes that failed on the first attempt
             for p in positions:
-                self._close(CloseRequest(p.ticket, p.symbol, self.risk.flatten_reason))
+                self._close(CloseRequest(p.ticket, p.symbol, stop_reason))
             positions = self.broker.positions(self.magics)
 
         # ---- Night Reversion: time stops every loop, signals on new M15 bars

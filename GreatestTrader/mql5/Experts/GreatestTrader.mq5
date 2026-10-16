@@ -8,7 +8,7 @@
 //+------------------------------------------------------------------+
 #property copyright   "GreatestTrader"
 #property version     "1.10"
-#property description "Night Reversion (14 crosses, 00:00-02:00 market time) + Euro Session (EURUSD 07-13 UTC)."
+#property description "Night Reversion (14 crosses, 00:00-02:00 market time) + Euro Session (EURUSD 07-13 UTC). v1.1: defaults = STABLE5 preset."
 #property description "Attach to ONE chart (any symbol, any timeframe). The EA trades all configured symbols."
 
 #include <Trade/Trade.mqh>
@@ -30,28 +30,30 @@ enum ENUM_GT_SERVER_TIME
 
 //--- inputs
 input group "=== Risk management ==="
-input ENUM_GT_RISK InpRiskProfile      = GT_RISK_STANDARD; // Risk profile
-input double       InpRiskNR           = 1.0;   // Custom: NR risk per trade (% of equity)
-input double       InpRiskES           = 1.0;   // Custom: ES risk per trade (% of equity)
+input ENUM_GT_RISK InpRiskProfile      = GT_RISK_CUSTOM; // Risk profile (default = STABLE5 preset)
+input double       InpRiskNR           = 3.5;   // Custom: NR risk per trade (% of equity)
+input double       InpRiskES           = 1.75;  // Custom: ES risk per trade (% of equity)
 input int          InpMaxOpen          = 10;    // Max open positions (total)
 input int          InpMaxPerCurrency   = 4;     // Max positions per currency
-input double       InpDDScaleFull      = 30.0;  // DD scaling: risk x max(floor, 1 - DD%/this)
-input double       InpDDScaleFloor     = 0.30;  // DD scaling: minimum multiplier
-input double       InpDailyLossLimit   = 5.0;   // Daily loss limit (% of day-start equity)
+input double       InpDDScaleFull      = 10.0;  // DD scaling: risk x max(floor, 1 - DD%/this)
+input double       InpDDScaleFloor     = 0.10;  // DD scaling: minimum multiplier
+input double       InpDailyLossLimit   = 1.0;   // Daily loss limit (% of day-start equity)
 input double       InpMaxDDHalt        = 40.0;  // Halt new entries at this DD (%) from peak
 input bool         InpUseMinLot        = false; // Use min lot when calculated lot is smaller
-input double       InpMaxTotalRisk     = 0.0;   // Max total open risk (% of equity, 0 = off)
-input int          InpMaxSameDirPerCcy = 0;     // Max same-direction positions per currency (0 = off)
+input double       InpMaxTotalRisk     = 8.75;  // Max total open risk (% of equity, 0 = off)
+input int          InpMaxSameDirPerCcy = 2;     // Max same-direction positions per currency (0 = off)
 input double       InpDailyHardStop    = 0.0;   // Daily hard stop: close all at this loss (%, 0 = off)
 input double       InpMonthlyLossLimit = 0.0;   // Monthly loss limit: no new entries (%, 0 = off)
-input double       InpMonthlyHardStop  = 0.0;   // Monthly hard stop: close all at this loss (%, 0 = off)
-input string       InpSymbolRiskMult   = "";    // Per-symbol risk multipliers, e.g. EURUSD:0.5,EURJPY:0.5
+input double       InpMonthlyHardStop  = 3.0;   // Monthly hard stop: close all at this loss (%, 0 = off)
+input string       InpSymbolRiskMult   = "EURJPY:0.25,GBPJPY:0.25,USDJPY:0.25,GBPUSD:0.25,EURGBP:0.25,USDCHF:0.25,EURUSD:0.25,EURAUD:0.25,CHFJPY:0.25,GBPAUD:0.25"; // Per-symbol risk multipliers (SYM:mult,...)
 input double       InpVolTargetDaily   = 0.0;   // Volatility target, daily equity vol (%, 0 = off)
 input int          InpVolLookbackDays  = 20;    // Volatility target lookback (days)
 input double       InpVolMultMin       = 0.25;  // Volatility target min multiplier
 input double       InpVolMultMax       = 1.5;   // Volatility target max multiplier
 input int          InpEqFilterDays     = 0;     // Equity-curve filter SMA (days, 0 = off)
 input double       InpEqFilterMult     = 0.5;   // Equity-curve filter multiplier below SMA
+input string       InpBlackoutStart    = "12-20"; // Year-end blackout start MM-DD (no new entries, empty = off)
+input string       InpBlackoutEnd      = "01-05"; // Year-end blackout end MM-DD (inclusive)
 
 input group "=== Broker ==="
 input string              InpSymbolSuffix     = "";             // Symbol suffix (e.g. .raw  -STD  m)
@@ -120,6 +122,8 @@ bool     g_flatten = false;      // set when a hard stop requires closing all po
 string   g_flattenReason = "";
 string   g_multSym[];
 double   g_multVal[];
+int      g_boStart = 0;          // blackout start as month*100+day (0 = off)
+int      g_boEnd = 0;
 
 //+------------------------------------------------------------------+
 //| Time utilities (US DST rules, identical to Python timeutil.py)    |
@@ -472,6 +476,30 @@ void ParseSymbolMult()
      }
   }
 
+int ParseMMDD(const string v)
+  {
+   string parts[];
+   if(StringSplit(v, '-', parts) != 2)
+      return 0;
+   int m = (int)StringToInteger(parts[0]);
+   int d = (int)StringToInteger(parts[1]);
+   if(m < 1 || m > 12 || d < 1 || d > 31)
+      return 0;
+   return m * 100 + d;
+  }
+
+bool InBlackout()
+  {
+   if(g_boStart == 0 || g_boEnd == 0 || g_day == 0)
+      return false;
+   MqlDateTime s;
+   TimeToStruct(g_day, s);
+   int md = s.mon * 100 + s.day;
+   if(g_boStart <= g_boEnd)
+      return (md >= g_boStart && md <= g_boEnd);
+   return (md >= g_boStart || md <= g_boEnd);
+  }
+
 void CloseAllOurs(const string reason)
   {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -604,6 +632,11 @@ bool CanOpen(const string sym, const double eq, const int dir, const double newR
    if(g_halted)
      {
       why = "halted (max drawdown)";
+      return false;
+     }
+   if(InBlackout())
+     {
+      why = "year-end holiday blackout";
       return false;
      }
    if(g_monthHalted)
@@ -1056,8 +1089,11 @@ void ProcessAll()
       return;
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    UpdateEquityState(eq, nowSrv);
+   // while a hard stop is in force our positions must stay flat (also retries failed closes)
    if(g_flatten)
       CloseAllOurs(g_flattenReason);
+   else if(g_monthHalted || g_dayHalted)
+      CloseAllOurs(g_monthHalted ? "monthly hard stop" : "daily hard stop");
    if(InpNREnabled && g_nsym > 0)
       ProcessNR(nowSrv, eq);
    if(InpESEnabled && g_esOk)
@@ -1087,6 +1123,13 @@ int OnInit()
      }
 
    ParseSymbolMult();
+   g_boStart = ParseMMDD(InpBlackoutStart);
+   g_boEnd = ParseMMDD(InpBlackoutEnd);
+   if((g_boStart == 0) != (g_boEnd == 0))
+     {
+      Print("[GT] blackout start/end must both be MM-DD or both empty");
+      return INIT_PARAMETERS_INCORRECT;
+     }
 
    // symbols
    string parts[];

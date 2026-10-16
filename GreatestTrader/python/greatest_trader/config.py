@@ -109,6 +109,10 @@ class RiskConfig:
     vol_mult_max: float = 1.5
     eq_filter_days: int = 0  # equity-curve filter: SMA length in days
     eq_filter_mult: float = 0.5  # risk multiplier while equity < its SMA
+    # --- year-end holiday blackout: no new entries between these market dates (MM-DD, inclusive;
+    #     empty = off). Thin year-end liquidity produced the worst flash-crash fills (e.g. 2019-01-03).
+    blackout_start: str = "12-20"
+    blackout_end: str = "01-05"
 
     def base_risk(self, strategy: str) -> float:
         if self.profile == "custom":
@@ -172,6 +176,11 @@ class Config:
                 raise ValueError(f"risk per trade for {name} must be between 0 and 5% (got {v})")
         if r.max_open_positions < 1:
             raise ValueError("risk.max_open_positions must be >= 1")
+        for v in (r.blackout_start, r.blackout_end):
+            if v and not _valid_mmdd(v):
+                raise ValueError(f"risk.blackout_start/end must be MM-DD (got {v!r})")
+        if bool(r.blackout_start) != bool(r.blackout_end):
+            raise ValueError("risk.blackout_start and blackout_end must both be set or both empty")
         if self.broker.server_time_mode not in ("auto", "ny7", "fixed"):
             raise ValueError("broker.server_time_mode must be auto, ny7 or fixed")
         nr = self.night_reversion
@@ -184,6 +193,14 @@ class Config:
             raise ValueError("euro_session: need 0 <= entry_utc_hour < exit_utc_hour <= 23")
         if es.direction not in (-1, 1):
             raise ValueError("euro_session.direction must be -1 (sell) or 1 (buy)")
+
+
+def _valid_mmdd(v: str) -> bool:
+    try:
+        m, d = (int(x) for x in str(v).split("-"))
+    except ValueError:
+        return False
+    return 1 <= m <= 12 and 1 <= d <= 31
 
 
 def _merge(dc_obj: Any, data: dict, path: str) -> Any:

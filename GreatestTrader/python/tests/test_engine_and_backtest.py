@@ -4,6 +4,7 @@ import pandas as pd
 
 from fakes import FakeBroker, step_until, synthetic_m15
 from greatest_trader.backtest import Backtester
+from greatest_trader.broker.base import OrderResult
 from greatest_trader.config import Config
 from greatest_trader.engine import LiveEngine
 from greatest_trader.notify import Notifier
@@ -19,6 +20,7 @@ def make_cfg(tmp_path, dry_run=False):
     cfg.engine.dry_run = dry_run
     cfg.engine.state_file = str(tmp_path / "state.json")
     cfg.broker.server_time_mode = "ny7"
+    cfg.risk.blackout_start = cfg.risk.blackout_end = ""  # synthetic data starts in early January
     return cfg
 
 
@@ -48,6 +50,33 @@ def test_live_engine_dry_run_sends_nothing(tmp_path):
     eng, broker = make_engine(make_cfg(tmp_path, dry_run=True), data)
     step_until(eng, broker, datetime(2021, 3, 2, 22, 0), datetime(2021, 3, 3, 6, 0))
     assert broker.log == []
+
+
+def test_live_engine_retries_flatten_while_hard_stop_active(tmp_path):
+    data = {"EURJPY": synthetic_m15(datetime(2021, 3, 1), 5, 130.0, 0.01, spike_at=SPIKE)}
+    cfg = make_cfg(tmp_path)
+    cfg.risk.monthly_hard_stop = 0.03
+    eng, broker = make_engine(cfg, data)
+    broker.set_time(datetime(2021, 3, 2, 22, 0, 5))
+    eng.step()  # month start equity = 1,000,000
+    broker.open_position("EURJPY", 1, 0.1, 129.0, None, 7101, "GT_NR")
+    real_close, fails = broker.close_position, []
+
+    def failing_close(ticket, base, comment=""):  # first attempt is rejected (e.g. requote)
+        if not fails:
+            fails.append(comment)
+            return OrderResult(False, ticket, message="requote")
+        return real_close(ticket, base, comment)
+
+    broker.close_position = failing_close
+    broker.equity = 960_000  # -4% month to date -> monthly hard stop
+    broker.set_time(datetime(2021, 3, 2, 22, 15, 5))
+    eng.step()
+    assert fails and broker.positions_  # the stop fired but the close failed
+    broker.set_time(datetime(2021, 3, 2, 22, 15, 10))
+    eng.step()
+    assert not broker.positions_  # retried on the next loop
+    assert any(x[0] == "close" and "monthly hard stop" in x[2] for x in broker.log)
 
 
 def test_live_engine_ignores_stale_bar_on_startup(tmp_path):

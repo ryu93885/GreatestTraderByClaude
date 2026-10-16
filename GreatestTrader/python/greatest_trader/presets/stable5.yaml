@@ -1,0 +1,24 @@
+# STABLE5 (default) - 5%/month target with drawdown control
+# core crosses at full risk_nr: GBPCAD, EURCAD, AUDCAD, GBPCHF; other pairs use symbol_risk_mult
+# Applied by `preset: stable5` in config.yaml (values in config.yaml override these).
+risk:
+  profile: custom
+  risk_nr: 0.035
+  risk_es: 0.0175
+  max_same_direction_per_currency: 2
+  max_total_risk: 0.0875
+  monthly_hard_stop: 0.03
+  dd_scale_full: 0.1
+  dd_scale_floor: 0.1
+  daily_loss_limit: 0.01
+  symbol_risk_mult:
+    EURJPY: 0.25
+    GBPJPY: 0.25
+    USDJPY: 0.25
+    GBPUSD: 0.25
+    EURGBP: 0.25
+    USDCHF: 0.25
+    EURUSD: 0.25
+    EURAUD: 0.25
+    CHFJPY: 0.25
+    GBPAUD: 0.25

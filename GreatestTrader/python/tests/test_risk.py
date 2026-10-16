@@ -10,7 +10,7 @@ def pv(sym):
 
 
 def test_profiles_and_dd_scaling():
-    rm = RiskManager(RiskConfig(profile="aggressive"))
+    rm = RiskManager(RiskConfig(profile="aggressive", blackout_start="", blackout_end=""))
     rm.update_equity(10000, date(2021, 1, 4))
     assert rm.risk_fraction("NR", 10000) == 0.015
     # 15% drawdown -> multiplier 1 - 0.15/0.30 = 0.5
@@ -20,7 +20,7 @@ def test_profiles_and_dd_scaling():
 
 
 def test_position_limits():
-    rm = RiskManager(RiskConfig(max_open_positions=3, max_positions_per_currency=2))
+    rm = RiskManager(RiskConfig(max_open_positions=3, max_positions_per_currency=2, blackout_start="", blackout_end=""))
     rm.update_equity(10000, date(2021, 1, 4))
     assert rm.can_open("NR", "EURJPY", [], 10000)[0]
     assert not rm.can_open("NR", "EURJPY", [pv("EURJPY")], 10000)[0]  # same symbol
@@ -29,7 +29,7 @@ def test_position_limits():
 
 
 def test_daily_limit_and_halt():
-    rm = RiskManager(RiskConfig(daily_loss_limit=0.05, max_drawdown_halt=0.40))
+    rm = RiskManager(RiskConfig(daily_loss_limit=0.05, max_drawdown_halt=0.40, blackout_start="", blackout_end=""))
     rm.update_equity(10000, date(2021, 1, 4))
     assert not rm.can_open("NR", "EURJPY", [], 9400)[0]  # -6% today
     rm.update_equity(9400, date(2021, 1, 5))  # new day resets
@@ -40,10 +40,10 @@ def test_daily_limit_and_halt():
 
 
 def test_lot_size_rounding_and_minimum():
-    rm = RiskManager(RiskConfig(min_lot_policy="skip"))
+    rm = RiskManager(RiskConfig(min_lot_policy="skip", blackout_start="", blackout_end=""))
     assert rm.lot_size(100.0, 300.0, 0.01, 50, 0.01) == 0.33
     assert rm.lot_size(1.0, 300.0, 0.01, 50, 0.01) == 0.0  # below min -> skip
-    rm2 = RiskManager(RiskConfig(min_lot_policy="min"))
+    rm2 = RiskManager(RiskConfig(min_lot_policy="min", blackout_start="", blackout_end=""))
     assert rm2.lot_size(2.5, 300.0, 0.01, 50, 0.01) == 0.01  # 3.0 loss <= 1.5 x 2.5
     assert rm.lot_size(1e9, 300.0, 0.01, 50, 0.01) == 50
 

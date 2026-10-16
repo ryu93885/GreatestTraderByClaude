@@ -1,10 +1,15 @@
 """Portfolio risk management.
 
-* Fixed-fractional sizing: each trade risks `risk_per_trade x equity` between entry and stop.
+* Fixed-fractional sizing: each trade risks `risk_per_trade x equity` between entry and stop,
+  times the per-symbol multiplier (symbol_risk_mult) and the adaptive multiplier (vol target /
+  equity-curve filter, 1.0 when off).
 * Drawdown scaling: risk x max(floor, 1 - DD / dd_scale_full)   (DD measured from equity peak).
-* Daily loss limit: no new entries for the rest of the market day after -daily_loss_limit.
+* Daily / monthly loss limits: no new entries for the rest of the market day / month.
+* Daily / monthly hard stops: close everything and stay flat for the rest of the day / month.
 * Max drawdown halt: no new entries at all once DD >= max_drawdown_halt (manual reset).
-* Position limits: total open positions, positions per currency, one position per symbol.
+* Position limits: total open positions, positions per currency, one position per symbol,
+  same-direction positions per currency and total open risk.
+* Year-end blackout: no new entries between blackout_start and blackout_end (market dates).
 """
 from __future__ import annotations
 
@@ -103,6 +108,15 @@ class RiskManager:
             events.append(f"DAY STOP: daily hard stop {c.daily_hard_stop:.1%} ({dkey})")
         return events
 
+    def hard_stop_active(self) -> str:
+        """Reason while a monthly/daily hard stop is in force (our positions must stay flat), else ''.
+        Lets the live engine retry closing positions whose first close attempt failed."""
+        if self.state.month_halted:
+            return f"monthly hard stop {self.cfg.monthly_hard_stop:.1%}"
+        if self.state.day_halted:
+            return f"daily hard stop {self.cfg.daily_hard_stop:.1%}"
+        return ""
+
     def _compute_adaptive_mult(self) -> float:
         """Volatility-target and equity-curve multipliers, recomputed once per market day."""
         c, eqs = self.cfg, self.state.daily_equity
@@ -146,6 +160,8 @@ class RiskManager:
         c, st = self.cfg, self.state
         if st.halted:
             return False, f"halted ({st.halt_reason})"
+        if self.in_blackout():
+            return False, "year-end holiday blackout"
         if st.month_halted:
             return False, "monthly stop"
         if st.day_halted:
@@ -180,6 +196,20 @@ class RiskManager:
             if (open_risk + new_risk) / equity > c.max_total_risk + 1e-12:
                 return False, "max total open risk"
         return True, ""
+
+    def in_blackout(self, market_day: date | None = None) -> bool:
+        """True when the market date (default: the current one) lies in the blackout window."""
+        c = self.cfg
+        if not c.blackout_start or not c.blackout_end:
+            return False
+        if market_day is None:
+            if not self.state.day:
+                return False
+            market_day = date.fromisoformat(self.state.day)
+        md = (market_day.month, market_day.day)
+        a = tuple(int(x) for x in c.blackout_start.split("-"))
+        b = tuple(int(x) for x in c.blackout_end.split("-"))
+        return (a <= md <= b) if a <= b else (md >= a or md <= b)
 
     def symbol_mult(self, symbol: str) -> float:
         return float(self.cfg.symbol_risk_mult.get(symbol, 1.0))

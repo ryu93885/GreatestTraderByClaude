@@ -1,0 +1,25 @@
+# SAFE2 - worst month about -2% (about 2%/month)
+# core crosses at full risk_nr: GBPCAD, EURCAD, AUDCAD, GBPCHF; other pairs use symbol_risk_mult
+# Applied by `preset: safe2` in config.yaml (values in config.yaml override these).
+risk:
+  profile: custom
+  risk_nr: 0.01
+  risk_es: 0.005
+  max_same_direction_per_currency: 2
+  max_total_risk: 0.02
+  monthly_loss_limit: 0.01
+  monthly_hard_stop: 0.015
+  dd_scale_full: 0.15
+  dd_scale_floor: 0.1
+  daily_loss_limit: 0.01
+  symbol_risk_mult:
+    EURJPY: 0.5
+    GBPJPY: 0.5
+    USDJPY: 0.5
+    GBPUSD: 0.5
+    EURGBP: 0.5
+    USDCHF: 0.5
+    EURUSD: 0.5
+    EURAUD: 0.5
+    CHFJPY: 0.5
+    GBPAUD: 0.5
