@@ -8,7 +8,10 @@ as the live engine. Fill model (conservative):
   * stop loss is checked before take profit inside a bar; gaps through the stop fill at
     the bar open;
   * PnL is expressed in R (multiples of the initial stop distance) and compounded with
-    the risk fraction from the RiskManager (fixed-fractional sizing, no lot rounding).
+    the risk fraction from the RiskManager (fixed-fractional sizing, no lot rounding);
+  * the capacity caps (risk.max_lots_per_order, risk.max_risk_amount) are applied exactly as live, before
+    the portfolio guards; lots are converted to backtest.account_currency with the loaded pairs (a symbol
+    without a conversion pair stays uncapped, with a warning); optional free-margin check (backtest.leverage).
 """
 from __future__ import annotations
 
@@ -237,10 +240,79 @@ def _business_days(a: pd.Timestamp, b: pd.Timestamp) -> int:
     return sum(1 for d in pd.bdate_range(a, b) if (d.month, d.day) not in _FX_HOLIDAYS)
 
 
+# ---------------------------------------------------------------- capacity / sizing limits
+_STALE = np.timedelta64(7, "D")
+MARGIN_USE_MAX = 0.8  # same as engine.MARGIN_USE_MAX
+
+
+class _FxConverter:
+    """Currency -> account-currency rate at any server time, from the bar OPENs of the loaded pairs.
+
+    Uses a direct pair when one is loaded (EURUSD, USDJPY, ...), otherwise goes through USD, triangulating
+    via a loaded cross whose other leg has a USD pair (CAD = GBPUSD / GBPCAD or EURUSD / EURCAD,
+    AUD = EURUSD / EURAUD, ...). With the 14 default NR symbols every currency is covered for a USD or a
+    JPY account. A rate older than 7 days counts as missing and the next candidate is tried."""
+
+    def __init__(self, data: dict[str, pd.DataFrame]):
+        self.px = {}
+        for s, df in data.items():
+            if len(df) and "open" in df.columns:
+                self.px[s[:6].upper()] = (df.index.to_numpy(dtype="datetime64[ns]"), df["open"].to_numpy(float))
+
+    def _asof(self, sym: str, t: np.ndarray) -> np.ndarray:
+        ix, v = self.px[sym]
+        i = np.searchsorted(ix, t, side="right") - 1
+        out = np.full(len(t), np.nan)
+        ok = i >= 0
+        out[ok] = v[i[ok]]
+        stale = np.zeros(len(t), bool)
+        stale[ok] = (t[ok] - ix[i[ok]]) > _STALE
+        out[stale] = np.nan
+        return out
+
+    def _direct(self, ccy: str, t: np.ndarray) -> np.ndarray | None:
+        if ccy == "USD":
+            return np.ones(len(t))
+        if ccy + "USD" in self.px:
+            return self._asof(ccy + "USD", t)
+        if "USD" + ccy in self.px:
+            return 1.0 / self._asof("USD" + ccy, t)
+        return None
+
+    def usd(self, ccy: str, t: np.ndarray) -> np.ndarray:
+        """Value of 1 unit of ccy in USD (NaN where no candidate is available)."""
+        out = self._direct(ccy, t)
+        out = np.full(len(t), np.nan) if out is None else out
+        for sym in sorted(self.px):
+            if not np.isnan(out).any():
+                break
+            b, q = sym[:3], sym[3:6]
+            if ccy not in (b, q) or "USD" in (b, q):
+                continue
+            other = q if b == ccy else b
+            o = self._direct(other, t)
+            if o is None:
+                continue
+            p = self._asof(sym, t)
+            cand = o * p if b == ccy else o / p
+            out = np.where(np.isfinite(out), out, cand)
+        return out
+
+    def rate(self, ccy: str, acct: str, t: np.ndarray) -> np.ndarray:
+        """Value of 1 unit of ccy in the account currency."""
+        if ccy == acct:
+            return np.ones(len(t))
+        if ccy + acct in self.px:
+            return self._asof(ccy + acct, t)
+        if acct + ccy in self.px:
+            return 1.0 / self._asof(acct + ccy, t)
+        return self.usd(ccy, t) / (1.0 if acct == "USD" else self.usd(acct, t))
+
+
 # ---------------------------------------------------------------- engine
 class _Pos:
     __slots__ = ("strategy", "sym", "dir", "j", "entry", "sl", "sl_dist", "risk_amt", "cost", "pip",
-                 "entry_time", "exit_utc", "ticket", "last_c")
+                 "entry_time", "exit_utc", "ticket", "last_c", "lots", "lots_raw", "notional", "margin")
 
 
 class Backtester:
@@ -337,6 +409,20 @@ class Backtester:
         if not entries:
             return BacktestResult(pd.DataFrame(), pd.Series(dtype=float), cfg.backtest.initial_equity)
 
+        # quote -> account and base -> account rates at every bar of each traded symbol (lots, caps, margin)
+        max_lots, max_risk_amt = cfg.risk.max_lots_per_order, cfg.risk.max_risk_amount
+        leverage, contract = cfg.backtest.leverage, cfg.backtest.contract_size
+        acct = cfg.backtest.account_currency.upper()
+        fx = _FxConverter(self.data)
+        for s, d in sym_data.items():
+            ix = d["df"].index.to_numpy(dtype="datetime64[ns]")
+            d["q2a"] = fx.rate(s[3:6], acct, ix)
+            d["b2a"] = fx.rate(s[:3], acct, ix)
+            if (max_lots > 0 or leverage > 0) and np.isnan(d["q2a"]).all():
+                log.warning("%s: no loaded pair converts %s to the account currency %s -> the lot cap / margin "
+                            "check are NOT applied to this symbol (add e.g. USD%s or %sUSD data)", s, s[3:6], acct,
+                            s[3:6], s[3:6])
+
         entries.sort(key=lambda x: (x[0], x[1], x[3]))
         if start_ts is not None:
             entries = [e for e in entries if e[0] >= start_ts]
@@ -373,21 +459,40 @@ class Backtester:
                 views = [PositionView(p.ticket, p.strategy, p.sym, p.dir, 1.0, p.entry, p.entry_time, p.sl, None,
                                       risk_amount=p.risk_amt) for p in open_pos]
                 rfrac = risk.risk_fraction(strat, last_mtm) * risk.symbol_mult(s)
-                ok, _why = risk.can_open(strat, s, views, last_mtm, req.direction, equity * rfrac)
+                d = sym_data[s]
+                # capacity caps BEFORE the portfolio guards, as live: the total-risk cap sees the capped risk
+                risk_amt = equity * rfrac
+                loss_per_lot = req.sl_distance * contract * d["q2a"][j]  # account ccy lost by 1.0 lot at the stop
+                lots_raw = risk_amt / loss_per_lot if loss_per_lot > 0 else np.nan
+                lots = lots_raw
+                if np.isfinite(lots_raw):
+                    capped = risk.capped_risk(risk_amt, loss_per_lot)
+                    if capped < risk_amt:  # only touched when a cap binds (bit-identical results otherwise)
+                        risk_amt, lots = capped, capped / loss_per_lot
+                elif max_risk_amt > 0:  # no conversion pair: the money cap still applies
+                    risk_amt = min(risk_amt, max_risk_amt)
+                ok, _why = risk.can_open(strat, s, views, last_mtm, req.direction, risk_amt)
                 if not ok:
                     continue
-                d = sym_data[s]
+                margin = 0.0
+                if leverage > 0 and np.isfinite(lots):
+                    margin = lots * contract * d["b2a"][j] / leverage
+                    free = last_mtm - sum(p.margin for p in open_pos)
+                    if margin > MARGIN_USE_MAX * free:
+                        continue  # live: "skip (insufficient free margin)"
                 entry = d["o"][j]
                 if strat == "NR" and NightReversion.favorable_tp(req.direction, entry, req.tp_price) is None:
                     continue
                 p = _Pos()
+                p.lots, p.lots_raw, p.margin = lots, lots_raw, margin
+                p.notional = lots * contract * d["b2a"][j] if np.isfinite(lots) else np.nan
                 ticket += 1
                 p.ticket, p.strategy, p.sym, p.dir, p.j = ticket, strat, s, req.direction, j
                 p.entry, p.sl_dist = entry, req.sl_distance
                 p.sl = entry - req.direction * req.sl_distance
                 # sized on realized equity (live sizes on account equity incl. floating P/L; the difference
                 # is negligible here: stable5 changes by less than 0.01%/month when sized on MTM equity)
-                p.risk_amt = equity * rfrac
+                p.risk_amt = risk_amt
                 slip = nr_cfg.slippage_pips if strat == "NR" else es_cfg.slippage_pips
                 sig_i = j - 1 if strat == "NR" else j
                 p.cost = (d["spr"][sig_i] + slip) * d["pip"]
@@ -440,7 +545,8 @@ class Backtester:
                     equity += pnl
                     exit_time = d["df"].index[k]
                     trades.append((p.strategy, p.sym, p.dir, p.entry_time, exit_time.to_pydatetime(), p.entry,
-                                   exitp, p.sl_dist / p.pip, p.cost / p.pip, R, pnl, equity, why))
+                                   exitp, p.sl_dist / p.pip, p.cost / p.pip, R, pnl, equity, why, p.lots, p.lots_raw,
+                                   p.notional, p.risk_amt))
                     eq_t.append(exit_time + pd.Timedelta(minutes=15))
                     eq_v.append(equity)
                 open_pos = still
@@ -467,7 +573,8 @@ class Backtester:
                     pnl = p.risk_amt * R
                     equity += pnl
                     trades.append((p.strategy, p.sym, p.dir, p.entry_time, t.to_pydatetime(), p.entry, exitp,
-                                   p.sl_dist / p.pip, p.cost / p.pip, R, pnl, equity, why))
+                                   p.sl_dist / p.pip, p.cost / p.pip, R, pnl, equity, why, p.lots, p.lots_raw,
+                                   p.notional, p.risk_amt))
                     eq_t.append(t + pd.Timedelta(minutes=15))
                     eq_v.append(equity)
                 open_pos = []
@@ -480,7 +587,8 @@ class Backtester:
                 mtm_dd = mtm / mtm_peak - 1
 
         cols = ["strategy", "symbol", "direction", "entry_time", "exit_time", "entry_price", "exit_price",
-                "sl_pips", "cost_pips", "R", "pnl", "equity", "exit_reason"]
+                "sl_pips", "cost_pips", "R", "pnl", "equity", "exit_reason", "lots", "lots_uncapped", "notional",
+                "risk_amount"]
         tr = pd.DataFrame(trades, columns=cols)
         eq = pd.Series(eq_v, index=pd.DatetimeIndex(eq_t), name="equity")
         eq = eq.groupby(level=0).last()

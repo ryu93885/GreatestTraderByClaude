@@ -6,8 +6,11 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
-from greatest_trader.broker.base import Broker, OrderResult, SymbolSpec, Tick
+from greatest_trader.broker.base import Broker, CashFlow, ClosedTrade, OrderResult, SymbolSpec, Tick
 from greatest_trader.strategies.base import PositionView, pip_size
+from greatest_trader.timeutil import ServerClock
+
+NY7 = ServerClock("ny7")
 
 
 def synthetic_m15(start: datetime, days: int, base: float, pip: float, spike_at: datetime | None = None,
@@ -34,13 +37,23 @@ def synthetic_m15(start: datetime, days: int, base: float, pip: float, spike_at:
 
 
 class FakeBroker(Broker):
-    def __init__(self, data: dict[str, pd.DataFrame], equity: float = 10000.0):
+    """In-memory broker: prices from M15 bars (bid = bar open), constant equity unless a test changes it,
+    P/L of 1.0 lot = price move x 100,000 in the account currency (same as loss_per_lot)."""
+
+    def __init__(self, data: dict[str, pd.DataFrame], equity: float = 10000.0, login: int = 111):
         self.data = data
         self.now: datetime | None = None
         self.equity = equity
+        self.login = login
         self.positions_: list[PositionView] = []
         self.log: list[tuple] = []
+        self.flows: list[CashFlow] = []
+        self.closed: dict[int, ClosedTrade] = {}
+        self.health_reason = ""
+        self.hedging = True
+        self.volume_max = 100.0
         self._ticket = 100
+        self._flow_ticket = 5000
 
     # helpers for tests
     def set_time(self, t: datetime) -> None:
@@ -70,7 +83,20 @@ class FakeBroker(Broker):
                 if hit:
                     self.positions_.remove(p)
                     self.log.append(("server_" + hit, p.symbol, ts))
+                    self._record_close(p, p.sl if hit == "SL" else p.tp, ts.to_pydatetime(), hit)
                     break
+
+    def add_cash(self, amount: float, comment: str = "", deal_type: int = 2) -> CashFlow:
+        """A deposit (+) / withdrawal (-) booked now: equity changes and a balance deal appears."""
+        self.equity += amount
+        self._flow_ticket += 1
+        f = CashFlow(self._flow_ticket, self.now, amount, deal_type, comment)
+        self.flows.append(f)
+        return f
+
+    def _record_close(self, p: PositionView, price: float, when: datetime, reason: str) -> None:
+        pnl = p.direction * (price - p.open_price) * 100000 * p.volume
+        self.closed[p.ticket] = ClosedTrade(p.ticket, when, price, pnl, reason)
 
     def _bar(self, base: str) -> pd.Series:
         df = self.data[base]
@@ -82,16 +108,36 @@ class FakeBroker(Broker):
 
     def shutdown(self) -> None: ...
 
+    def health(self) -> str:
+        return self.health_reason
+
     def account_equity(self) -> float:
         return self.equity
 
     def account_currency(self) -> str:
         return "JPY"
 
+    def account_login(self) -> int:
+        return self.login
+
+    def account_server(self) -> str:
+        return "FakeServer"
+
+    def is_hedging(self) -> bool:
+        return self.hedging
+
+    def cash_flows(self) -> list[CashFlow]:
+        return list(self.flows)
+
+    def closed_trade(self, ticket: int) -> ClosedTrade | None:
+        return self.closed.get(int(ticket))
+
     def symbol_spec(self, base: str) -> SymbolSpec:
+        if base not in self.data:
+            raise RuntimeError(f"symbol {base} not available at this broker")
         pip = pip_size(base)
         digits = 3 if pip == 0.01 else 5
-        return SymbolSpec(base, base, digits, pip / 10, pip, 0.01, 100.0, 0.01, 0)
+        return SymbolSpec(base, base, digits, pip / 10, pip, 0.01, self.volume_max, 0.01, 0)
 
     def tick(self, base: str) -> Tick | None:
         b = self._bar(base)
@@ -135,9 +181,18 @@ class FakeBroker(Broker):
         return OrderResult(True, ticket)
 
     def close_position(self, ticket, base, comment="") -> OrderResult:
+        for p in self.positions_:
+            if p.ticket == ticket:
+                t = self.tick(base)
+                self._record_close(p, t.bid if p.direction > 0 else t.ask, self.now, "expert")
         self.positions_ = [p for p in self.positions_ if p.ticket != ticket]
         self.log.append(("close", base, comment))
         return OrderResult(True, ticket)
+
+
+def ny7_utc(broker: FakeBroker):
+    """utcnow() for the engine that matches a ny7 broker clock (server time = market time)."""
+    return lambda: NY7.server_to_utc(broker.now)
 
 
 def step_until(engine, broker: FakeBroker, start: datetime, end: datetime, every=timedelta(minutes=15),

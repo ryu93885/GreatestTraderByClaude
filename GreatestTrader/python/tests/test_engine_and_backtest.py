@@ -2,8 +2,13 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from fakes import FakeBroker, step_until, synthetic_m15
-from greatest_trader.backtest import Backtester
+import logging
+
+import numpy as np
+import pytest
+
+from fakes import FakeBroker, ny7_utc, step_until, synthetic_m15
+from greatest_trader.backtest import Backtester, _FxConverter
 from greatest_trader.broker.base import OrderResult
 from greatest_trader.config import Config, load_config
 from greatest_trader.engine import LiveEngine
@@ -19,14 +24,15 @@ def make_cfg(tmp_path, dry_run=False):
     cfg.euro_session.enabled = False
     cfg.engine.dry_run = dry_run
     cfg.engine.state_file = str(tmp_path / "state.json")
+    cfg.engine.journal_dir = str(tmp_path / "journal")
     cfg.broker.server_time_mode = "ny7"
     cfg.risk.blackout_start = cfg.risk.blackout_end = ""  # synthetic data starts in early January
     return cfg
 
 
-def make_engine(cfg, data):
-    broker = FakeBroker(data, equity=1_000_000)
-    eng = LiveEngine(cfg, broker, Notifier(cfg.notify))
+def make_engine(cfg, data, equity=1_000_000):
+    broker = FakeBroker(data, equity=equity)
+    eng = LiveEngine(cfg, broker, Notifier(cfg.notify), utcnow=ny7_utc(broker))
     eng.clock = ServerClock("ny7")
     return eng, broker
 
@@ -142,6 +148,7 @@ def test_backtest_matches_live_engine_when_guards_compete(tmp_path):
     cfg.euro_session.enabled = False
     cfg.engine.dry_run = False
     cfg.engine.state_file = str(tmp_path / "state.json")
+    cfg.engine.journal_dir = str(tmp_path / "journal")
     cfg.broker.server_time_mode = "ny7"
     cfg.risk.blackout_start = cfg.risk.blackout_end = ""
     # the fake broker's equity is constant: switch off the equity-driven guards on both sides
@@ -213,3 +220,94 @@ def test_mtm_drawdown_matches_independent_reconstruction(tmp_path):
     s = pd.Series(mtm)
     dd = float((s / s.cummax().clip(lower=eq0) - 1).min())
     assert abs(dd - res.max_drawdown_mtm) < 1e-9
+
+
+def _three_jpy_crosses():
+    syms = [("EURJPY", 130.0, 0.01), ("GBPJPY", 150.0, 0.01), ("CHFJPY", 115.0, 0.01)]
+    return {s: synthetic_m15(datetime(2021, 3, 1), 8, b, p, seed=7 + k) for k, (s, b, p) in enumerate(syms)}
+
+
+def _stable5_flat_equity_cfg(tmp_path, data):
+    cfg = load_config(None, preset="stable5")
+    cfg.night_reversion.symbols = list(data)
+    cfg.euro_session.enabled = False
+    cfg.engine.dry_run = False
+    cfg.engine.state_file = str(tmp_path / "state.json")
+    cfg.engine.journal_dir = str(tmp_path / "journal")
+    cfg.broker.server_time_mode = "ny7"
+    cfg.risk.blackout_start = cfg.risk.blackout_end = ""
+    # the fake broker's equity is constant: switch off the equity-driven guards on both sides
+    cfg.risk.dd_scale_full = cfg.risk.daily_loss_limit = cfg.risk.monthly_hard_stop = 0.0
+    cfg.backtest.spreads_pips = {s: 1.0 for s in data}
+    return cfg
+
+
+def test_backtest_matches_live_engine_with_lot_cap(tmp_path):
+    """Large account: max_lots_per_order binds on every trade. Live and backtest must take the same trades
+    with the same (capped) volume; the total-risk cap sees the capped risk on both sides."""
+    data = _three_jpy_crosses()
+    cfg = _stable5_flat_equity_cfg(tmp_path, data)
+    cfg.risk.max_lots_per_order = 3.0
+    cfg.backtest.account_currency = "JPY"  # the fake broker prices JPY crosses in JPY
+    cfg.backtest.initial_equity = 1e9
+    res = Backtester(cfg, data).run()
+    t = res.trades
+    assert len(t) >= 5 and (t.lots_uncapped > 3.0).all() and (abs(t.lots - 3.0) < 1e-9).all()
+    assert np.allclose(t.risk_amount, 3.0 * 100000 * t.sl_pips * 0.01)  # 3 lots x loss of 1 lot at the stop
+    bt = sorted((pd.Timestamp(r.entry_time), r.symbol, int(r.direction), 3.0) for r in t.itertuples())
+
+    eng, broker = make_engine(cfg, data, equity=1e9)
+    opened = []
+    orig = broker.open_position
+
+    def rec(base, direction, volume, sl, tp, magic, comment):
+        opened.append((pd.Timestamp(broker.now).floor("15min"), base, direction, volume))
+        return orig(base, direction, volume, sl, tp, magic, comment)
+
+    broker.open_position = rec
+    step_until(eng, broker, datetime(2021, 3, 1, 0, 0), datetime(2021, 3, 8, 23, 45))
+    assert sorted(opened) == bt
+    caps = [m for m in eng.notifier.recent if m.startswith("lot cap: intended")]
+    assert caps and "sending 3 " in caps[0]
+    # notified at most once per market day and symbol, although every trade was capped
+    assert len(caps) == len({(o[0].date(), o[1]) for o in opened})
+
+
+def test_backtest_caps_off_and_unbound_cap_give_identical_trades(tmp_path):
+    data = _three_jpy_crosses()
+    cfg = _stable5_flat_equity_cfg(tmp_path, data)
+    cfg.backtest.account_currency = "JPY"
+    cfg.backtest.initial_equity = 1_000_000  # ~0.1 lot trades: a 20-lot cap never binds
+    capped = Backtester(cfg, data).run().trades
+    cfg.risk.max_lots_per_order = 0
+    off = Backtester(cfg, data).run().trades
+    cols = ["entry_time", "symbol", "pnl", "equity"]
+    assert len(off) > 5 and off[cols].equals(capped[cols])
+
+
+def test_fx_converter_usd_and_jpy_accounts():
+    idx = pd.date_range("2021-03-01", periods=4, freq="15min")
+
+    def px(v):
+        return pd.DataFrame({"open": [v] * 4}, index=idx)
+
+    fx = _FxConverter({"USDJPY": px(110.0), "GBPUSD": px(1.40), "GBPCAD": px(1.75), "EURJPY": px(130.0)})
+    t = idx.to_numpy(dtype="datetime64[ns]")
+    assert np.allclose(fx.rate("JPY", "USD", t), 1 / 110.0)
+    assert np.allclose(fx.rate("CAD", "USD", t), 1.40 / 1.75)  # triangulated through GBP
+    assert np.allclose(fx.rate("CAD", "JPY", t), 1.40 / 1.75 * 110.0)
+    assert np.allclose(fx.rate("EUR", "JPY", t), 130.0)  # direct pair
+    assert np.isnan(fx.rate("CHF", "USD", t)).all()  # nothing to convert CHF with
+
+
+def test_backtest_missing_conversion_pair_leaves_symbol_uncapped(tmp_path, caplog):
+    data = {"EURJPY": synthetic_m15(datetime(2021, 3, 1), 5, 130.0, 0.01, spike_at=SPIKE)}
+    cfg = make_cfg(tmp_path)
+    cfg.backtest.spreads_pips = {"EURJPY": 1.0}
+    cfg.backtest.initial_equity = 1e12  # would be capped if JPY could be converted to USD
+    with caplog.at_level(logging.WARNING, logger="greatest_trader.backtest"):
+        res = Backtester(cfg, data).run()
+    assert any("EURJPY" in r.message and "NOT applied" in r.message for r in caplog.records)
+    t = res.trades
+    assert len(t) and t.lots.isna().all()
+    assert t.iloc[0].risk_amount == pytest.approx(1e12 * cfg.risk.base_risk("nr"))  # uncapped

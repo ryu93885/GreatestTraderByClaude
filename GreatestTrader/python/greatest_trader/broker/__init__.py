@@ -1,3 +1,3 @@
-from .base import Broker, OrderResult, SymbolSpec, Tick
+from .base import Broker, CashFlow, ClosedTrade, OrderResult, SymbolSpec, Tick
 
-__all__ = ["Broker", "OrderResult", "SymbolSpec", "Tick"]
+__all__ = ["Broker", "CashFlow", "ClosedTrade", "OrderResult", "SymbolSpec", "Tick"]

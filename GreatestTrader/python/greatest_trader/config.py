@@ -113,6 +113,12 @@ class RiskConfig:
     #     empty = off). Thin year-end liquidity produced the worst flash-crash fills (e.g. 2019-01-03).
     blackout_start: str = "12-20"
     blackout_end: str = "01-05"
+    # --- capacity caps (0 = off). The strategy enters right after the NY 17:00 rollover, when the market is
+    #     thinnest, so the size of one order cannot grow with equity forever: above the cap, profit grows in
+    #     currency, not in % per month. Applied BEFORE the portfolio guards (the total-risk cap sees the
+    #     capped amount); the broker's volume_max applies as well (the tighter wins).
+    max_lots_per_order: float = 20.0  # lots of one order, every strategy
+    max_risk_amount: float = 0.0  # money at risk of one trade (entry -> stop), ACCOUNT currency
 
     def base_risk(self, strategy: str) -> float:
         if self.profile == "custom":
@@ -128,14 +134,25 @@ class NotifyConfig:
     slack_webhook: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    healthcheck_url: str = ""  # dead-man switch (e.g. healthchecks.io): pinged every 5 minutes while running
+
+
+@dataclass
+class MonitorConfig:
+    """Notification-only monitoring: never changes trading."""
+    dd_alert: float = 0.15  # notify when drawdown from peak >= this (at most once a day while above; 0 = off)
+    daily_summary: bool = True  # summary at every market-day change
+    edge_window_trades: int = 250  # R-based edge monitor: last N closed trades of the journal, at each month end
+    stale_feed_minutes: float = 10.0  # notify (hourly) when server time stops for this long on a market weekday
 
 
 @dataclass
 class EngineConfig:
     dry_run: bool = True  # True: compute & log signals but send no orders
     poll_seconds: float = 5.0
-    state_file: str = "state/state.json"
+    state_file: str = "state/state.json"  # dry-run uses <name>_dryrun.json next to it
     log_dir: str = "logs"
+    journal_dir: str = "journal"  # append-only trade journal and daily equity log
     log_level: str = "INFO"
     history_bars: int = 300
 
@@ -146,6 +163,9 @@ class BacktestConfig:
     start: str | None = None
     end: str | None = None
     initial_equity: float = 10000.0
+    account_currency: str = "USD"  # lots and the capacity caps are converted with the loaded pairs (USD, JPY, ...)
+    contract_size: float = 100000.0  # units per 1.0 lot
+    leverage: float = 0.0  # free-margin check like live (skip when margin > 80% of free margin); 0 = off
     spreads_pips: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_BACKTEST_SPREADS))
     commission_pips: float = 0.0  # extra round-trip commission in pips (if spreads exclude it)
     output_dir: str = "backtest_output"
@@ -159,6 +179,7 @@ class Config:
     euro_session: EuroSessionConfig = field(default_factory=EuroSessionConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     preset: str = ""
@@ -212,6 +233,25 @@ class Config:
         for v in (r.blackout_start, r.blackout_end):
             if v and not _valid_mmdd(v):
                 raise ValueError(f"risk.blackout_start/end must be MM-DD (got {v!r})")
+        for k in ("max_lots_per_order", "max_risk_amount"):
+            v = getattr(r, k)
+            if not _is_num(v) or v < 0:
+                raise ValueError(f"risk.{k} must be a number >= 0 (0 = off, got {v!r})")
+        m = self.monitor
+        if not _is_num(m.dd_alert) or not 0 <= m.dd_alert <= 1:
+            raise ValueError(f"monitor.dd_alert must be a fraction between 0 and 1 (got {m.dd_alert!r})")
+        if isinstance(m.edge_window_trades, bool) or not isinstance(m.edge_window_trades, int) \
+                or m.edge_window_trades < 1:
+            raise ValueError("monitor.edge_window_trades must be an integer >= 1")
+        if not _is_num(m.stale_feed_minutes) or m.stale_feed_minutes <= 0:
+            raise ValueError("monitor.stale_feed_minutes must be > 0")
+        b = self.backtest
+        if not _is_num(b.leverage) or b.leverage < 0 or not _is_num(b.contract_size) or b.contract_size <= 0:
+            raise ValueError("backtest.leverage must be >= 0 and backtest.contract_size > 0")
+        if not isinstance(b.account_currency, str) or len(b.account_currency.strip()) != 3:
+            raise ValueError(f"backtest.account_currency must be a currency code such as USD or JPY "
+                             f"(got {b.account_currency!r})")
+        b.account_currency = b.account_currency.strip().upper()
         if bool(r.blackout_start) != bool(r.blackout_end):
             raise ValueError("risk.blackout_start and blackout_end must both be set or both empty")
         if self.broker.server_time_mode not in ("auto", "ny7", "fixed"):

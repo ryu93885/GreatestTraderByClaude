@@ -4,6 +4,7 @@ __pycache__/
 GreatestTrader/python/.venv/
 GreatestTrader/python/logs/
 GreatestTrader/python/state/
+GreatestTrader/python/journal/
 GreatestTrader/python/data/
 GreatestTrader/python/backtest_output/
 .claude/

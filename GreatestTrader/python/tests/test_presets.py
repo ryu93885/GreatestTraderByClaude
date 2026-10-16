@@ -54,7 +54,17 @@ EA_ALL = {"max_open_positions": ("InpMaxOpen", 1), "max_positions_per_currency":
           "monthly_hard_stop": ("InpMonthlyHardStop", 100), "vol_target_daily": ("InpVolTargetDaily", 100),
           "vol_lookback_days": ("InpVolLookbackDays", 1), "vol_mult_min": ("InpVolMultMin", 1),
           "vol_mult_max": ("InpVolMultMax", 1), "eq_filter_days": ("InpEqFilterDays", 1),
-          "eq_filter_mult": ("InpEqFilterMult", 1)}
+          "eq_filter_mult": ("InpEqFilterMult", 1), "max_lots_per_order": ("InpMaxLotsPerOrder", 1),
+          "max_risk_amount": ("InpMaxRiskAmount", 1)}
+
+
+@pytest.mark.parametrize("name", sorted(SET_NAMES))
+def test_preset_capacity_caps_and_drawdown_halt(name):
+    """Shared contract: every preset caps an order at 20 lots (no money cap); the stable / safe presets halt
+    new entries at 20% drawdown, the classic ones keep 40%."""
+    r = load_config(None, preset=name).risk
+    assert r.max_lots_per_order == 20.0 and r.max_risk_amount == 0.0
+    assert r.max_drawdown_halt == (0.40 if name.startswith("classic_") else 0.20)
 
 
 @pytest.mark.parametrize("name", sorted(SET_NAMES))
@@ -79,10 +89,26 @@ def test_ea_default_inputs_equal_stable5_preset():
     st = read_set(SET_DIR / "GreatestTrader_Stable5_Default.set")
     for key in ["InpRiskNR", "InpRiskES", "InpMaxTotalRisk", "InpMaxSameDirPerCcy", "InpMonthlyHardStop",
                 "InpDDScaleFull", "InpDDScaleFloor", "InpDailyLossLimit", "InpSymbolRiskMult", "InpBlackoutStart",
-                "InpBlackoutEnd", "InpBBPeriod", "InpBBDev", "InpATRCostMult", "InpSLATRMult", "InpMaxHoldBars"]:
+                "InpBlackoutEnd", "InpMaxDDHalt", "InpMaxLotsPerOrder", "InpMaxRiskAmount", "InpBBPeriod", "InpBBDev",
+                "InpATRCostMult", "InpSLATRMult", "InpMaxHoldBars"]:
         a, b = defaults[key], st[key]
         try:
             assert abs(float(a) - float(b)) < 1e-9, key
         except ValueError:
             assert a == b, key
     assert defaults["InpRiskProfile"] == "GT_RISK_CUSTOM" and st["InpRiskProfile"] == "3"
+
+
+def test_ea_monitoring_and_clock_defaults_match_python():
+    """EA defaults of the shared contract: DD alert 15% (Python monitor.dd_alert), server clock AUTO (Python
+    broker.server_time_mode: auto), drawdown halt 20% like the stable5 preset."""
+    import re
+    from greatest_trader.config import Config
+    src = (ROOT / "mql5" / "Experts" / "GreatestTrader.mq5").read_text()
+    defaults = {m.group(1): m.group(2).strip().strip('"')
+                for m in re.finditer(r"^input\s+\w+\s+(Inp\w+)\s*=\s*([^;]+);", src, re.M)}
+    c = Config()
+    assert abs(float(defaults["InpDDAlert"]) - c.monitor.dd_alert * 100) < 1e-9
+    assert c.broker.server_time_mode == "auto" and "GT_SERVER_AUTO" in defaults.values()
+    assert abs(float(defaults["InpMaxDDHalt"]) - load_config(None, preset="stable5").risk.max_drawdown_halt * 100) < 1e-9
+    assert defaults["InpResetHalt"] == "false"
