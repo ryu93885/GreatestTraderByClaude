@@ -10,6 +10,7 @@ import pytest
 import fake_mt5
 import main
 from fake_mt5 import S
+from fakes import synthetic_m15
 from greatest_trader.broker import mt5_broker
 from greatest_trader.config import Config
 from greatest_trader.journal import TradeJournal
@@ -162,3 +163,24 @@ def test_edge_monitor_table(tmp_path):
                      "ticket": k})
     t = edge_monitor_table(j.closed_trades(), 250)
     assert t.status.tolist() == ["WARN", "REVIEW", "ok"] and t.trades.tolist() == [60, 70, 250]
+
+
+def test_backtest_command_loads_conversion_pairs_from_the_data_dir(tmp_path, capsys):
+    """A pair that is not traded but sits in data_dir converts the lots of a traded symbol (GBPCHF in a USD
+    account needs USDCHF): the 20-lot cap binds."""
+    d = tmp_path / "data"
+    d.mkdir()
+    for s, b, p, seed in (("GBPCHF", 1.25, 0.0001, 1), ("USDCHF", 0.92, 0.0001, 2), ("AUDNZD", 1.08, 0.0001, 3)):
+        synthetic_m15(datetime(2021, 3, 1), 10, b, p, seed=seed, spike_at=datetime(2021, 3, 3, 0, 30)).rename_axis("time").to_csv(
+            d / f"{s}_M15.csv")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"night_reversion:\n  symbols: [GBPCHF]\neuro_session:\n  enabled: false\nbroker:\n"
+                   f"  server_time_mode: ny7\nrisk:\n  blackout_start: ''\n  blackout_end: ''\n"
+                   f"engine:\n  log_dir: {tmp_path / 'logs'}\n  state_file: {tmp_path / 'state.json'}\n"
+                   f"backtest:\n  data_dir: {d}\n  output_dir: {tmp_path / 'out'}\n  initial_equity: 1000000000\n",
+                   encoding="utf-8")
+    assert main.main(["backtest", "-c", str(cfg)]) == 0
+    out = capsys.readouterr().out
+    assert "conversion pairs (not traded): USDCHF" in out and "AUDNZD" not in out
+    t = pd.read_csv(next((tmp_path / "out").rglob("trades.csv")))
+    assert len(t) and (abs(t.lots - 20) < 1e-9).all()

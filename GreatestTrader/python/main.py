@@ -106,7 +106,7 @@ def cmd_download(cfg, years: float) -> int:
 
 
 def cmd_backtest(cfg, out: str | None) -> int:
-    from greatest_trader.backtest import Backtester, load_data_dir
+    from greatest_trader.backtest import Backtester, conversion_pairs, load_data_dir
     from greatest_trader.report import annual_table, format_stats, save_report, yearly_table
 
     syms = list(dict.fromkeys(cfg.night_reversion.symbols + [cfg.euro_session.symbol]))
@@ -114,6 +114,10 @@ def cmd_backtest(cfg, out: str | None) -> int:
     if not data:
         print(f"no data found in {cfg.backtest.data_dir}. Run `python main.py download` first.")
         return 1
+    extra = conversion_pairs(cfg.backtest.data_dir, syms, cfg.backtest.account_currency)
+    if extra:  # not traded: only for converting lots / margin to the account currency
+        data.update(load_data_dir(cfg.backtest.data_dir, extra))
+        print(f"conversion pairs (not traded): {', '.join(extra)}")
     res = Backtester(cfg, data).run()
     if len(res.trades) == 0:
         print("no trades")
