@@ -64,6 +64,9 @@ class RiskState:
     day_opens: int = 0  # entries / closes of the current market day (daily summary)
     day_closes: int = 0
     open_trades: dict = field(default_factory=dict)  # str(ticket) -> journal data of an open position
+    # `reset-halt` request ("clear" | "rebase"), applied by the engine at its next start AFTER the first cash-flow
+    # check (a deposit made while it was stopped must reach the old peak before the peak is rebased)
+    reset_request: str = ""
 
     # ------------------------------------------------------------- persistence
     @classmethod

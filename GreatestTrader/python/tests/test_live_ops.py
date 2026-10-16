@@ -13,6 +13,7 @@ from greatest_trader.config import Config, load_config
 from greatest_trader.engine import M15, LiveEngine
 from greatest_trader.journal import TradeJournal, risk_weighted_r
 from greatest_trader.notify import Notifier
+from greatest_trader.risk import RiskState
 from greatest_trader.strategies import PositionView
 
 SPIKE = datetime(2021, 3, 3, 0, 30)
@@ -114,6 +115,26 @@ def test_flow_booked_between_the_equity_read_and_the_scan(tmp_path):
     eng.step()
     assert eng.state.peak_equity == pytest.approx(9_600) and eng.state.last_equity == 9_600
     assert not sent(eng, "MONTH STOP")
+
+
+def test_reset_halt_is_applied_after_the_first_cash_flow_check(tmp_path):
+    """reset-halt --rebase-peak while a 5,000 deposit was made with the engine stopped: the deposit is applied to
+    the OLD peak first, then the peak is rebased to the equity that contains it (EA: InpResetHalt). Rebasing first
+    multiplied the deposit onto the new peak: 'HALT: drawdown 38.8%' at once."""
+    cfg = cfg_for(tmp_path, preset="stable5")
+    RiskState(peak_equity=10_000, last_equity=7_900, day="2021-03-02", month="2021-03", day_start_equity=7_900,
+              month_start_equity=8_000, halted=True, halt_reason="max drawdown 21.0% reached", account_login=111,
+              cash_init=True, cash_tickets=[[1, 0.0]], reset_request="rebase").save(tmp_path / "state.json")
+    eng, br = make(cfg, eurjpy(), equity=7_900)
+    br.set_time(datetime(2021, 3, 2, 10, 0, 5))
+    br.add_cash(5_000, "deposit while stopped")
+    eng.step()
+    st = eng.state
+    assert not st.halted and st.reset_request == "" and st.peak_equity == pytest.approx(12_900)
+    assert eng.risk.risk_fraction("NR", 12_900) == pytest.approx(0.035)
+    assert sent(eng, "CASH FLOW +5,000.00") and sent(eng, "RESET HALT") and not sent(eng, "HALT: max drawdown")
+    j = pd.read_csv(tmp_path / "journal" / "trades_2021.csv")
+    assert j.event.tolist() == ["reset_halt"] and "applied by the engine" in j.reason.iloc[0]
 
 
 def test_several_flows_in_one_loop_compound_exactly(tmp_path):
@@ -320,6 +341,19 @@ def test_daily_summary_and_equity_log(tmp_path):
     assert msg and "equity 10,100.00" in msg[0] and "month-to-date +1.00%" in msg[0] and "DD 0.0%" in msg[0]
     log = pd.read_csv(tmp_path / "journal" / "equity_log.csv")
     assert list(log.market_date) == ["2021-03-02"] and log.close_equity.iloc[0] == 10_100
+
+
+def test_equity_log_of_an_older_version_keeps_its_columns(tmp_path):
+    old = "market_date,time_utc,close_equity,peak_equity,drawdown,month_return,cash_flow_total,opens,closes," \
+          "halted,entries_blocked\n2021-03-01,2021-03-01 21:00:05,10000,10000,0,0,0,0,0,False,\n"
+    (tmp_path / "equity_log.csv").write_text(old, encoding="utf-8")
+    j = TradeJournal(tmp_path)
+    assert j.equity({"market_date": "2021-03-02", "close_equity": 10_100, "balance": 10_050})
+    log = pd.read_csv(tmp_path / "equity_log.csv")  # still one consistent table
+    assert list(log.market_date) == ["2021-03-01", "2021-03-02"] and "balance" not in log
+    j2 = TradeJournal(tmp_path / "new")
+    j2.equity({"market_date": "2021-03-02", "close_equity": 10_100, "balance": 10_050})
+    assert pd.read_csv(tmp_path / "new" / "equity_log.csv").balance.tolist() == [10_050]
 
 
 def test_trade_journal_open_and_close_with_r(tmp_path):

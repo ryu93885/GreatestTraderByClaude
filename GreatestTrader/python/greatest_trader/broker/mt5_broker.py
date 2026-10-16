@@ -12,6 +12,7 @@ Fail-closed rules for unattended operation:
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from dataclasses import fields
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,7 @@ try:  # pragma: no cover - only available on Windows with MT5 installed
 except ImportError:  # pragma: no cover
     mt5 = None
 
+RES_S_OK = 1  # last_error() code of "Success"
 RETCODE_OK = {10008, 10009, 10010}  # PLACED, DONE, DONE_PARTIAL
 RETCODE_INVALID_FILL = 10030  # unsupported filling mode -> try the next one
 RETCODE_RETRY = {10004, 10020, 10021}  # requote / price changed / no prices: proven NOT executed -> send again
@@ -48,12 +50,28 @@ def _ts(sec: int | float) -> datetime:
     return datetime.fromtimestamp(int(sec), tz=timezone.utc).replace(tzinfo=None)
 
 
+class MissingPackageError(RuntimeError):
+    """The MetaTrader5 package is not importable: a restart cannot fix it (exit code 10)."""
+
+
+def _history(deals):
+    """history_deals_get result: None with last_error 'Success' is an EMPTY history (no deal in the window, e.g.
+    a month without trades), any other None is an error (raised: never read as 'no deals')."""
+    if deals is None:
+        err = mt5.last_error()
+        if err and int(err[0]) == RES_S_OK:
+            return ()
+        raise RuntimeError(f"history_deals_get failed: {err}")
+    return deals
+
+
 class MT5Broker(Broker):
     def __init__(self, cfg: Config):
         if mt5 is None:
-            raise RuntimeError(
-                "MetaTrader5 package is not installed. Run `pip install MetaTrader5` on Windows "
-                "with the MT5 terminal installed.")
+            raise MissingPackageError(
+                f"the MetaTrader5 package is not installed in this Python ({sys.executable}). Run "
+                f"setup_windows.bat once (it creates the .venv folder with the tested packages; the package exists "
+                f"for 64-bit Windows only) and start GreatestTrader with the .bat files, which use .venv")
         self.cfg = cfg
         self._specs: dict[str, SymbolSpec] = {}
         self._spec_t: dict[str, float] = {}
@@ -186,10 +204,8 @@ class MT5Broker(Broker):
         if money == self._money and now - self._cash_t < CASH_RESCAN and now >= self._cash_burst_until:
             return list(self._cash)
         end = datetime.now() + timedelta(days=2)  # generous window: history times are server-time based
-        deals = mt5.history_deals_get(end - timedelta(days=CASH_WINDOW_DAYS + 2), end)
-        if deals is None:
-            raise RuntimeError(f"history_deals_get failed: {mt5.last_error()}")
-        self._cash = [CashFlow(int(d.ticket), _ts(d.time), float(d.profit), int(d.type), str(getattr(d, "comment", "")))
+        deals = _history(mt5.history_deals_get(end - timedelta(days=CASH_WINDOW_DAYS + 2), end))
+        self._cash =[CashFlow(int(d.ticket), _ts(d.time), float(d.profit), int(d.type), str(getattr(d, "comment", "")))
                       for d in deals if int(d.type) in CASH_DEAL_TYPES]
         self._money, self._cash_t = money, now
         return list(self._cash)
@@ -209,10 +225,8 @@ class MT5Broker(Broker):
 
     def history_deals(self, start: datetime, end: datetime) -> pd.DataFrame:
         """Every deal between start and end (report command)."""
-        deals = mt5.history_deals_get(start, end)
-        if deals is None:
-            raise RuntimeError(f"history_deals_get failed: {mt5.last_error()}")
-        cols = ["ticket", "time", "type", "entry", "magic", "position_id", "symbol", "volume", "price", "profit",
+        deals = _history(mt5.history_deals_get(start, end))
+        cols =["ticket", "time", "type", "entry", "magic", "position_id", "symbol", "volume", "price", "profit",
                 "commission", "swap", "fee", "reason", "comment"]
         df = pd.DataFrame([{c: getattr(d, c, 0) for c in cols} for d in deals], columns=cols)
         df["time"] = pd.to_datetime(df["time"], unit="s")

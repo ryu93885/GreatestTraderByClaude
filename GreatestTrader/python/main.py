@@ -1,14 +1,21 @@
 """GreatestTrader command line.
 
+commands:
   python main.py check     -c config/config.yaml   # connect to MT5, show account/symbols/spreads (no trading)
   python main.py live      -c config/config.yaml   # run the trading engine (dry_run setting in config!)
   python main.py download  -c config/config.yaml --years 5   # fetch M15 history from MT5 into backtest.data_dir
   python main.py backtest  -c config/config.yaml   # Python backtest on CSV data in backtest.data_dir
-  python main.py report    -c config/config.yaml   # live monthly returns / P/L / R monitor from MT5 history
-  python main.py reset-halt [--rebase-peak]        # clear a drawdown halt (stop the engine first)
+  python main.py report    -c config/config.yaml [--from 2026-01]   # live monthly returns / P/L / R monitor
+  python main.py reset-halt [--rebase-peak]        # clear a drawdown halt (stop the engine first; the engine
+                                                   # applies it at its next start, after the cash-flow check)
   python main.py backtest --preset safe2           # any command: use a bundled risk preset instead of `preset:`
 
-Exit codes of `live`: 0 normal, 3 = restart me (persistent failure), 10 = stopped / do not restart.
+exit codes:
+  0   done (every command except `live`)
+  1   failed; `live`: an unexpected error at start-up (3_run_live.bat restarts after 30 s)
+  3   `live`: MT5 failing for 30 minutes (3_run_live.bat restarts the process)
+  10  stopped on purpose or by a problem a restart cannot fix: Ctrl+C, another instance running, netting
+      account, an error in config.yaml, the MetaTrader5 package missing (3_run_live.bat does NOT restart)
 """
 from __future__ import annotations
 
@@ -26,6 +33,21 @@ from greatest_trader.config import load_config  # noqa: E402
 from greatest_trader.ops import EXIT_STOP, format_versions, setup_logging, versions  # noqa: E402
 
 log = logging.getLogger("main")
+
+
+def utf8_stdio() -> None:
+    """Japanese report text must never crash a run whose output is redirected (file, Task Scheduler, IDE) on a
+    Windows code page that cannot encode it (cp1252 ...): such streams are switched to UTF-8, and characters
+    that still cannot be written are replaced."""
+    for s in (sys.stdout, sys.stderr):
+        try:
+            enc = (getattr(s, "encoding", None) or "").lower().replace("-", "")
+            if enc == "utf8":
+                s.reconfigure(errors="replace")
+            else:
+                s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):  # not a text stream that can be reconfigured
+            pass
 
 
 def dry_run_paths(cfg) -> None:
@@ -101,8 +123,13 @@ def cmd_live(cfg) -> int:
 def cmd_download(cfg, years: float) -> int:
     from greatest_trader.data import download_history
 
-    download_history(cfg, years, cfg.backtest.data_dir)
-    return 0
+    written, failed = download_history(cfg, years, cfg.backtest.data_dir)
+    print(f"downloaded {len(written)} pairs into {cfg.backtest.data_dir}")
+    if failed:
+        print(f"NOT downloaded ({len(failed)}):")
+        for s, why in failed.items():
+            print(f"  {s}: {why}")
+    return 0 if written else 1
 
 
 def cmd_backtest(cfg, out: str | None) -> int:
@@ -137,9 +164,8 @@ def cmd_backtest(cfg, out: str | None) -> int:
     return 0
 
 
-def cmd_report(cfg, since: str | None, out: str | None, broker=None) -> int:
-    import pandas as pd
-
+def cmd_report(cfg, since, out: str | None, broker=None) -> int:
+    """since: first month (pandas Period 'M', parsed by main) or None."""
     from greatest_trader.journal import TradeJournal
     from greatest_trader.live_report import add_rolling, edge_monitor_table, monthly_returns_from_deals, \
         pnl_by_magic, write_report
@@ -155,9 +181,11 @@ def cmd_report(cfg, since: str | None, out: str | None, broker=None) -> int:
         broker.shutdown()
     magics = {cfg.night_reversion.magic: "NR", cfg.euro_session.magic: "ES"}
     monthly = add_rolling(monthly_returns_from_deals(deals, magics))
-    if since:
-        monthly = monthly[monthly.index >= since]
-        deals = deals[deals.time >= pd.Timestamp(since)]
+    if since is not None:  # the monthly table and P/L by strategy both start at the first day of that month
+        if len(monthly):
+            monthly = monthly[monthly.index.astype(str) >= str(since)]  # both "YYYY-MM"
+        if len(deals):
+            deals = deals[deals.time >= since.start_time]
     edge = edge_monitor_table(TradeJournal(cfg.engine.journal_dir).closed_trades(), cfg.monitor.edge_window_trades)
     out_dir = Path(out) if out else Path(cfg.backtest.output_dir) / "live_report"
     text = write_report(out_dir, monthly, pnl_by_magic(deals, magics), edge,
@@ -167,10 +195,14 @@ def cmd_report(cfg, since: str | None, out: str | None, broker=None) -> int:
     return 0
 
 
-def cmd_reset_halt(cfg, rebase_peak: bool, equity: float | None = None) -> int:
+def cmd_reset_halt(cfg, rebase_peak: bool) -> int:
+    """Store a reset request in the state. The engine applies it at its next start, right AFTER its first
+    cash-flow check: a deposit / withdrawal made while it was stopped is applied to the old peak first, and the
+    peak is rebased to an equity that already contains it (otherwise the deposit would be multiplied onto the new
+    peak and the halt would fire again at once)."""
     from greatest_trader.journal import TradeJournal
     from greatest_trader.ops import acquire_single_instance_lock
-    from greatest_trader.risk import RiskManager, RiskState
+    from greatest_trader.risk import RiskState
 
     try:
         lock = acquire_single_instance_lock(cfg.engine.state_file)
@@ -180,10 +212,11 @@ def cmd_reset_halt(cfg, rebase_peak: bool, equity: float | None = None) -> int:
     try:
         path = Path(cfg.engine.state_file)
         st = RiskState.load(path)
-        if rebase_peak and equity is None:
-            equity = _current_equity(cfg, st)
-        msg = RiskManager(cfg.risk, st).reset_halt(equity if rebase_peak else None)
+        st.reset_request = "rebase" if rebase_peak else "clear"
         st.save(path)
+        what = "clear the halt" + (" and rebase the peak equity to the account equity" if rebase_peak else "")
+        msg = (f"reset requested ({what}; halt now: {st.halt_reason if st.halted else 'not halted'}). The engine "
+               f"applies it at its next start, after it has checked the deposits/withdrawals")
         now = datetime.now(timezone.utc)
         TradeJournal(cfg.engine.journal_dir).trade({"event": "reset_halt", "time_utc": f"{now:%Y-%m-%d %H:%M:%S}",
                                                      "reason": msg})
@@ -194,23 +227,35 @@ def cmd_reset_halt(cfg, rebase_peak: bool, equity: float | None = None) -> int:
     return 0
 
 
-def _current_equity(cfg, st) -> float:
-    """Account equity from MT5 when it is reachable, else the last equity the engine saw."""
+def _load(args):
+    """Config with paths relative to this folder (python/). Raises ConfigError for anything wrong in it."""
+    import yaml
+
+    from greatest_trader.config import ConfigError
+
     try:
-        from greatest_trader.broker.mt5_broker import MT5Broker
-        b = MT5Broker(cfg)
-        b.connect()
-        try:
-            return b.account_equity()
-        finally:
-            b.shutdown()
-    except Exception as exc:  # noqa: BLE001
-        print(f"(MT5 not reachable: {exc}; using the last equity seen by the engine: {st.last_equity:,.2f})")
-        return st.last_equity
+        cfg = load_config(args.config, preset=args.preset)
+    except ConfigError:
+        raise
+    except FileNotFoundError as exc:
+        raise ConfigError(f"config file not found: {exc.filename or args.config}") from None
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{args.config} is not valid YAML (indent with spaces, not tabs): {exc}") from None
+    except (KeyError, ValueError, TypeError, AttributeError, OSError) as exc:
+        text = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
+        raise ConfigError(f"{args.config}: {text}") from None
+    for obj, attr in ((cfg.engine, "state_file"), (cfg.engine, "log_dir"), (cfg.engine, "journal_dir"),
+                      (cfg.backtest, "data_dir"), (cfg.backtest, "output_dir")):
+        p = Path(getattr(obj, attr))
+        if not p.is_absolute():
+            setattr(obj, attr, str(HERE / p))
+    return cfg
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=f"GreatestTrader {__version__}")
+    utf8_stdio()
+    ap = argparse.ArgumentParser(description=f"GreatestTrader {__version__}", epilog=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["check", "live", "download", "backtest", "report", "reset-halt"])
     ap.add_argument("-c", "--config", default=str(HERE / "config" / "config.yaml"))
     ap.add_argument("--years", type=float, default=5.0, help="download: years of M15 history")
@@ -224,16 +269,28 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--preset", default=None,
                     help="apply a bundled preset (overrides `preset:` in the config file), e.g. stable5 / safe2")
     args = ap.parse_args(argv)
-
-    cfg = load_config(args.config, preset=args.preset)
-    # relative paths in the config are relative to this folder (python/)
-    for obj, attr in ((cfg.engine, "state_file"), (cfg.engine, "log_dir"), (cfg.engine, "journal_dir"),
-                      (cfg.backtest, "data_dir"), (cfg.backtest, "output_dir")):
-        p = Path(getattr(obj, attr))
-        if not p.is_absolute():
-            setattr(obj, attr, str(HERE / p))
     if args.live_orders and args.dry_run:
         ap.error("--live-orders and --dry-run are mutually exclusive")
+    since = None
+    if args.since:  # YYYY-MM (a day YYYY-MM-DD means its month); parsed once, used for every table of the report
+        import re
+
+        import pandas as pd
+        try:
+            if not re.fullmatch(r"\d{4}-\d{1,2}(-\d{1,2})?", str(args.since).strip()):
+                raise ValueError
+            since = pd.Period(str(args.since).strip(), "M")
+        except (ValueError, TypeError):
+            ap.error(f"--from must be a month such as 2026-01 (got {args.since!r})")
+
+    from greatest_trader.broker.mt5_broker import MissingPackageError
+    from greatest_trader.config import ConfigError
+
+    try:
+        cfg = _load(args)  # relative paths in the config are relative to this folder (python/)
+    except ConfigError as exc:  # a restart cannot fix it: exit 10 stops 3_run_live.bat
+        print(f"\nCONFIG ERROR: {exc}\nFix config.yaml, then start again (exit code {EXIT_STOP}: not restarted).")
+        return EXIT_STOP
     if args.live_orders:
         cfg.engine.dry_run = False
     if args.dry_run:
@@ -262,10 +319,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "download":
             return cmd_download(cfg, args.years)
         if args.command == "report":
-            return cmd_report(cfg, args.since, args.out)
+            return cmd_report(cfg, since, args.out)
         if args.command == "reset-halt":
             return cmd_reset_halt(cfg, args.rebase_peak)
         return cmd_backtest(cfg, args.out)
+    except MissingPackageError as exc:  # a restart cannot fix it: exit 10 stops 3_run_live.bat
+        log.error("%s", exc)
+        print(f"\nERROR: {exc}\n(exit code {EXIT_STOP}: not restarted)")
+        return EXIT_STOP
     finally:
         fh.flush()
 

@@ -8,6 +8,11 @@ from typing import Any
 
 import yaml
 
+
+class ConfigError(ValueError):
+    """Something in config.yaml (or the chosen preset) is wrong: fix the file, a restart cannot help."""
+
+
 DEFAULT_NR_SYMBOLS = [
     "EURJPY", "GBPJPY", "USDJPY", "GBPUSD", "EURGBP", "USDCHF", "EURUSD",
     "GBPCAD", "EURCAD", "AUDCAD", "GBPCHF", "EURAUD", "CHFJPY", "GBPAUD",
@@ -327,5 +332,11 @@ def load_config(path: str | Path | None, preset: str | None = None) -> Config:
     _merge(cfg, data, "")
     cfg.preset = name or ""
     cfg._risk_overrides = sorted((data.get("risk") or {}).keys())
+    ignored = [k for k in ("risk_nr", "risk_es") if k in cfg._risk_overrides]
+    if ignored and cfg.risk.profile != "custom":
+        raise ConfigError(f"risk.{' / risk.'.join(ignored)} only apply with risk.profile: custom, but the profile is "
+                          f"'{cfg.risk.profile}'" + (f" (preset {name})" if name else "") + ": they would be ignored. "
+                          "Use risk.profile: conservative / standard / aggressive, or set risk.profile: custom "
+                          "together with both risk_nr and risk_es")
     cfg.validate()
     return cfg

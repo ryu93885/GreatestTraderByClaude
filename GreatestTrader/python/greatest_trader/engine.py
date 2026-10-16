@@ -89,6 +89,7 @@ class LiveEngine:
         self._clock_cand: float | None = None
         self._clock_n = 0
         self._account_problem = ""
+        self._balance: float | None = None  # account balance at the last cash-flow check (equity log)
         self._lot_cap_day: dict[str, str] = {}
         self._closing: dict[int, str] = {}  # ticket -> reason of a close sent by the engine (journal)
         self._gap_logged: dict[str, datetime] = {}
@@ -171,7 +172,9 @@ class LiveEngine:
         if self.state.restored_from:
             self._alert(f"state file was unreadable or missing -> restored from: {self.state.restored_from}",
                         level=logging.ERROR)
-        if self.state.halted:
+        if self.state.reset_request:
+            log.warning("reset-halt requested (%s): applied after the first cash-flow check", self.state.reset_request)
+        elif self.state.halted:
             self._alert(f"HALTED: {self.state.halt_reason} (no new entries; `python main.py reset-halt` to resume)",
                         level=logging.ERROR)
         self._started = True
@@ -253,6 +256,7 @@ class LiveEngine:
         now_utc = self.clock.server_to_utc(now_server)
         now_mkt = self.clock.server_to_market(now_server)
         equity = self._scan_cash_flows(self.broker.account_equity())  # BEFORE the guards: a withdrawal is no loss
+        self._apply_reset_request(equity)
         st = self.state
         before = (st.day, st.month, st.last_equity, st.peak_equity, st.month_start_equity, st.day_opens,
                   st.day_closes)
@@ -463,6 +467,18 @@ class LiveEngine:
             self._alert(f"{msg} [deal {f.ticket}{' ' + f.comment if f.comment else ''}]")
         return equity
 
+    def _apply_reset_request(self, equity: float) -> None:
+        """`reset-halt` request stored in the state: applied after the cash-flow check of this start, so that a
+        deposit made while the engine was stopped has already been applied to the old peak."""
+        st = self.state
+        if not st.reset_request:
+            return
+        msg = self.risk.reset_halt(equity if st.reset_request == "rebase" else None)
+        st.reset_request = ""
+        self._alert(f"RESET HALT (python main.py reset-halt, applied after the cash-flow check): {msg}")
+        self.journal.trade({"event": "reset_halt", "time_utc": f"{self._utcnow():%Y-%m-%d %H:%M:%S}",
+                            "reason": f"applied by the engine: {msg}"})
+
     # ------------------------------------------------------------------ monitoring
     def _new_day(self, before: tuple, utc: datetime) -> None:
         """Equity log row and daily summary for the market day that just ended."""
@@ -474,7 +490,8 @@ class LiveEngine:
         self.journal.equity({"market_date": prev_day, "time_utc": f"{utc:%Y-%m-%d %H:%M:%S}", "close_equity": close,
                              "peak_equity": peak, "drawdown": dd, "month_return": mret,
                              "cash_flow_total": st.cash_flow_total, "opens": opens, "closes": closes,
-                             "halted": st.halted, "entries_blocked": block})
+                             "halted": st.halted, "entries_blocked": block,
+                             "balance": self._balance if self._balance is not None else ""})
         if self.cfg.monitor.daily_summary:
             parts = [f"DAILY {prev_day}: equity {close:,.2f} {self.broker.account_currency()}", f"DD {dd:.1%}",
                      f"month-to-date {mret:+.2%} (flow-adjusted)", f"trades opened {opens} / closed {closes}"]
