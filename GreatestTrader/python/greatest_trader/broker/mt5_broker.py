@@ -21,7 +21,8 @@ import pandas as pd
 
 from ..config import Config
 from ..strategies.base import PositionView, pip_size
-from .base import CASH_DEAL_TYPES, Broker, CashFlow, ClosedTrade, OrderResult, SymbolSpec, Tick
+from .base import (CASH_DEAL_TYPES, DEAL_TYPE_CREDIT, Broker, CashFlow, CashScan, ClosedTrade, HistoryCheck,
+                   OrderResult, SymbolSpec, Tick)
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ class MT5Broker(Broker):
         self._tick_t: dict[str, datetime] = {}  # latest tick time per symbol (server time)
         self._money: tuple[float, float] | None = None
         self._cash: list[CashFlow] = []
+        self._newest: int | None = None  # newest deal ticket of any type seen in the history
         self._cash_t = self._cash_burst_until = -1e18
         self._reconnect_delay = RECONNECT_FIRST_DELAY
         self._next_reconnect = 0.0
@@ -192,23 +194,58 @@ class MT5Broker(Broker):
         m = mt5.order_calc_margin(otype, self._name(base), float(volume), float(price))
         return float(m) if m is not None else float("inf")
 
-    def cash_flows(self) -> list[CashFlow]:
+    def cash_flows(self, force: bool = False) -> list[CashFlow]:
         """BALANCE / CREDIT / BONUS deals of the last 30 days. The history is re-read when balance or credit
         changed (and on every call during the following minute, in case the deal reaches the history a moment
-        after the balance), otherwise every 10 minutes."""
+        after the balance), when `force` is set, otherwise every 10 minutes. The newest deal ticket of ANY type
+        in the window is kept for the engine's cash-flow lag guard."""
         info = self._account()
         money = (round(float(info.balance), 2), round(float(getattr(info, "credit", 0.0)), 2))
         now = time.monotonic()
         if money != self._money and self._money is not None:
             self._cash_burst_until = now + CASH_BURST
-        if money == self._money and now - self._cash_t < CASH_RESCAN and now >= self._cash_burst_until:
+        if not force and money == self._money and now - self._cash_t < CASH_RESCAN and now >= self._cash_burst_until:
             return list(self._cash)
         end = datetime.now() + timedelta(days=2)  # generous window: history times are server-time based
         deals = _history(mt5.history_deals_get(end - timedelta(days=CASH_WINDOW_DAYS + 2), end))
-        self._cash =[CashFlow(int(d.ticket), _ts(d.time), float(d.profit), int(d.type), str(getattr(d, "comment", "")))
+        self._cash = [CashFlow(int(d.ticket), _ts(d.time), float(d.profit), int(d.type), str(getattr(d, "comment", "")))
                       for d in deals if int(d.type) in CASH_DEAL_TYPES]
+        newest = max((int(d.ticket) for d in deals), default=None)
+        if newest is not None and (self._newest is None or newest > self._newest):
+            self._newest = newest
         self._money, self._cash_t = money, now
         return list(self._cash)
+
+    def cash_scan(self, fresh: bool = False) -> CashScan:
+        """The deal scan first, then ONE account read (equity, balance, credit together): k = E / (E - F) uses an
+        equity that contains every flow the scan found, and a deal booked between the history read and the account
+        read shows as money != scan_money (the engine then decides on the next loop)."""
+        flows = self.cash_flows(force=fresh)
+        scan_money = round(sum(self._money), 2) if self._money is not None else None
+        info = self._account()
+        balance = float(info.balance)
+        money = round(balance + float(getattr(info, "credit", 0.0)), 2)
+        return CashScan(flows, float(info.equity), self._newest, money, scan_money, balance)
+
+    def history_check(self) -> HistoryCheck:
+        """The whole deal history (first run): complete when the deals add up to the balance - every deal type but
+        CREDIT: profit + commission + swap + fee - and the CREDIT deals to the credit, within max(1, 0.1%)."""
+        deals = _history(mt5.history_deals_get(datetime(2000, 1, 1), datetime.now() + timedelta(days=2)))
+        info = self._account()
+        sum_bal = sum_cred = 0.0
+        for d in deals:
+            amount = float(d.profit) + float(getattr(d, "commission", 0.0)) + float(getattr(d, "swap", 0.0)) \
+                + float(getattr(d, "fee", 0.0))
+            if int(d.type) == DEAL_TYPE_CREDIT:
+                sum_cred += amount
+            else:
+                sum_bal += amount
+        bal, cred = float(info.balance), float(getattr(info, "credit", 0.0))
+        ok = abs(sum_bal - bal) <= max(1.0, 0.001 * abs(bal)) and abs(sum_cred - cred) <= max(1.0, 0.001 * abs(cred))
+        flows = [CashFlow(int(d.ticket), _ts(d.time), float(d.profit), int(d.type), str(getattr(d, "comment", "")))
+                 for d in deals if int(d.type) in CASH_DEAL_TYPES]
+        return HistoryCheck(flows, ok, f"{len(deals)} deals sum to {sum_bal:,.2f} (balance {bal:,.2f}), credit deals "
+                                       f"to {sum_cred:,.2f} (credit {cred:,.2f})")
 
     def closed_trade(self, ticket: int) -> ClosedTrade | None:
         deals = mt5.history_deals_get(position=int(ticket))

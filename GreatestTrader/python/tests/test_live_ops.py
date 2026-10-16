@@ -105,15 +105,20 @@ def test_cash_flow_first_run_dedup_and_restart(tmp_path):
     assert not sent(eng2, "CASH FLOW")
 
 
-def test_flow_booked_between_the_equity_read_and_the_scan(tmp_path):
+def test_equity_is_read_after_the_deal_scan(tmp_path):
+    """k = E / (E - F) and the guards of the loop use ONE equity read taken after the deal scan (EA finding ea#1:
+    an equity read before the scan does not contain a flow booked in between)."""
     eng, br = make(cfg_for(tmp_path, preset="stable5"), eurjpy())
     br.set_time(datetime(2021, 3, 2, 22, 0, 5))
     eng.step()
+    calls = []
+    flows, equity = br.cash_flows, br.account_equity
+    br.cash_flows = lambda: (calls.append("deals"), flows())[1]
+    br.account_equity = lambda: (calls.append("equity"), equity())[1]
     br.add_cash(-400)
-    reads = iter([10_000.0, 9_600.0])  # the first read of the loop still saw the old equity
-    br.account_equity = lambda: next(reads, 9_600.0)
     br.set_time(datetime(2021, 3, 2, 22, 0, 10))
     eng.step()
+    assert calls[:2] == ["deals", "equity"] and calls.count("equity") == 1
     assert eng.state.peak_equity == pytest.approx(9_600) and eng.state.last_equity == 9_600
     assert not sent(eng, "MONTH STOP")
 
@@ -304,8 +309,16 @@ def test_auto_clock_change_is_adopted_or_blocked_after_three_observations(tmp_pa
 
 def test_explicit_clock_allows_entries_from_the_start(tmp_path):
     cfg = cfg_for(tmp_path, mode="ny7")
-    eng, _ = make(cfg, eurjpy())
-    assert eng.clock_verified and eng.entry_block() == ""
+    eng, br = make(cfg, eurjpy(), utcnow=lambda: datetime(2021, 3, 2, 12, 0))  # no tick advances: no observation
+    assert eng.clock_verified and eng.clock_problem == ""
+    br.set_time(datetime(2021, 3, 2, 10, 0, 5))
+    eng.step()
+    assert eng.entry_block() == ""
+    cfg2 = cfg_for(tmp_path / "auto", mode="auto")
+    eng2, br2 = make(cfg2, eurjpy(), utcnow=lambda: datetime(2021, 3, 2, 12, 0))
+    br2.set_time(datetime(2021, 3, 2, 10, 0, 5))
+    eng2.step()
+    assert eng2.entry_block().startswith("server clock not verified yet")
 
 
 def test_stale_feed_watchdog_only_on_market_days(tmp_path):
