@@ -131,12 +131,19 @@ def test_reconnect_after_terminal_restart_with_backoff(b, clock):
     assert b._specs == {} and b._tick_t == {}  # caches dropped on reconnect
     S.terminal_alive = False
     fake_mt5.terminal_restart()
-    assert "reconnect failed" in b.health() and S.init_count == 3
-    assert "reconnecting" in b.health() and S.init_count == 3  # back-off: no new attempt yet
+    with pytest.raises(RuntimeError, match="reconnect failed"):  # a failure: counts toward the exit-3 restart
+        b.health()
+    assert S.init_count == 3
+    with pytest.raises(RuntimeError, match="reconnecting"):
+        b.health()
+    assert S.init_count == 3  # back-off: no new attempt yet
     clock.t += 6
-    assert "reconnect failed" in b.health() and S.init_count == 4  # next attempt after 5 s, then 10 s
+    with pytest.raises(RuntimeError, match="reconnect failed"):
+        b.health()
+    assert S.init_count == 4  # next attempt after 5 s, then 10 s
     clock.t += 6
-    b.health()
+    with pytest.raises(RuntimeError):
+        b.health()
     assert S.init_count == 4
     S.terminal_alive = True
     clock.t += 10
@@ -232,6 +239,27 @@ def test_engine_recovers_from_terminal_restart(cfg, clock, monkeypatch):
     monkeypatch.setattr("greatest_trader.engine.time.sleep", fake_sleep)
     assert eng.run_forever() == 10  # Ctrl+C = clean stop
     assert S.init_count == 2 and ok[0] >= 39  # re-initialised once, every loop worked
+
+
+def test_engine_exits_for_restart_when_the_terminal_stays_down(cfg, monkeypatch):
+    br = MT5Broker(cfg)
+    eng = LiveEngine(cfg, br, Notifier(cfg.notify), utcnow=lambda: NY7.server_to_utc(mt5_broker._ts(S.now)))
+    t, loops = [0.0], [0]
+    monkeypatch.setattr("greatest_trader.engine.time.monotonic", lambda: t[0])
+
+    def fake_sleep(s):
+        t[0] += 5
+        loops[0] += 1
+        S.now += 5
+        S.ticks["EURJPY"]["time"] = S.now
+        if loops[0] == 3:  # the terminal is closed and does not come back
+            S.terminal_alive = False
+            fake_mt5.terminal_restart()
+
+    monkeypatch.setattr("greatest_trader.engine.time.sleep", fake_sleep)
+    assert eng.run_forever() == EXIT_RESTART
+    assert 1800 <= t[0] <= 1900 and any("CRITICAL" in m for m in eng.notifier.recent)
+    assert 5 <= S.init_count < 120  # re-initialised with back-off, not on every 5-second loop
 
 
 def test_engine_exits_for_restart_after_30_minutes_of_failure(cfg, monkeypatch):

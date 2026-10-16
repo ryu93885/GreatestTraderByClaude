@@ -198,10 +198,12 @@ class LiveEngine:
                 except Exception as exc:  # noqa: BLE001 - keep running, but tell the operator
                     fails += 1
                     first_fail = first_fail or t0
-                    if fails <= 3 or fails % 120 == 0:
+                    if fails <= 3 or fails % 120 == 0:  # full traceback now and then, one line a minute
                         log.exception("loop failed (%d in a row): %s", fails, exc)
-                    else:
+                    elif fails % 12 == 0:
                         log.error("loop failed (%d in a row): %s", fails, exc)
+                    else:
+                        log.debug("loop failed (%d in a row): %s", fails, exc)
                     self._alert(f"ERROR: {exc}", key="loop-error", every=1800, level=logging.ERROR)
                     if not self._started:
                         next_start = time.monotonic() + min(60.0, 5.0 * 2 ** min(fails - 1, 4))
@@ -295,10 +297,12 @@ class LiveEngine:
             fn(*args)
         except Exception as exc:  # noqa: BLE001
             n = self._sym_fail[name] = self._sym_fail.get(name, 0) + 1
-            if n <= 3 or n % 720 == 0:
+            if n <= 3 or n % 720 == 0:  # full traceback now and then, one line a minute
                 log.exception("%s failed (%d in a row): %s", name, n, exc)
-            else:
+            elif n % 12 == 0:
                 log.error("%s failed (%d in a row): %s", name, n, exc)
+            else:
+                log.debug("%s failed (%d in a row): %s", name, n, exc)
             if n == 60:
                 self._alert(f"{name} failing for {n} loops: {exc} (the other symbols keep trading)",
                             key=f"symfail-{name}", every=6 * 3600)

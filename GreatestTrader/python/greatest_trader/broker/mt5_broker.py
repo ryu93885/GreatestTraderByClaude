@@ -104,24 +104,26 @@ class MT5Broker(Broker):
         self.connect()  # raises while the terminal is not back yet
 
     def health(self) -> str:
-        """'' when trading decisions are safe; otherwise why not. A lost IPC link (terminal restarted by an
-        update, crashed, closed) never comes back by itself: re-initialise it, with back-off up to 60 s."""
+        """'' when trading decisions are safe, otherwise why not (the terminal is up but not connected to the
+        trade server, or Algo Trading is off). A lost IPC link (terminal restarted by an update, crashed,
+        closed) never comes back by itself: it is re-initialised with back-off up to 60 s, and RuntimeError is
+        raised while the terminal stays unreachable (the engine counts it as a failure: exit 3 after 30 min)."""
         ti = mt5.terminal_info()
         if ti is None:
             now = time.monotonic()
             if now < self._next_reconnect:
-                return f"MT5 terminal unreachable ({mt5.last_error()}), reconnecting"
+                raise RuntimeError(f"MT5 terminal unreachable ({mt5.last_error()}), reconnecting")
             log.warning("MT5 IPC link lost (%s): re-initialising", mt5.last_error())
             try:
                 self.reconnect()
             except Exception as exc:  # noqa: BLE001
                 self._next_reconnect = now + self._reconnect_delay
                 self._reconnect_delay = min(RECONNECT_MAX_DELAY, self._reconnect_delay * 2)
-                return f"MT5 reconnect failed: {exc}"
+                raise RuntimeError(f"MT5 reconnect failed: {exc}") from None
             self._reconnect_delay, self._next_reconnect = RECONNECT_FIRST_DELAY, 0.0
             ti = mt5.terminal_info()
             if ti is None:
-                return f"MT5 terminal_info unavailable after reconnect ({mt5.last_error()})"
+                raise RuntimeError(f"MT5 terminal_info unavailable after reconnect ({mt5.last_error()})")
             log.warning("MT5 connection re-established")
         if not ti.connected:
             return "MT5 terminal is not connected to the trade server"
