@@ -110,10 +110,13 @@ input bool   InpResetHalt   = false; // Clear the max-DD halt once at start (pea
 
 //--- constants
 #define GT_FRESH_SEC        150     // act on a closed M15 bar only within this many seconds of its close (Python FRESH_SIGNAL)
-#define GT_CLOCK_TOL_SEC    120     // a tick is fresh when server - UTC is within this of a half-hour step
-#define GT_CLOCK_ADV_SEC    120     // ... and the server time advanced within this many seconds
+#define GT_CLOCK_TOL_SEC    120     // a valid observation: server - UTC within this of a whole half-hour offset
+#define GT_CLOCK_ADV_SEC    30      // clock observations only while the server time advanced within this many seconds
 #define GT_CLOCK_OBS_SEC    60      // spacing of counted clock observations
-#define GT_CLOCK_CONFIRM    3       // identical observations to adopt / mismatches to block
+#define GT_CLOCK_CONFIRM    3       // identical observations to adopt / mismatches to block / off-grid PC clock to alert
+#define GT_FLOW_PENDING_SEC 60      // a balance change without a new deal in the history waits at most this long
+#define GT_PRIME_STABLE_SEC 60      // first run: the cash-flow deals of the history unchanged this long = complete
+#define GT_PRIME_MAX_SEC    600     // first run: start the cash-flow tracking after this long anyway (warning)
 #define GT_LOCK_STALE_SEC   60      // instance lock: heartbeat older than this = holder gone
 #define GT_LOCK_BEAT_SEC    10      // instance lock: heartbeat interval
 #define GT_REPEAT_SEC       21600   // repeat a standing alert at most every 6 hours
@@ -160,6 +163,7 @@ datetime g_gvRefreshAt = 0;
 string   g_gvName[];             // cache of the values last written, to write only on change
 double   g_gvVal[];
 bool     g_resetHaltDone = false; // InpResetHalt already applied (persisted; re-armed when InpResetHalt=false)
+bool     g_resetDue = false;     // InpResetHalt is evaluated after the first cash-flow scan of the session
 
 //--- cash flows (deposits / withdrawals / credit / bonus)
 ulong    g_flowTicket = 0;       // newest cash-flow deal ticket already applied (persisted "flowtk")
@@ -167,6 +171,15 @@ datetime g_flowScan = 0;         // server time of the last history scan (persis
 ulong    g_allTicket = 0;        // newest deal ticket of any type seen (in memory)
 double   g_lastBalCred = 0.0;    // balance + credit at the last explained change (0 = scan at the next cycle)
 datetime g_pendingSince = 0;     // balance changed but no new deal in the history yet
+bool     g_flowPending = false;  // this cycle: balance change not explained yet (no guard decision, no entry)
+bool     g_flowPrimed = true;    // false on a first run until the existing deals are marked as seen
+datetime g_primeStart = 0;       // first run: local time of the first priming attempt
+datetime g_primeRefAt = 0;       // first run: since when the cash-flow deals below are unchanged
+int      g_primeRefN = 0;        // ... their number, ticket sum and ticket xor (a fingerprint of the set)
+ulong    g_primeRefSum = 0;
+ulong    g_primeRefXor = 0;
+datetime g_primeNote = 0;        // ... last 'history cannot be read' alert
+datetime g_primeTry = 0;         // ... last priming attempt (the whole history is read at most every 5 s)
 
 //--- broker clock
 ENUM_GT_SERVER_TIME g_clockMode = GT_SERVER_NY7; // effective mode (AUTO -> NY7 in the tester)
@@ -180,6 +193,10 @@ int      g_clkCandN = 0;         // AUTO: consecutive identical observations of 
 datetime g_clkLastObs = 0;       // local time of the last counted observation
 datetime g_lastSrvSeen = 0;      // newest TimeCurrent() seen
 datetime g_srvAdvAt = 0;         // local time when TimeCurrent() last advanced
+datetime g_lastSrvSeenAt = 0;    // local time when g_lastSrvSeen was first seen (TrackServerTime)
+int      g_clkOffGridN = 0;      // consecutive fresh observations off the half-hour grid (PC clock off)
+long     g_clkOffGridSec = 0;    // ... seconds off the grid at the last one
+datetime g_clkDriftNote = 0;     // local time of the last PC clock alert
 
 //--- monitoring
 datetime g_ddAlertDay = 0;       // market day of the last drawdown alert (persisted "ddalert")
@@ -433,8 +450,12 @@ void SaveState(const bool force = false)
    GVPut("deqn", (double)n);
    for(int i = 0; i < n; i++)
       GVPut("deq" + IntegerToString(i), g_dailyEq[i]);
-   GVPut("flowtk", (double)g_flowTicket);   // deal tickets are far below 2^53: exact in a double
-   GVPut("flowtm", (double)g_flowScan);
+   if(g_flowPrimed)
+     {
+      // only a primed cursor is persisted: a restart before the first-run priming primes again
+      GVPut("flowtk", (double)g_flowTicket);   // deal tickets are far below 2^53: exact in a double
+      GVPut("flowtm", (double)g_flowScan);
+     }
    if(g_clkHave)
       GVPut("clkoff", (double)g_clkOffset);
    GVPut("ddalert", (double)g_ddAlertDay);
@@ -470,10 +491,20 @@ void ResetStateVars()
    g_allTicket = 0;
    g_lastBalCred = 0.0;
    g_pendingSince = 0;
+   g_flowPending = false;
+   g_flowPrimed = true;
+   g_primeStart = 0;
+   g_primeRefAt = 0;
+   g_primeRefN = 0;
+   g_primeRefSum = 0;
+   g_primeRefXor = 0;
+   g_primeNote = 0;
+   g_primeTry = 0;
    g_clkHave = false;
    g_clkOffset = 0;
    g_ddAlertDay = 0;
    g_resetHaltDone = false;
+   g_resetDue = false;
    g_sumPending = false;
   }
 
@@ -947,11 +978,8 @@ int CountCurrencyDir(const string ccy, const int sign)
 
 bool CanOpen(const string sym, const double eq, const int dir, const double newRisk, string &why)
   {
-   if(!ClockAllowsEntries())
-     {
-      why = ClockBlockReason();
+   if(!EntryGateOpen(why))
       return false;
-     }
    if(g_halted)
      {
       why = "halted (max drawdown)";
@@ -1678,8 +1706,9 @@ void ProcessES(const datetime nowSrv, const double eq)
       return;
    if(u.day_of_week < 1 || u.day_of_week > 5 || u.hour != InpESEntryUTC || u.min >= 15)
       return;
-   if(!ClockAllowsEntries())
-      return;   // decide only on a verified broker clock (the day stays open until the clock is verified)
+   string gate;
+   if(!EntryGateOpen(gate))
+      return;   // decide only on a verified broker clock and settled cash flows (the day stays open meanwhile)
    if(HasESPosition())
       return;
    MqlTick tick;
@@ -1742,26 +1771,96 @@ bool IsCashFlow(const long dealType)
    return (dealType == DEAL_TYPE_BALANCE || dealType == DEAL_TYPE_CREDIT || dealType == DEAL_TYPE_BONUS);
   }
 
-// first run (no persisted cursor): every deal already in the history counts as seen and is NOT applied
-void PrimeFlowCursor()
+// first run (no persisted cursor): every deal already in the history counts as seen and is NOT applied - but
+// only once the history looks complete: the deals sum to the balance (credit deals to the credit) within
+// max(1, 0.1%), or the set of cash-flow deals stayed the same for GT_PRIME_STABLE_SEC. After GT_PRIME_MAX_SEC
+// the cursor is primed anyway (warning). Until then new entries wait; closes, stops and the guards keep working.
+// Returns true when the cursor is primed. Live only (shared contract with the Python engine).
+bool TryPrimeFlowCursor()
   {
-   ulong mx = 0;
-   int n = 0;
-   if(HistorySelect(0, GT_FAR_FUTURE))
+   if(g_flowPrimed)
+      return true;
+   datetime now = TimeLocal();
+   if(g_primeStart == 0 || Secs(now, g_primeStart) < 0)
+      g_primeStart = now;
+   if(g_primeTry != 0 && Secs(now, g_primeTry) < 5 && Secs(now, g_primeTry) >= 0)
+      return false;
+   g_primeTry = now;
+   bool late = (Secs(now, g_primeStart) >= GT_PRIME_MAX_SEC);
+   if(!HistorySelect(0, GT_FAR_FUTURE))
      {
-      n = HistoryDealsTotal();
-      for(int i = 0; i < n; i++)
+      if(late && (g_primeNote == 0 || Secs(now, g_primeNote) >= GT_REPEAT_SEC || Secs(now, g_primeNote) < 0))
         {
-         ulong tk = HistoryDealGetTicket(i);
-         if(tk > mx)
-            mx = tk;
+         g_primeNote = now;
+         Log("the deal history cannot be read: cash-flow tracking not started, new entries wait", true);
+        }
+      return false;
+     }
+   int n = HistoryDealsTotal();
+   ulong mx = 0;
+   double sumBal = 0.0;
+   double sumCred = 0.0;
+   int nCash = 0;
+   ulong cashSum = 0;
+   ulong cashXor = 0;
+   for(int i = 0; i < n; i++)
+     {
+      ulong tk = HistoryDealGetTicket(i);
+      if(tk == 0)
+         continue;
+      if(tk > mx)
+         mx = tk;
+      long type = HistoryDealGetInteger(tk, DEAL_TYPE);
+      double amt = HistoryDealGetDouble(tk, DEAL_PROFIT) + HistoryDealGetDouble(tk, DEAL_COMMISSION) +
+                   HistoryDealGetDouble(tk, DEAL_SWAP) + HistoryDealGetDouble(tk, DEAL_FEE);
+      if(type == DEAL_TYPE_CREDIT)
+         sumCred += amt;
+      else
+         sumBal += amt;
+      if(IsCashFlow(type))
+        {
+         nCash++;
+         cashSum += tk;
+         cashXor ^= tk;
         }
      }
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double cred = AccountInfoDouble(ACCOUNT_CREDIT);
+   bool sums = (MathAbs(sumBal - bal) <= MathMax(1.0, 0.001 * MathAbs(bal)) &&
+                MathAbs(sumCred - cred) <= MathMax(1.0, 0.001 * MathAbs(cred)));
+   bool same = (g_primeRefAt != 0 && nCash == g_primeRefN && cashSum == g_primeRefSum && cashXor == g_primeRefXor);
+   if(!same || Secs(now, g_primeRefAt) < 0)
+     {
+      same = false;
+      g_primeRefAt = now;
+      g_primeRefN = nCash;
+      g_primeRefSum = cashSum;
+      g_primeRefXor = cashXor;
+     }
+   bool stable = (same && Secs(now, g_primeRefAt) >= GT_PRIME_STABLE_SEC);
+   if(!sums && !stable && !late)
+      return false;
    g_flowTicket = mx;
    g_allTicket = mx;
    g_flowScan = TimeCurrent();
-   Log(StringFormat("cash-flow tracking started: %d existing deals marked as seen (cursor #%s)", n,
-                    IntegerToString((long)mx)));
+   g_flowPrimed = true;
+   g_lastBalCred = 0.0;   // the first scan (same cycle) takes balance + credit as the reference
+   g_pendingSince = 0;
+   g_stateDirty = true;
+   string how = "NOT confirmed";
+   if(sums)
+      how = "deals match balance and credit";
+   else
+      if(stable)
+         how = StringFormat("cash-flow deals unchanged for %d s", GT_PRIME_STABLE_SEC);
+   Log(StringFormat("cash-flow tracking started: %d existing deals marked as seen (cursor #%s, %s)", n,
+                    IntegerToString((long)mx), how));
+   if(!sums && !stable)
+      Log(StringFormat("WARNING: the deal history was not confirmed complete within %d min (deals sum to %.2f, "
+                       "balance %.2f; credit deals %.2f, credit %.2f). Existing deals are marked as seen anyway: a "
+                       "deposit or withdrawal that reaches the history later is treated as a new cash flow.",
+                       GT_PRIME_MAX_SEC / 60, sumBal, bal, sumCred, cred), true);
+   return true;
   }
 
 // sums new cash-flow deals (ticket > cursor). Returns true when the history holds any deal newer than the
@@ -1803,6 +1902,25 @@ bool ScanDeals(double &flow, int &count)
    return fresh;
   }
 
+// keeps the newest deal ticket of any type current while the balance does not change, so that "a new deal" in
+// HandleCashFlows means one booked since the previous cycle (an entry deal booked an hour ago, which does not
+// change the balance, must not explain a later deposit or withdrawal)
+void TrackNewestDeal()
+  {
+   long fromL = (long)TimeCurrent() - 2 * 86400;
+   if(fromL < 0)
+      fromL = 0;
+   if(!HistorySelect((datetime)fromL, GT_FAR_FUTURE))
+      return;
+   int n = HistoryDealsTotal();
+   for(int i = 0; i < n; i++)
+     {
+      ulong tk = HistoryDealGetTicket(i);
+      if(tk > g_allTicket)
+         g_allTicket = tk;
+     }
+  }
+
 // rescale every equity baseline by k = E / (E - F) so that the percentage guards (DD scaling, max-DD halt,
 // daily limit, monthly stop, vol target / equity filter) stay exactly where they were before the flow
 void ApplyCashFlow(const double flow, const int count, const double eq)
@@ -1841,21 +1959,48 @@ void ApplyCashFlow(const double flow, const int count, const double eq)
    Log(StringFormat("CASH FLOW %+.2f detected, guards rebased (%s)", flow, how), true);
   }
 
-// returns false while a balance change is not yet explained by the deal history (no guard decision this cycle,
-// at most 60 s); live only
-bool HandleCashFlows(const double eq)
+// Returns false ("pending") while a balance / credit change is not yet explained by any new deal (trade or cash,
+// newer than the newest deal seen in the previous cycle) in the history: in that cycle the peak is not raised, no
+// halt / month / day stop is evaluated and nothing is
+// opened; closes, time stops and TP management continue. Pending lasts at most GT_FLOW_PENDING_SEC, then the
+// change counts as profit / loss. eq is read again AFTER the deal scan, so that k and this cycle's guards use an
+// equity that contains every flow the scan found. Live only (shared contract with the Python engine).
+bool HandleCashFlows(double &eq)
   {
    if(g_tester)
       return true;
    double bc = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT);
    if(g_lastBalCred != 0.0 && MathAbs(bc - g_lastBalCred) < 0.005)
+     {
+      g_pendingSince = 0;
+      ulong allTk = g_allTicket;
+      TrackNewestDeal();
+      if(MathAbs(AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT) - bc) >= 0.005)
+         g_allTicket = allTk;   // a deal was booked during the read: it explains the change on the next cycle
       return true;
+     }
    double flow = 0.0;
    int count = 0;
+   ulong flowTk0 = g_flowTicket;
+   ulong allTk0 = g_allTicket;
+   datetime scan0 = g_flowScan;
    bool fresh = ScanDeals(flow, count);
+   double eqNow = AccountInfoDouble(ACCOUNT_EQUITY);
+   double bcNow = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT);
+   if(MathAbs(bcNow - bc) >= 0.005)
+     {
+      // a deal was booked while the history was scanned (eq may contain a flow the scan missed): nothing is
+      // applied, the same scan is repeated on the next cycle
+      g_flowTicket = flowTk0;
+      g_allTicket = allTk0;
+      g_flowScan = scan0;
+      return false;
+     }
+   if(eqNow > 0.0)
+      eq = eqNow;
    if(count > 0)
       ApplyCashFlow(flow, count, eq);
-   if(fresh || g_lastBalCred == 0.0)
+   if(fresh || count > 0 || g_lastBalCred == 0.0)
      {
       g_lastBalCred = bc;
       g_pendingSince = 0;
@@ -1864,7 +2009,7 @@ bool HandleCashFlows(const double eq)
    datetime now = TimeLocal();
    if(g_pendingSince == 0)
       g_pendingSince = now;
-   if(Secs(now, g_pendingSince) > 60 || Secs(now, g_pendingSince) < 0)
+   if(Secs(now, g_pendingSince) > GT_FLOW_PENDING_SEC || Secs(now, g_pendingSince) < 0)
      {
       Log(StringFormat("balance changed by %+.2f without a matching deal in the history: treated as profit/loss",
                        bc - g_lastBalCred), true);
@@ -1878,49 +2023,82 @@ bool HandleCashFlows(const double eq)
 //+------------------------------------------------------------------+
 //| Broker clock verification (live only; the tester uses the rule)   |
 //+------------------------------------------------------------------+
+// an advance of the server time counts as a new tick only when it is not larger than the local time that passed
+// since the previous server time was first seen (+ GT_CLOCK_ADV_SEC): the jump from an old cached time to Friday's
+// last tick after a weekend terminal start is no new tick, while the first tick after a quiet minute or the weekly
+// open (the server time moved as far as the local clock) is one
 void TrackServerTime(const datetime srv)
   {
-   if(srv > g_lastSrvSeen)
-     {
-      if(g_lastSrvSeen > 0)
-         g_srvAdvAt = TimeLocal();
-      g_lastSrvSeen = srv;
-     }
+   if(srv <= g_lastSrvSeen)
+      return;
+   datetime now = TimeLocal();
+   if(g_lastSrvSeen > 0 && Secs(srv, g_lastSrvSeen) <= Secs(now, g_lastSrvSeenAt) + GT_CLOCK_ADV_SEC)
+      g_srvAdvAt = now;
+   g_lastSrvSeen = srv;
+   g_lastSrvSeenAt = now;
   }
 
-// server - UTC offset from the newest tick, rounded to 30 min; valid only for a fresh tick
-// (same test as Python engine: within 120 s of a half-hour step, and the server time advanced recently)
-bool ObserveOffset(long &obs)
+// clock observation from the newest tick (same rule as the Python engine):
+//  1 = valid: obs = server - UTC rounded to 30 min
+//  0 = no observation: the server time did not advance within GT_CLOCK_ADV_SEC (weekend, holiday, frozen feed,
+//      a stale Friday tick after a restart never counts)
+// -1 = fresh tick, but server - PC UTC is not within GT_CLOCK_TOL_SEC of a whole half-hour offset within +-14 h:
+//      the PC clock is off (diff = server - PC UTC in seconds)
+int ObserveOffset(long &obs, long &diff)
   {
+   obs = 0;
+   diff = 0;
    datetime srv = TimeCurrent();
    datetime gmt = TimeGMT();
    if(srv <= 0 || gmt <= 0)
-      return false;
-   if(g_srvAdvAt == 0 || Secs(TimeLocal(), g_srvAdvAt) > GT_CLOCK_ADV_SEC || Secs(TimeLocal(), g_srvAdvAt) < 0)
-      return false;
-   long diff = (long)srv - (long)gmt;
+      return 0;
+   datetime now = TimeLocal();
+   if(g_srvAdvAt == 0 || Secs(now, g_srvAdvAt) > GT_CLOCK_ADV_SEC || Secs(now, g_srvAdvAt) < 0)
+      return 0;
+   diff = (long)srv - (long)gmt;
    long nearest = (long)MathRound((double)diff / 1800.0) * 1800;
    if(MathAbs((double)(diff - nearest)) > GT_CLOCK_TOL_SEC || MathAbs((double)nearest) > 14.0 * 3600.0)
-      return false;
+      return -1;
    obs = nearest;
-   return true;
+   return 1;
   }
 
+// AUTO waits for a verified clock after every start-up; every mode blocks after GT_CLOCK_CONFIRM mismatches
 bool ClockAllowsEntries()
   {
    if(g_tester)
       return true;
-   return (g_clkVerified && !g_clkBlocked);
+   if(g_clkBlocked)
+      return false;
+   return (g_clockMode != GT_SERVER_AUTO || g_clkVerified);
   }
 
 string ClockBlockReason()
   {
    if(g_clkBlocked)
       return "broker clock mismatch";
+   if(g_clkOffGridN >= GT_CLOCK_CONFIRM)
+      return "broker clock not verified yet (PC clock off - check the Windows time synchronisation)";
    return "broker clock not verified yet";
   }
 
-void AdoptOffset(const long obs)
+// gates for every new entry that do not depend on the signal: the broker clock, the first-run deal history and
+// an unexplained balance change in this cycle (closes, stops and TP management are never gated)
+bool EntryGateOpen(string &why)
+  {
+   why = "";
+   if(!ClockAllowsEntries())
+      why = ClockBlockReason();
+   else
+      if(!g_flowPrimed)
+         why = "deal history not confirmed complete yet (first run)";
+      else
+         if(g_flowPending)
+            why = "balance change not in the deal history yet (cash flow pending)";
+   return (why == "");
+  }
+
+void AdoptOffset(const long obs, const string how)
   {
    bool had = g_clkHave;
    long old = g_clkOffset;
@@ -1932,10 +2110,11 @@ void AdoptOffset(const long obs)
    g_clkCandN = 0;
    g_stateDirty = true;
    if(!had)
-      Log(StringFormat("broker clock measured: server = UTC%+.1f h (AUTO); new entries enabled", obs / 3600.0), true);
+      Log(StringFormat("broker clock measured: server = UTC%+.1f h (AUTO, %s); new entries enabled", obs / 3600.0, how),
+          true);
    else
-      Log(StringFormat("broker clock offset changed: UTC%+.1f h -> UTC%+.1f h (AUTO, %d identical observations)",
-                       old / 3600.0, obs / 3600.0, GT_CLOCK_CONFIRM), true);
+      Log(StringFormat("broker clock offset changed: UTC%+.1f h -> UTC%+.1f h (AUTO, %s)", old / 3600.0, obs / 3600.0,
+                       how), true);
   }
 
 void ClockMatch(const long obs)
@@ -1953,9 +2132,36 @@ void ClockMatch(const long obs)
          Log(StringFormat("broker clock verified: server = UTC%+.1f h (%s)", obs / 3600.0, EnumToString(g_clockMode)));
   }
 
-// one counted observation per minute (the first one at once). AUTO adopts a changed offset after 3 identical
-// observations; explicit modes block new entries after 3 consecutive mismatches. Closes, time stops, TP
-// management and hard stops always run with the clock in use (last persisted offset, or NY7 if none).
+// a fresh tick off the half-hour grid is no observation of the broker clock: the PC clock is off. Reported after
+// GT_CLOCK_CONFIRM such observations in a row, then at most every GT_REPEAT_SEC
+void ClockOffGrid(const long diff)
+  {
+   long nearest = (long)MathRound((double)diff / 1800.0) * 1800;
+   g_clkOffGridSec = (MathAbs((double)nearest) > 14.0 * 3600.0) ? diff : diff - nearest;
+   g_clkOffGridN++;
+   if(g_clkOffGridN < GT_CLOCK_CONFIRM)
+      return;
+   datetime now = TimeLocal();
+   if(g_clkDriftNote != 0 && Secs(now, g_clkDriftNote) < GT_REPEAT_SEC && Secs(now, g_clkDriftNote) >= 0)
+      return;
+   g_clkDriftNote = now;
+   string effect = (g_clockMode == GT_SERVER_AUTO && !g_clkVerified) ?
+                   "new entries wait until the broker clock is verified" : "trading continues with the clock in use";
+   Log(StringFormat("PC CLOCK: server time %s vs PC clock %s UTC is %+d s off a whole half-hour offset (%d observations "
+                    "in a row) - check the Windows time synchronisation; %s",
+                    TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS), TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS),
+                    (int)g_clkOffGridSec, g_clkOffGridN, effect), true);
+  }
+
+// one counted observation per minute (the first one at once), only from a fresh tick. Gating of new entries
+// (shared rule with the Python engine, spec section 3):
+//  - AUTO: new entries wait until a valid observation after start-up confirms the clock in use (the adopted /
+//    persisted offset, or the NY7 rule when there is none). A different offset is adopted after GT_CLOCK_CONFIRM
+//    identical observations - the first offset too, unless it matches the NY7 rule.
+//  - NY7 / Fixed: new entries are allowed from the start.
+//  - every mode: GT_CLOCK_CONFIRM consecutive mismatches that are not adopted block new entries until the clock
+//    matches again.
+// Closes, time stops, TP management and hard stops always run with the clock in use.
 void CheckClock()
   {
    if(g_tester)
@@ -1964,21 +2170,31 @@ void CheckClock()
    if(g_clkLastObs != 0 && Secs(now, g_clkLastObs) < GT_CLOCK_OBS_SEC && Secs(now, g_clkLastObs) >= 0)
       return;
    long obs = 0;
-   if(!ObserveOffset(obs))
-      return;   // market closed / stale ticks: keep the last verdict
+   long diff = 0;
+   int r = ObserveOffset(obs, diff);
+   if(r == 0)
+      return;   // no fresh tick: no observation, keep the last verdict
    g_clkLastObs = now;
-   if(g_clockMode == GT_SERVER_AUTO)
+   if(r < 0)
      {
-      if(!g_clkHave)
-        {
-         AdoptOffset(obs);
-         return;
-        }
-      if(obs == g_clkOffset)
-        {
+      ClockOffGrid(diff);
+      return;
+     }
+   g_clkOffGridN = 0;
+   datetime srv = TimeCurrent();
+   long expected = (long)srv - (long)ServerToUTC(srv);   // clock in use (AUTO without an offset: NY7 rule)
+   bool autoMode = (g_clockMode == GT_SERVER_AUTO);
+   if(obs == expected)
+     {
+      if(autoMode && !g_clkHave)
+         AdoptOffset(obs, "matches the NY7 rule");
+      else
          ClockMatch(obs);
-         return;
-        }
+      return;
+     }
+   g_clkMismatch++;
+   if(autoMode)
+     {
       if(g_clkCandN > 0 && obs == g_clkCand)
          g_clkCandN++;
       else
@@ -1986,36 +2202,28 @@ void CheckClock()
          g_clkCand = obs;
          g_clkCandN = 1;
         }
-      g_clkMismatch++;
-      Log(StringFormat("broker clock observation UTC%+.1f h differs from UTC%+.1f h in use (%d/%d)",
-                       obs / 3600.0, g_clkOffset / 3600.0, g_clkCandN, GT_CLOCK_CONFIRM));
+      Log(StringFormat("broker clock observation UTC%+.1f h differs from UTC%+.1f h in use (%d/%d identical)",
+                       obs / 3600.0, expected / 3600.0, g_clkCandN, GT_CLOCK_CONFIRM));
       if(g_clkCandN >= GT_CLOCK_CONFIRM)
         {
-         AdoptOffset(obs);
+         AdoptOffset(obs, IntegerToString(GT_CLOCK_CONFIRM) + " identical observations");
          return;
         }
-      if(g_clkMismatch >= GT_CLOCK_CONFIRM && !g_clkBlocked)
-        {
-         g_clkBlocked = true;
-         Log(StringFormat("broker clock unstable: observations disagree with UTC%+.1f h - new entries blocked",
-                          g_clkOffset / 3600.0), true);
-        }
-      return;
      }
-   datetime srv = TimeCurrent();
-   long expected = (long)srv - (long)ServerToUTC(srv);
-   if(obs == expected)
-     {
-      ClockMatch(obs);
-      return;
-     }
-   g_clkMismatch++;
+   else
+      if(g_clkMismatch <= GT_CLOCK_CONFIRM || InpVerbose)
+         Log(StringFormat("broker clock observation %+.1f h differs from the configured %+.1f h (%d/%d)", obs / 3600.0,
+                          expected / 3600.0, g_clkMismatch, GT_CLOCK_CONFIRM));
    if(g_clkMismatch >= GT_CLOCK_CONFIRM && !g_clkBlocked)
      {
       g_clkBlocked = true;
-      Log(StringFormat("broker clock mismatch: observed %+.1f h, expected %+.1f h (InpServerTime=%s). New entries blocked; "
-                       "closes and stops keep working. Use GT_SERVER_AUTO or correct the setting / PC clock.",
-                       obs / 3600.0, expected / 3600.0, EnumToString(InpServerTime)), true);
+      if(autoMode)
+         Log(StringFormat("broker clock unstable: observations disagree with UTC%+.1f h in use - new entries blocked; "
+                          "closes and stops keep working", expected / 3600.0), true);
+      else
+         Log(StringFormat("broker clock mismatch: observed %+.1f h, expected %+.1f h (InpServerTime=%s). New entries "
+                          "blocked; closes and stops keep working. Use GT_SERVER_AUTO or correct the setting / PC clock.",
+                          obs / 3600.0, expected / 3600.0, EnumToString(InpServerTime)), true);
      }
   }
 
@@ -2105,8 +2313,9 @@ string StatusText()
       s += ", day stop";
    if(InBlackout())
       s += ", blackout";
-   if(!ClockAllowsEntries())
-      s += ", entries blocked: " + ClockBlockReason();
+   string gate;
+   if(!EntryGateOpen(gate))
+      s += ", entries blocked: " + gate;
    if(g_permit == 0)
       s += ", trading blocked";
    if(s == "")
@@ -2347,7 +2556,9 @@ void ReleaseLock()
 //| Start-up: state is loaded on the first Ready() cycle               |
 //+------------------------------------------------------------------+
 // InpResetHalt: clears the max-DD halt and rebases the peak once; a persisted marker stops a forgotten
-// InpResetHalt=true from clearing a later halt at every restart (re-armed by a start with InpResetHalt=false)
+// InpResetHalt=true from clearing a later halt at every restart (re-armed by a start with InpResetHalt=false).
+// Called after the first cash-flow scan of the session (ProcessAll): a deposit / withdrawal made while the EA was
+// off is applied to the old peak first, then the peak is rebased to the equity that contains it.
 void ApplyResetHalt(const double eq)
   {
    if(g_tester)
@@ -2412,9 +2623,8 @@ bool EnsureState()
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    if(g_peak <= 0.0)
       g_peak = eq;
-   if(!g_tester && !flowKnown)
-      PrimeFlowCursor();
-   ApplyResetHalt(eq);
+   g_flowPrimed = (g_tester || flowKnown);   // first run: TryPrimeFlowCursor (ProcessAll) once the history is complete
+   g_resetDue = true;                        // InpResetHalt: after the first cash-flow scan (ProcessAll)
    g_stateLoaded = true;
    g_stateDirty = true;
    if(!g_tester)
@@ -2527,17 +2737,25 @@ void ProcessAll()
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    if(eq <= 0.0)
       return;
-   // cash flows are detected BEFORE the equity guards of this cycle
-   if(!HandleCashFlows(eq))
+   // cash flows are detected BEFORE the equity guards of this cycle (eq is read again after the deal scan).
+   // Pending (balance changed, no new deal in the history yet, at most GT_FLOW_PENDING_SEC): no peak raise, no
+   // halt / month / day stop decision and no new entry this cycle; closes, time stops and TP management run.
+   if(!g_flowPrimed)
+      TryPrimeFlowCursor();
+   g_flowPending = (g_flowPrimed && !HandleCashFlows(eq));
+   if(g_resetDue && g_flowPrimed && !g_flowPending)
      {
-      SaveState();
-      return;   // balance change not yet in the deal history: decide next cycle (max 60 s)
+      g_resetDue = false;
+      ApplyResetHalt(eq);   // after the first cash-flow scan of the session
      }
    CheckClock();
    PruneFails();
-   UpdateEquityState(eq, nowSrv);
-   CheckDDAlert(eq);
-   DailySummary(eq);
+   if(!g_flowPending)
+     {
+      UpdateEquityState(eq, nowSrv);
+      CheckDDAlert(eq);
+      DailySummary(eq);
+     }
    string why;
    if(TradingPermitted(why))
      {
@@ -2564,11 +2782,13 @@ int OnInit()
    g_stateLoaded = false;   // (re)loaded from the global variables on the first Ready() cycle
    g_startLocal = TimeLocal();
    g_clockMode = (g_tester && InpServerTime == GT_SERVER_AUTO) ? GT_SERVER_NY7 : InpServerTime;
-   g_clkVerified = false;   // a clock must be confirmed by a live observation after every start-up
+   g_clkVerified = false;   // AUTO: the clock must be confirmed by a live observation after every start-up
    g_clkBlocked = false;
    g_clkMismatch = 0;
    g_clkCandN = 0;
    g_clkLastObs = 0;
+   g_clkOffGridN = 0;
+   g_flowPending = false;
    g_permit = -1;
 
    if(!ValidateInputs())
@@ -2654,7 +2874,9 @@ int OnInit()
                     "max lots/order=%.2f, max risk amount=%.2f, max DD halt=%.1f%%, server=%s%s",
                     g_nsym, (InpESEnabled && g_esOk) ? g_esSym : "off", prof, BaseRisk(true) * 100.0,
                     BaseRisk(false) * SymbolMult(g_esSym) * 100.0, InpMaxLotsPerOrder, InpMaxRiskAmount, InpMaxDDHalt,
-                    EnumToString(InpServerTime), g_tester ? "" : " (new entries wait for a verified broker clock)"), true);
+                    EnumToString(InpServerTime),
+                    (!g_tester && g_clockMode == GT_SERVER_AUTO) ? " (new entries wait for a verified broker clock)" : ""),
+       true);
    if(!g_tester && TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) == 0)
       Print("[GT] WARNING: Algo Trading is disabled in the terminal.");
    return INIT_SUCCEEDED;
