@@ -10,12 +10,14 @@ as the live engine. Fill model (conservative):
   * PnL is expressed in R (multiples of the initial stop distance) and compounded with
     the risk fraction from the RiskManager (fixed-fractional sizing, no lot rounding);
   * the capacity caps (risk.max_lots_per_order, risk.max_risk_amount) are applied exactly as live, before
-    the portfolio guards; lots are converted to backtest.account_currency with the loaded pairs (a symbol
-    without a conversion pair stays uncapped, with a warning); optional free-margin check (backtest.leverage).
+    the portfolio guards; lots are converted to backtest.account_currency with the loaded pairs, traded or
+    not (a signal without a conversion rate stays uncapped, with a warning that counts them); optional
+    free-margin check (backtest.leverage): a signal whose margin cannot be converted is skipped (fail closed).
 """
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -72,6 +74,29 @@ def load_data_dir(data_dir: str | Path, symbols: list[str]) -> dict[str, pd.Data
         else:
             log.warning("no data for %s in %s (expected %s_M15.csv)", s, d, s)
     return out
+
+
+_DATA_FILE = re.compile(r"^([A-Z]{6})(?:_M15\.(?:parquet|csv|txt)|\.csv)$")
+
+
+def conversion_pairs(data_dir: str | Path, traded: list[str], account_currency: str) -> list[str]:
+    """Pairs with data in data_dir that are NOT traded but can convert a traded currency to the account currency
+    (both legs among the traded symbols' currencies, the account currency and USD), e.g. USDCHF or USDCAD. The
+    backtest loads them for the lot-cap / margin conversion only (they never generate signals)."""
+    d = Path(data_dir)
+    if not d.is_dir():
+        return []
+    ccys = {c for s in traded for c in (s[:3].upper(), s[3:6].upper())} | {account_currency.upper(), "USD"}
+    have = {s.upper() for s in traded}
+    out = set()
+    for p in d.iterdir():
+        m = _DATA_FILE.match(p.name)
+        if not m:
+            continue
+        s = m.group(1)
+        if s not in have and s[:3] != s[3:] and s[:3] in ccys and s[3:] in ccys:
+            out.add(s)
+    return sorted(out)
 
 
 # ---------------------------------------------------------------- result
@@ -242,6 +267,7 @@ def _business_days(a: pd.Timestamp, b: pd.Timestamp) -> int:
 
 # ---------------------------------------------------------------- capacity / sizing limits
 _STALE = np.timedelta64(7, "D")
+_STALE_DIRECT = np.timedelta64(1, "D")  # an older direct pair gives way to a fresher route through USD
 MARGIN_USE_MAX = 0.8  # same as engine.MARGIN_USE_MAX
 
 
@@ -251,7 +277,9 @@ class _FxConverter:
     Uses a direct pair when one is loaded (EURUSD, USDJPY, ...), otherwise goes through USD, triangulating
     via a loaded cross whose other leg has a USD pair (CAD = GBPUSD / GBPCAD or EURUSD / EURCAD,
     AUD = EURUSD / EURAUD, ...). With the 14 default NR symbols every currency is covered for a USD or a
-    JPY account. A rate older than 7 days counts as missing and the next candidate is tried."""
+    JPY account. A rate older than 7 days counts as missing and the next candidate is tried; a direct pair
+    older than 1 day (a data gap, or its data ended) gives way to the route through USD and is used again only
+    where that route has no price either."""
 
     def __init__(self, data: dict[str, pd.DataFrame]):
         self.px = {}
@@ -259,14 +287,14 @@ class _FxConverter:
             if len(df) and "open" in df.columns:
                 self.px[s[:6].upper()] = (df.index.to_numpy(dtype="datetime64[ns]"), df["open"].to_numpy(float))
 
-    def _asof(self, sym: str, t: np.ndarray) -> np.ndarray:
+    def _asof(self, sym: str, t: np.ndarray, limit: np.timedelta64 = _STALE) -> np.ndarray:
         ix, v = self.px[sym]
         i = np.searchsorted(ix, t, side="right") - 1
         out = np.full(len(t), np.nan)
         ok = i >= 0
         out[ok] = v[i[ok]]
         stale = np.zeros(len(t), bool)
-        stale[ok] = (t[ok] - ix[i[ok]]) > _STALE
+        stale[ok] = (t[ok] - ix[i[ok]]) > limit
         out[stale] = np.nan
         return out
 
@@ -299,14 +327,24 @@ class _FxConverter:
         return out
 
     def rate(self, ccy: str, acct: str, t: np.ndarray) -> np.ndarray:
-        """Value of 1 unit of ccy in the account currency."""
+        """Value of 1 unit of ccy in the account currency (NaN where no candidate has a price)."""
         if ccy == acct:
             return np.ones(len(t))
         if ccy + acct in self.px:
-            return self._asof(ccy + acct, t)
-        if acct + ccy in self.px:
-            return 1.0 / self._asof(acct + ccy, t)
-        return self.usd(ccy, t) / (1.0 if acct == "USD" else self.usd(acct, t))
+            def direct(limit):
+                return self._asof(ccy + acct, t, limit)
+        elif acct + ccy in self.px:
+            def direct(limit):
+                return 1.0 / self._asof(acct + ccy, t, limit)
+        else:
+            direct = None
+        out = direct(_STALE_DIRECT) if direct is not None else np.full(len(t), np.nan)
+        if np.isnan(out).any():  # no fresh direct pair: the route through USD
+            via = self.usd(ccy, t) / (1.0 if acct == "USD" else self.usd(acct, t))
+            out = np.where(np.isfinite(out), out, via)
+        if direct is not None and np.isnan(out).any():  # nothing fresher: the direct pair up to 7 days old
+            out = np.where(np.isfinite(out), out, direct(_STALE))
+        return out
 
 
 # ---------------------------------------------------------------- engine
@@ -323,6 +361,30 @@ class Backtester:
         self.clock = clock or ServerClock("ny7" if mode == "auto" else mode, cfg.broker.server_gmt_offset)
         self.nr = NightReversion(cfg.night_reversion)
         self.es = EuroSession(cfg.euro_session)
+
+    @staticmethod
+    def _warn_conversion(entries: list, sym_data: dict, acct: str, caps: bool, margin: bool) -> None:
+        """Warn (with counts) about signals whose lots (quote currency) or margin (base currency) cannot be
+        converted to the account currency at their entry bar."""
+        if not (caps or margin):
+            return
+        hint = "conversion pairs found there are loaded even when they are not traded"
+        for s, d in sym_data.items():
+            js = np.array([e[4] for e in entries if e[3] == s], dtype=int)
+            if len(js) == 0:
+                continue
+            nq = int(np.isnan(d["q2a"][js]).sum())
+            nb = int(np.isnan(d["b2a"][js]).sum())
+            if nq:
+                log.warning("%s: %d of %d signals have no rate to convert %s to the account currency %s -> the lot "
+                            "cap is NOT applied to them%s (put USD%s or %sUSD M15 data into backtest.data_dir: %s)",
+                            s, nq, len(js), s[3:6], acct,
+                            "; with backtest.leverage they are skipped (margin unknown)" if margin else "",
+                            s[3:6], s[3:6], hint)
+            if margin and nb > nq:
+                log.warning("%s: %d of %d signals have no rate to convert %s to the account currency %s -> skipped by "
+                            "the margin check (fail closed; put USD%s or %sUSD M15 data into backtest.data_dir: %s)",
+                            s, nb, len(js), s[:3], acct, s[:3], s[:3], hint)
 
     def _slice(self, df: pd.DataFrame) -> pd.DataFrame:
         b = self.cfg.backtest
@@ -418,14 +480,11 @@ class Backtester:
             ix = d["df"].index.to_numpy(dtype="datetime64[ns]")
             d["q2a"] = fx.rate(s[3:6], acct, ix)
             d["b2a"] = fx.rate(s[:3], acct, ix)
-            if (max_lots > 0 or leverage > 0) and np.isnan(d["q2a"]).all():
-                log.warning("%s: no loaded pair converts %s to the account currency %s -> the lot cap / margin "
-                            "check are NOT applied to this symbol (add e.g. USD%s or %sUSD data)", s, s[3:6], acct,
-                            s[3:6], s[3:6])
 
         entries.sort(key=lambda x: (x[0], x[1], x[3]))
         if start_ts is not None:
             entries = [e for e in entries if e[0] >= start_ts]
+        self._warn_conversion(entries, sym_data, acct, max_lots > 0, leverage > 0)
         timeline = pd.DatetimeIndex(np.unique(np.concatenate(
             [v["df"].index.to_numpy(dtype="datetime64[ns]") for v in sym_data.values()])))
         if start_ts is not None:
@@ -475,8 +534,10 @@ class Backtester:
                 if not ok:
                     continue
                 margin = 0.0
-                if leverage > 0 and np.isfinite(lots):
-                    margin = lots * contract * d["b2a"][j] / leverage
+                if leverage > 0:
+                    margin = lots * contract * d["b2a"][j] / leverage  # NaN when lots or the base rate are unknown
+                    if not np.isfinite(margin):
+                        continue  # fail closed: the margin cannot be checked (counted by _warn_conversion)
                     free = last_mtm - sum(p.margin for p in open_pos)
                     if margin > MARGIN_USE_MAX * free:
                         continue  # live: "skip (insufficient free margin)"

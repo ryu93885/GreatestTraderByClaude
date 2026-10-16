@@ -10,8 +10,10 @@ One loop every engine.poll_seconds:
   6. trade journal of closed positions, heartbeat, dead-man-switch ping, state save (only on change).
 
 New entries need a verified server clock (auto mode: measured from fresh ticks after every start) and are
-blocked while the configured clock disagrees with the broker. Closes, time stops, TP management and hard
-stops keep working with the last known clock.
+blocked after 3 observations that disagree with the clock in use; they also wait while the first-run deal history
+is not confirmed complete, while the deal history cannot be read and while a balance change is not yet explained
+by the deal history (cash flow pending, at most 60 s). Closes, time stops, TP management and hard stops keep
+working with the last known clock.
 """
 from __future__ import annotations
 
@@ -33,7 +35,7 @@ from .notify import Notifier
 from .ops import EXIT_RESTART, EXIT_STOP, format_versions, process_memory_mb, versions
 from .risk import RiskManager, RiskState
 from .strategies import CloseRequest, EntryRequest, EuroSession, ModifyRequest, NightReversion, PositionView
-from .timeutil import ServerClock, detect_server_mode, utc_to_market
+from .timeutil import ServerClock, detect_server_mode, market_to_utc, utc_to_market
 
 log = logging.getLogger(__name__)
 M15 = timedelta(minutes=15)
@@ -41,13 +43,19 @@ H1 = timedelta(hours=1)
 FRESH_SIGNAL = timedelta(seconds=150)  # act on a closed bar only if it closed within this time
 MARGIN_USE_MAX = 0.8  # a new position may use at most 80% of the current free margin
 CLOCK_TOL = 120.0  # s: a fresh tick lies within this distance of a whole half-hour offset from real UTC
-TICK_FRESH = 120.0  # s: ... and the server time advanced at most this long ago (VPS clock)
-CLOCK_CONFIRM = 3  # identical observations to adopt a changed offset (auto) / mismatches to block entries
+TICK_FRESH = 30.0  # s: a clock observation needs a symbol's own tick time to have advanced within this time
+CLOCK_CONFIRM = 3  # identical observations to adopt a changed offset (auto) / mismatches to block entries /
+#                    off-grid observations in a row before the PC-clock alert
+SESSION_GRACE = timedelta(minutes=10)  # stale-feed watchdog: the first tick of a session may come this late
 MAX_FAIL_SECONDS = 1800.0  # continuous failure -> CRITICAL notification and exit code 3 (wrapper restarts)
 HEARTBEAT_SECONDS = 3600.0
 SYMBOL_RETRY_SECONDS = 3600.0  # unavailable symbols are tried again this often
+SYMBOL_FAIL_ALERT = 60  # loops in a row before a failing symbol is notified (then every 6 hours)
 STATE_SAVE_SECONDS = 60.0  # equity-only changes are written at most this often (everything else at once)
 CLOSED_LOOKUP_TRIES = 120  # loops to wait for the deal history of a closed position before journaling it
+FLOW_PENDING_SECONDS = 60.0  # a balance change without a new deal in the history waits at most this long
+PRIME_STABLE_SECONDS = 60.0  # first run: cash deals of the history unchanged this long = the history is complete
+PRIME_MAX_SECONDS = 600.0  # first run: the cash-flow tracking starts after this long anyway (warning)
 FX_HOLIDAYS = {(12, 25), (1, 1)}  # market dates without trading
 
 
@@ -70,7 +78,8 @@ class LiveEngine:
         self.notifier = notifier or Notifier(cfg.notify)
         self.nr = NightReversion(cfg.night_reversion)
         self.es = EuroSession(cfg.euro_session)
-        self.state = RiskState.load(cfg.engine.state_file)  # never raises: backups, else HALTED
+        # corrupt -> newest backup, else HALTED; a file that stays locked raises (exit 1: the wrapper restarts)
+        self.state = RiskState.load(cfg.engine.state_file)
         self.risk = RiskManager(cfg.risk, self.state)
         self.journal = TradeJournal(cfg.engine.journal_dir)
         self.magics = {cfg.night_reversion.magic: "NR", cfg.euro_session.magic: "ES"}
@@ -83,12 +92,23 @@ class LiveEngine:
         self._init_clock()
         self._started = False
         self._sym_fail: dict[str, int] = {}
-        self._prev_st: datetime | None = None
-        self._st_moved_utc: datetime | None = None  # VPS UTC when the server time last advanced
+        self._sym_tick: dict[str, tuple[datetime, datetime]] = {}  # symbol -> (its last tick time, VPS UTC of read)
+        self._st_moved_utc: datetime | None = None  # VPS UTC when a symbol's own tick time last advanced
         self._watch_from_utc: datetime | None = None  # stale-feed watchdog reference
-        self._clock_cand: float | None = None
+        self._clock_cand: float | None = None  # auto: candidate offset (hours) and its identical observations
         self._clock_n = 0
+        self._clock_mis = 0  # consecutive observations that disagree with the clock in use
+        self._drift_n = 0  # consecutive fresh observations off the half-hour grid (PC clock off)
         self._account_problem = ""
+        self._balance: float | None = None  # account balance at the last cash-flow check (equity log)
+        self._flow_pending = False  # this loop: balance change not explained by the deal history yet
+        self._pending_since: float | None = None  # monotonic time when the unexplained change was first seen
+        self._money_ref: float | None = None  # balance + credit at the last explained change (None: take the next)
+        self._deal_ref: int | None = None  # newest deal ticket at that time
+        self._cash_problem = ""  # the deal history cannot be read
+        self._prime_start: float | None = None  # first run: when priming was first tried
+        self._prime_ref: tuple | None = None  # first run: (cash deal tickets, since when unchanged)
+        self._prime_note = False
         self._lot_cap_day: dict[str, str] = {}
         self._closing: dict[int, str] = {}  # ticket -> reason of a close sent by the engine (journal)
         self._gap_logged: dict[str, datetime] = {}
@@ -98,12 +118,14 @@ class LiveEngine:
         self._saved_key = ""
 
     # ------------------------------------------------------------------ helpers
-    def _alert(self, text: str, key: str | None = None, every: float = 0.0, level: int = logging.WARNING) -> None:
-        """Log and notify. A keyed alert is sent (and logged at `level`) at most every `every` seconds."""
+    def _alert(self, text: str, key: str | None = None, every: float = 0.0, level: int = logging.WARNING) -> bool:
+        """Log and notify. A keyed alert is sent (and logged at `level`) at most every `every` seconds.
+        Returns True when it was sent."""
         if self.notifier.send(text, key=key, every=every):
             log.log(level, text)
-        else:
-            log.debug(text)
+            return True
+        log.debug(text)
+        return False
 
     def all_symbols(self) -> list[str]:
         syms = []
@@ -171,7 +193,9 @@ class LiveEngine:
         if self.state.restored_from:
             self._alert(f"state file was unreadable or missing -> restored from: {self.state.restored_from}",
                         level=logging.ERROR)
-        if self.state.halted:
+        if self.state.reset_request:
+            log.warning("reset-halt requested (%s): applied after the first cash-flow check", self.state.reset_request)
+        elif self.state.halted:
             self._alert(f"HALTED: {self.state.halt_reason} (no new entries; `python main.py reset-halt` to resume)",
                         level=logging.ERROR)
         self._started = True
@@ -180,7 +204,7 @@ class LiveEngine:
     def run_forever(self) -> int:
         """Run until stopped. Returns the process exit code: EXIT_STOP (10) after Ctrl+C, EXIT_RESTART (3) after
         30 minutes of continuous failure (the wrapper starts a fresh process). FatalError propagates."""
-        fails, first_fail, next_start = 0, None, 0.0
+        fails, first_fail, next_start, told = 0, None, 0.0, False
         try:
             while True:
                 t0 = time.monotonic()
@@ -190,9 +214,11 @@ class LiveEngine:
                             self.start()
                     if self._started:
                         self.step()
-                        if fails:
-                            self._alert(f"recovered after {fails} failed loops")
-                        fails, first_fail = 0, None
+                        if fails and told:  # the operator got an ERROR for this failure: tell the recovery too
+                            self._alert(f"recovered after {fails} failed loops", key="loop-recovered", every=1800)
+                        elif fails:
+                            log.info("recovered after %d failed loops", fails)
+                        fails, first_fail, told = 0, None, False
                 except FatalError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - keep running, but tell the operator
@@ -204,7 +230,8 @@ class LiveEngine:
                         log.error("loop failed (%d in a row): %s", fails, exc)
                     else:
                         log.debug("loop failed (%d in a row): %s", fails, exc)
-                    self._alert(f"ERROR: {exc}", key="loop-error", every=1800, level=logging.ERROR)
+                    if self._alert(f"ERROR: {exc}", key="loop-error", every=1800, level=logging.ERROR):
+                        told = True
                     if not self._started:
                         next_start = time.monotonic() + min(60.0, 5.0 * 2 ** min(fails - 1, 4))
                     elif fails % 12 == 0:
@@ -239,30 +266,39 @@ class LiveEngine:
             return
         if not self._check_account():
             return
+        ticks = {}
         for s in self.symbols():
             try:
-                self.broker.tick(s)
+                ticks[s] = self.broker.tick(s)
             except Exception as exc:  # noqa: BLE001 - handled per symbol below
                 log.debug("tick %s failed: %s", s, exc)
+                ticks[s] = None
         self._retry_disabled()
         utc = self._utcnow()
-        self._check_clock(utc)
+        self._check_clock(utc, *self._track_ticks(ticks, utc))
         now_server = self.broker.server_time()
         if now_server is None:
             return
         now_utc = self.clock.server_to_utc(now_server)
         now_mkt = self.clock.server_to_market(now_server)
-        equity = self._scan_cash_flows(self.broker.account_equity())  # BEFORE the guards: a withdrawal is no loss
+        equity = self._cash_check()  # BEFORE the guards: a withdrawal is no loss, a deposit no profit
         st = self.state
-        before = (st.day, st.month, st.last_equity, st.peak_equity, st.month_start_equity, st.day_opens,
-                  st.day_closes)
-        for ev in self.risk.update_equity(equity, now_mkt.date()):
-            self._alert(ev)
-        if before[0] and st.day != before[0]:
-            self._new_day(before, utc)
-        if before[1] and st.month != before[1]:
-            self._month_end(before[1])
-        self._dd_alert(equity)
+        if self._flow_pending:
+            # balance changed, no deal explains it yet (at most FLOW_PENDING_SECONDS): no peak raise, no halt /
+            # month / day stop decision, no entry this loop; closes, time stops, TP management and stops in force run
+            self.risk.flatten_reason = ""
+        else:
+            if st.cash_init and not self._cash_problem:
+                self._apply_reset_request(equity)  # after this start's first cash-flow check
+            before = (st.day, st.month, st.last_equity, st.peak_equity, st.month_start_equity, st.day_opens,
+                      st.day_closes)
+            for ev in self.risk.update_equity(equity, now_mkt.date()):
+                self._alert(ev)
+            if before[0] and st.day != before[0]:
+                self._new_day(before, utc)
+            if before[1] and st.month != before[1]:
+                self._month_end(before[1])
+            self._dd_alert(equity)
         positions = self.broker.positions(self.magics)
         self._sync_trades(positions, utc)
         stop_reason = self.risk.flatten_reason or self.risk.hard_stop_active()
@@ -291,8 +327,9 @@ class LiveEngine:
         self._save_state()
 
     def _isolated(self, name: str, fn, *args) -> None:
-        """Run one symbol's work; a failure is logged (full traceback only now and then) and notified after
-        60 loops in a row, and never stops the other symbols."""
+        """Run one symbol's work; a failure is logged (full traceback only now and then), notified after 60 loops
+        in a row and then every 6 hours while it lasts (also listed in the daily summary), and never stops the
+        other symbols."""
         try:
             fn(*args)
         except Exception as exc:  # noqa: BLE001
@@ -303,12 +340,17 @@ class LiveEngine:
                 log.error("%s failed (%d in a row): %s", name, n, exc)
             else:
                 log.debug("%s failed (%d in a row): %s", name, n, exc)
-            if n == 60:
+            if n >= SYMBOL_FAIL_ALERT:
                 self._alert(f"{name} failing for {n} loops: {exc} (the other symbols keep trading)",
                             key=f"symfail-{name}", every=6 * 3600)
             return
-        if self._sym_fail.pop(name, 0) >= 60:
+        if self._sym_fail.pop(name, 0) >= SYMBOL_FAIL_ALERT:
+            self.notifier.reset(f"symfail-{name}")  # a new failure is notified again after 60 loops
             self._alert(f"{name} works again")
+
+    def failing(self) -> list[str]:
+        """Symbols (and ES) failing for SYMBOL_FAIL_ALERT loops or more in a row."""
+        return sorted(n for n, k in self._sym_fail.items() if k >= SYMBOL_FAIL_ALERT)
 
     def _save_state(self) -> None:
         """Write the state when it changed; equity-only changes at most every STATE_SAVE_SECONDS."""
@@ -359,113 +401,280 @@ class LiveEngine:
         m = utc_to_market(utc)
         return m.weekday() < 5 and (m.month, m.day) not in FX_HOLIDAYS
 
-    def _check_clock(self, utc: datetime) -> None:
-        """Verify the server clock from fresh ticks and watch the price feed.
+    def _session_open_utc(self, utc: datetime) -> datetime | None:
+        """UTC start (00:00 market time) of the current market day when the market was closed the day before
+        (Monday after the weekend, the day after Dec 25 / Jan 1), else None."""
+        m = utc_to_market(utc)
+        prev = m.date() - timedelta(days=1)
+        if prev.weekday() >= 5 or (prev.month, prev.day) in FX_HOLIDAYS:
+            return market_to_utc(datetime(m.year, m.month, m.day))
+        return None
 
-        A measurement is valid only when the server time advanced within the last TICK_FRESH seconds AND lies
-        within CLOCK_TOL of a whole half-hour offset from real UTC (a stale weekend tick never qualifies).
-        auto: a different offset is adopted after CLOCK_CONFIRM identical observations (persisted, notified);
-        new entries wait until the clock was verified after start-up. ny7 / fixed: CLOCK_CONFIRM mismatches
-        in a row block new entries until the clock matches again."""
-        st = self.broker.server_time()
+    def _track_ticks(self, ticks: dict, utc: datetime) -> tuple[bool, datetime | None]:
+        """Per symbol: did its OWN tick time advance since its previous successful read? The first read after a
+        symbol was unreadable (terminal just started, reconnect, symbol re-enabled) never counts, so a stale
+        Friday tick that becomes readable on a Saturday cannot look like a new tick.
+        Returns (any advance: the feed moves, newest advanced tick time whose previous read was at most
+        TICK_FRESH seconds ago: a tick at most that old, usable for a clock observation)."""
+        moved, fresh = False, None
+        old = {s: v for s, v in self._sym_tick.items() if s in ticks}
+        self._sym_tick = {}
+        for s, t in ticks.items():
+            if t is None:
+                continue  # unreadable now: its next successful read starts afresh
+            self._sym_tick[s] = (t.time, utc)
+            prev = old.get(s)
+            if prev is None or t.time <= prev[0]:
+                continue
+            moved = True
+            if (utc - prev[1]).total_seconds() <= TICK_FRESH:
+                fresh = t.time if fresh is None else max(fresh, t.time)
+        return moved, fresh
+
+    def _check_clock(self, utc: datetime, moved: bool, fresh: datetime | None) -> None:
+        """Watch the price feed and verify the server clock (shared rule with the EA, spec section 3).
+
+        * Stale feed: notified when no symbol's tick advanced for monitor.stale_feed_minutes on a market day,
+          counted from the last advance but never from before the current session's open (+ SESSION_GRACE).
+        * Observation: only from a tick that advanced within the last TICK_FRESH seconds, only while the market
+          is open (a stale weekend tick never counts): server - UTC rounded to 30 minutes. A fresh tick that is
+          not within CLOCK_TOL of a whole half-hour offset is no observation: the PC clock is off (notified after
+          CLOCK_CONFIRM in a row, then every 6 hours).
+        * auto: new entries wait for the first observation after start-up that confirms the clock in use (the
+          persisted offset, else the NY7 rule); a different offset is adopted after CLOCK_CONFIRM identical
+          observations (persisted, notified).
+        * every mode: CLOCK_CONFIRM consecutive mismatches that are not adopted block new entries until the clock
+          matches again. Closes, time stops, TP management and hard stops always run with the clock in use."""
         if self._watch_from_utc is None:
             self._watch_from_utc = utc
-        if st is None:
-            return
-        prev, self._prev_st = self._prev_st, st
-        if prev is not None and st > prev:
+        if moved:
             self._st_moved_utc = self._watch_from_utc = utc
-        stale = utc - self._watch_from_utc
-        if stale > timedelta(minutes=self.cfg.monitor.stale_feed_minutes) and self._market_open(utc):
-            self._alert(f"no price updates for {stale.total_seconds() / 60:.0f} min on a market day (terminal "
-                        f"disconnected? feed stopped?)", key="stale-feed", every=3600)
-        if self._st_moved_utc is None or (utc - self._st_moved_utc).total_seconds() > TICK_FRESH:
-            return  # no fresh tick: no measurement (weekend, holiday, frozen feed)
-        diff = (st - utc).total_seconds()
+        if self._market_open(utc):
+            since = self._watch_from_utc
+            opened = self._session_open_utc(utc)
+            if opened is not None and since < opened:
+                since, ref = opened, opened + SESSION_GRACE  # Monday / after a holiday: not since Friday
+            else:
+                ref = since
+            if utc - ref > timedelta(minutes=self.cfg.monitor.stale_feed_minutes):
+                self._alert(f"no price updates for {(utc - since).total_seconds() / 60:.0f} min on a market day "
+                            f"(terminal disconnected? feed stopped?)", key="stale-feed", every=3600)
+        if fresh is None or not self._market_open(utc):
+            return  # no fresh tick: no observation (weekend, holiday, frozen feed, stale tick)
+        auto = self.cfg.broker.server_time_mode == "auto"
+        diff = (fresh - utc).total_seconds()
         nearest = round(diff / 1800.0) * 1800.0
         if abs(diff - nearest) > CLOCK_TOL or abs(nearest) > 14 * 3600:
-            self._alert(f"server time {st:%Y-%m-%d %H:%M:%S} vs VPS UTC {utc:%Y-%m-%d %H:%M:%S}: no whole half-hour "
-                        f"offset ({diff - nearest:+.0f} s) -> check the Windows time synchronisation",
-                        key="clock-drift", every=6 * 3600)
+            self._drift_n += 1
+            off = diff - nearest if abs(nearest) <= 14 * 3600 else diff
+            if self._drift_n >= CLOCK_CONFIRM:
+                effect = ("new entries wait until the broker clock is verified" if auto and not self.clock_verified
+                          else "trading continues with the clock in use")
+                self._alert(f"PC CLOCK: server time {fresh:%Y-%m-%d %H:%M:%S} vs VPS UTC {utc:%Y-%m-%d %H:%M:%S} is "
+                            f"{off:+.0f} s off a whole half-hour offset ({self._drift_n} observations in a row) -> "
+                            f"check the Windows time synchronisation; {effect}", key="clock-drift", every=6 * 3600)
             return
+        self._drift_n = 0
         observed = nearest / 3600.0
         expected = (self.clock.utc_to_server(utc) - utc).total_seconds() / 3600.0
-        auto = self.cfg.broker.server_time_mode == "auto"
         if abs(observed - expected) < 0.01:
-            self._clock_cand, self._clock_n = None, 0
+            self._clock_cand, self._clock_n, self._clock_mis = None, 0, 0
             if not self.clock_verified:
                 self.clock_verified = True
                 log.info("server clock verified: %s (offset %+.1f h)", self.clock, observed)
             if self.clock_problem:
                 self.clock_problem = ""
-                self._alert(f"broker clock matches the configured {self.clock} again ({observed:+.1f} h): new "
-                            f"entries allowed")
+                self._alert(f"broker clock matches the {'clock in use' if auto else 'configured'} {self.clock} again "
+                            f"({observed:+.1f} h): new entries allowed")
             if auto and (self.state.clock_mode, self.state.clock_offset) != (self.clock.mode, self.clock.offset):
                 self.state.clock_mode, self.state.clock_offset = self.clock.mode, self.clock.offset
             return
+        self._clock_mis += 1
         if auto:
-            self.clock_verified = False
             self._clock_n = self._clock_n + 1 if self._clock_cand == observed else 1
             self._clock_cand = observed
+            if self._clock_mis <= CLOCK_CONFIRM:
+                log.info("server clock observation %+.1f h differs from %+.1f h in use (%d/%d identical)", observed,
+                         expected, self._clock_n, CLOCK_CONFIRM)
             if self._clock_n >= CLOCK_CONFIRM:
                 old, first = self.clock, not self.state.clock_mode
-                mode, off = detect_server_mode(st, utc)
+                mode, off = detect_server_mode(fresh, utc)
                 self.clock = ServerClock(mode, off)
                 self.state.clock_mode, self.state.clock_offset = mode, off
                 self.clock_verified = True
-                self._clock_cand, self._clock_n = None, 0
+                self._clock_cand, self._clock_n, self._clock_mis = None, 0, 0
+                self.clock_problem = ""
                 self._alert(f"server clock {'detected' if first else 'CHANGED'}: {self.clock} (observed offset "
                             f"{observed:+.1f} h, was {old}; persisted)")
-        else:
-            self._clock_n += 1
-            if self._clock_n >= CLOCK_CONFIRM:
-                self.clock_problem = f"broker clock mismatch: observed {observed:+.1f} h, expected {expected:+.1f} h"
-                self._alert(f"NEW ENTRIES BLOCKED: {self.clock_problem} (check broker.server_time_mode)",
-                            key="clock-mismatch", every=3600, level=logging.ERROR)
+                return
+        elif self._clock_mis <= CLOCK_CONFIRM:
+            log.info("server clock observation %+.1f h differs from the configured %+.1f h (%d/%d)", observed,
+                     expected, self._clock_mis, CLOCK_CONFIRM)
+        if self._clock_mis >= CLOCK_CONFIRM:
+            self.clock_problem = f"broker clock mismatch: observed {observed:+.1f} h, expected {expected:+.1f} h"
+            self._alert(f"NEW ENTRIES BLOCKED: {self.clock_problem} "
+                        f"({'observations disagree' if auto else 'check broker.server_time_mode'})",
+                        key="clock-mismatch", every=3600, level=logging.ERROR)
 
     def entry_block(self) -> str:
         """Why new entries are not allowed right now ('' = allowed)."""
         if self.cfg.broker.server_time_mode == "auto" and not self.clock_verified:
+            if self._drift_n >= CLOCK_CONFIRM:
+                return "server clock not verified yet (PC clock off - check the Windows time synchronisation)"
             return "server clock not verified yet (waiting for fresh ticks)"
-        return self.clock_problem
+        if self.clock_problem:
+            return self.clock_problem
+        if not self.state.cash_init:
+            return "deal history not confirmed complete yet (first run)"
+        if self._cash_problem:
+            return self._cash_problem
+        if self._flow_pending:
+            return "balance change not in the deal history yet (cash flow pending)"
+        return ""
 
     # ------------------------------------------------------------------ cash flows
-    def _scan_cash_flows(self, equity: float) -> float:
-        """Deposits / withdrawals / credit / bonus since the last loop, de-duplicated by deal ticket. On the very
-        first scan the existing deals are only marked as seen (they are history, not new flows). Returns the
-        equity the guards must use (read again when new flows were found, so that it contains them)."""
-        flows = self.broker.cash_flows()
+    def _cash_check(self) -> float:
+        """Deposits / withdrawals / credit / bonus since the last loop, de-duplicated by deal ticket, applied
+        BEFORE the guards (shared rule with the EA, spec section 5). Returns the equity this loop's guards use:
+        read ONCE after the deal scan, so k = E / (E - F) and the guards see an equity that contains every flow
+        found. Sets:
+          _flow_pending: balance + credit changed since the last explained change and no new deal of any type
+                         (trade or cash) explains it yet: no peak raise, no halt / month / day stop decision and no
+                         entry in this loop; closes, time stops and TP management continue. At most
+                         FLOW_PENDING_SECONDS, then the change counts as profit / loss (notified).
+          _cash_problem: the deal history cannot be read: new entries wait; closes, time stops and the hard stops
+                         continue with the account equity.
+        First run (no cash_init): see _try_prime."""
+        self._flow_pending = False
+        st = self.state
+        try:
+            scan = self.broker.cash_scan(fresh=self._pending_since is not None)
+            primed = st.cash_init or self._try_prime(scan)
+        except Exception as exc:  # noqa: BLE001 - isolated: never stops closes, time stops or hard stops
+            if not self._cash_problem:
+                log.exception("cash-flow check failed: %s", exc)
+            self._cash_problem = f"deal history cannot be read ({exc})"
+            self._alert(f"cash-flow check failed: {exc} -> new entries wait; closes, time stops and hard stops "
+                        f"continue", key="cash-check", every=1800, level=logging.ERROR)
+            return self.broker.account_equity()
+        if self._cash_problem:
+            self._cash_problem = ""
+            log.warning("cash-flow check works again")
+        self._balance = scan.balance
+        equity = scan.equity
+        if not primed:
+            return equity
+        seen = {int(t) for t, _ in st.cash_tickets}
+        new = sorted((f for f in scan.flows if int(f.ticket) not in seen), key=lambda f: (f.time, f.ticket))
+        money = scan.money
+        if money is not None:  # the broker knows balance + credit and the deal tickets: lag guard
+            now = time.monotonic()
+            expired = self._pending_since is not None and now - self._pending_since > FLOW_PENDING_SECONDS
+            if scan.scan_money is not None and abs(money - scan.scan_money) >= 0.005 and not expired:
+                # a deal was booked between the history read and the account read: the equity may contain a flow
+                # the scan missed -> nothing is applied, decided on the next loop
+                return self._pending(now, money, equity)
+            if self._money_ref is not None and abs(money - self._money_ref) < 0.005:
+                self._pending_since = None
+                return equity  # nothing changed: a cash deal seen before its balance change waits for it
+            fresh = scan.newest_deal is not None and (self._deal_ref is None or scan.newest_deal > self._deal_ref)
+            if not (new or fresh or self._money_ref is None or expired):
+                return self._pending(now, money, equity)
+            if not (new or fresh or self._money_ref is None):
+                self._alert(f"balance / credit changed by {money - self._money_ref:+,.2f} without a matching deal in "
+                            f"the history for {FLOW_PENDING_SECONDS:.0f} s: treated as profit/loss",
+                            key="flow-unexplained", every=600)
+            self._money_ref, self._deal_ref, self._pending_since = money, scan.newest_deal, None
+        if new:
+            self._mark_seen(new)
+            rest = sum(f.amount for f in new)
+            for f in new:  # in time order; E_i = equity without the flows booked after this one
+                rest -= f.amount
+                msg = self.risk.apply_cash_flow(f.amount, equity - rest)
+                self._alert(f"{msg} [deal {f.ticket}{' ' + f.comment if f.comment else ''}]")
+        return equity
+
+    def _pending(self, now: float, money: float, equity: float) -> float:
+        if self._pending_since is None:
+            self._pending_since = now
+            log.warning("balance + credit %s -> %.2f but no new deal in the history yet: cash flow pending (no peak "
+                        "raise, no stop decision, no entry; at most %.0f s)",
+                        "?" if self._money_ref is None else f"{self._money_ref:.2f}", money, FLOW_PENDING_SECONDS)
+        self._flow_pending = True
+        return equity
+
+    def _mark_seen(self, flows: list) -> None:
+        """Remember cash deal tickets (60 days: the broker scan looks back 30)."""
         st = self.state
         seen = {int(t) for t, _ in st.cash_tickets}
-        new = sorted((f for f in flows if int(f.ticket) not in seen), key=lambda f: (f.time, f.ticket))
-        if new:
-            st.cash_tickets = st.cash_tickets + [[int(f.ticket), _epoch(f.time)] for f in new]
-        if st.cash_tickets:  # keep 60 days (the broker scan looks back 30)
-            ref = max(e for _, e in st.cash_tickets)
+        add = []
+        for f in flows:
+            if int(f.ticket) not in seen:
+                seen.add(int(f.ticket))
+                add.append([int(f.ticket), _epoch(f.time)])
+        tickets = st.cash_tickets + add
+        if tickets:
+            ref = max(e for _, e in tickets)
             now_st = self.broker.server_time()
             if now_st is not None:
                 ref = max(ref, _epoch(now_st))
-            kept = [[t, e] for t, e in st.cash_tickets if e >= ref - 60 * 86400]
-            if len(kept) != len(st.cash_tickets):
-                st.cash_tickets = kept
-        if not st.cash_init:
-            st.cash_init = True
-            if new:
-                log.info("cash flows: %d existing balance/credit/bonus deals marked as seen (not applied)", len(new))
-            return equity
-        if not new:
-            return equity
-        equity = self.broker.account_equity()  # a flow booked after the first read must be in E
-        rest = sum(f.amount for f in new)
-        for f in new:  # in time order; E_i = equity without the flows booked after this one
-            rest -= f.amount
-            msg = self.risk.apply_cash_flow(f.amount, equity - rest)
-            self._alert(f"{msg} [deal {f.ticket}{' ' + f.comment if f.comment else ''}]")
-        return equity
+            tickets = [[t, e] for t, e in tickets if e >= ref - 60 * 86400]
+        if tickets != st.cash_tickets:
+            st.cash_tickets = tickets
+
+    def _try_prime(self, scan) -> bool:
+        """First run (no cash-flow cursor yet): the deals already in the history are history, not new flows - but
+        they are marked as seen only once the history looks complete (shared rule with the EA): the whole history
+        adds up to the balance (credit deals to the credit), or the set of cash deals stayed the same for
+        PRIME_STABLE_SECONDS. After PRIME_MAX_SECONDS it is primed anyway, with a warning. Until then new entries
+        wait (closes, time stops and the guards keep working). A broker that cannot check it primes at once."""
+        now = time.monotonic()
+        if self._prime_start is None:
+            self._prime_start = now
+        hc = self.broker.history_check()
+        tickets = frozenset(int(f.ticket) for f in hc.flows)
+        if self._prime_ref is None or self._prime_ref[0] != tickets:
+            self._prime_ref = (tickets, now)
+        stable = now - self._prime_ref[1] >= PRIME_STABLE_SECONDS
+        late = now - self._prime_start >= PRIME_MAX_SECONDS
+        if hc.complete is False and not stable and not late:
+            if not self._prime_note:
+                self._prime_note = True
+                log.warning("first run: waiting until the deal history is complete before the cash-flow tracking "
+                            "starts (%s); new entries wait", hc.detail)
+            return False
+        st = self.state
+        self._mark_seen(list(hc.flows) + list(scan.flows))
+        st.cash_init = True
+        how = {True: "the deals add up to the balance", None: "the history cannot be checked"}.get(
+            hc.complete, "the cash deals were unchanged for 60 s" if stable else "NOT confirmed")
+        log.info("cash-flow tracking started: %d existing balance/credit/bonus deals marked as seen, not applied (%s)",
+                 len(tickets), how)
+        if hc.complete is False and not stable:
+            self._alert(f"WARNING: the deal history was not confirmed complete within {PRIME_MAX_SECONDS / 60:.0f} min "
+                        f"({hc.detail}). Its {len(tickets)} cash deals are marked as seen anyway: a deposit or "
+                        f"withdrawal that reaches the history later is treated as a new cash flow", level=logging.ERROR)
+        self._money_ref = self._deal_ref = None  # the check of this loop takes balance + credit as the reference
+        self._prime_start = self._prime_ref = None
+        return True
+
+    def _apply_reset_request(self, equity: float) -> None:
+        """`reset-halt` request stored in the state: applied after the cash-flow check of this start, so that a
+        deposit made while the engine was stopped has already been applied to the old peak."""
+        st = self.state
+        if not st.reset_request:
+            return
+        msg = self.risk.reset_halt(equity if st.reset_request == "rebase" else None)
+        st.reset_request = ""
+        self._alert(f"RESET HALT (python main.py reset-halt, applied after the cash-flow check): {msg}")
+        self.journal.trade({"event": "reset_halt", "time_utc": f"{self._utcnow():%Y-%m-%d %H:%M:%S}",
+                            "reason": f"applied by the engine: {msg}"})
 
     # ------------------------------------------------------------------ monitoring
     def _new_day(self, before: tuple, utc: datetime) -> None:
-        """Equity log row and daily summary for the market day that just ended."""
+        """Equity log row and daily summary for the market day that just ended. The market day changes with the
+        server time, i.e. at the first price of the next market day: Friday's summary arrives at the Monday open
+        (the weekday in the text says which day it covers)."""
         st = self.state
         prev_day, _, close, peak, month_start, opens, closes = before
         dd = max(0.0, 1 - close / peak) if peak > 0 and close > 0 else 0.0
@@ -474,10 +683,17 @@ class LiveEngine:
         self.journal.equity({"market_date": prev_day, "time_utc": f"{utc:%Y-%m-%d %H:%M:%S}", "close_equity": close,
                              "peak_equity": peak, "drawdown": dd, "month_return": mret,
                              "cash_flow_total": st.cash_flow_total, "opens": opens, "closes": closes,
-                             "halted": st.halted, "entries_blocked": block})
+                             "halted": st.halted, "entries_blocked": block,
+                             "balance": self._balance if self._balance is not None else ""})
         if self.cfg.monitor.daily_summary:
-            parts = [f"DAILY {prev_day}: equity {close:,.2f} {self.broker.account_currency()}", f"DD {dd:.1%}",
-                     f"month-to-date {mret:+.2%} (flow-adjusted)", f"trades opened {opens} / closed {closes}"]
+            try:
+                wd = f" {datetime.strptime(prev_day, '%Y-%m-%d'):%a}"
+            except ValueError:
+                wd = ""
+            bal = f" (balance {self._balance:,.2f})" if self._balance is not None else ""
+            parts = [f"DAILY {prev_day}{wd}: equity {close:,.2f} {self.broker.account_currency()}{bal}",
+                     f"DD {dd:.1%}", f"month-to-date {mret:+.2%} (flow-adjusted)",
+                     f"trades opened {opens} / closed {closes}"]
             if st.halted:
                 parts.append(f"HALTED ({st.halt_reason}) -> python main.py reset-halt")
             if st.month_halted or st.day_halted:
@@ -486,6 +702,8 @@ class LiveEngine:
                 parts.append(f"entries blocked: {block}")
             if self.disabled:
                 parts.append(f"unavailable symbols: {', '.join(sorted(self.disabled))}")
+            if self.failing():
+                parts.append("failing: " + ", ".join(f"{n} ({self._sym_fail[n]} loops)" for n in self.failing()))
             if self.notifier.failed_total:
                 parts.append(f"notification failures so far: {self.notifier.failed_total}")
             self._alert(" | ".join(parts), level=logging.INFO)
@@ -536,10 +754,10 @@ class LiveEngine:
         self._last_heartbeat = time.monotonic()
         mem = process_memory_mb()
         log.info("heartbeat: server=%s market=%s utc=%s equity=%.2f DD=%.1f%% open=%d halted=%s clock=%s%s "
-                 "entries=%s unavailable=%s mem=%s notify_failures=%d | GreatestTrader=%s %s", now_server, now_mkt,
-                 now_utc, equity, self.risk.drawdown(equity) * 100, len(positions), self.state.halted, self.clock,
-                 "" if self.clock_verified else " (unverified)", self.entry_block() or "allowed",
-                 sorted(self.disabled) or "-", f"{mem:.0f}MB" if mem is not None else "n/a",
+                 "entries=%s unavailable=%s failing=%s mem=%s notify_failures=%d | GreatestTrader=%s %s", now_server,
+                 now_mkt, now_utc, equity, self.risk.drawdown(equity) * 100, len(positions), self.state.halted,
+                 self.clock, "" if self.clock_verified else " (unverified)", self.entry_block() or "allowed",
+                 sorted(self.disabled) or "-", self.failing() or "-", f"{mem:.0f}MB" if mem is not None else "n/a",
                  self.notifier.failed_total, __version__, format_versions({**versions(), **self.broker.versions()}))
 
     # ------------------------------------------------------------------ trade journal
@@ -709,12 +927,20 @@ class LiveEngine:
     # ------------------------------------------------------------------ execution
     def _open_risk(self, positions: list[PositionView]) -> list[PositionView]:
         """Attach the remaining risk (loss to stop, account currency) to each position.
-        Only needed (and only priced) when the total-risk cap is on."""
+        Only needed (and only priced) when the total-risk cap is on. Fail closed (EA: same rule): an own position
+        WITHOUT a stop loss, or one that cannot be priced, counts as unlimited risk and fills the cap; a stop at
+        or beyond the entry price leaves no remaining risk."""
         if self.cfg.risk.max_total_risk <= 0:
             return positions
         for p in positions:
             p.risk_amount = 0.0
-            if p.sl and ((p.direction > 0 and p.sl < p.open_price) or (p.direction < 0 and p.sl > p.open_price)):
+            if not p.sl:
+                p.risk_amount = float("inf")
+                self._alert(f"{p.strategy} {p.symbol} ticket={p.ticket} has NO stop loss: its open risk counts as "
+                            f"unlimited, so the total-risk cap blocks new entries until it has a stop or is closed",
+                            key=f"nosl-{p.ticket}", every=6 * 3600)
+                continue
+            if (p.direction > 0 and p.sl < p.open_price) or (p.direction < 0 and p.sl > p.open_price):
                 try:
                     p.risk_amount = self.broker.loss_per_lot(p.symbol, p.direction, p.open_price, p.sl) * p.volume
                 except Exception as exc:  # noqa: BLE001 - fail closed: an unpriced position fills the risk cap
@@ -816,11 +1042,27 @@ class LiveEngine:
             res = self.broker.modify_position(act.ticket, act.symbol, pos.sl, act.tp_price)
             if res.ok:
                 log.info("MODIFY %s %s TP -> %s (%s)", pos.strategy, act.symbol, act.tp_price, act.reason)
+            elif self._beyond_tp(pos, act):
+                # the TP can never be placed: a fresh quote is already past it -> take the profit at market
+                self._close(CloseRequest(act.ticket, act.symbol, "price beyond TP (TP not placeable)"))
             else:
-                log.warning("modify failed %s: %s", act.symbol, res.message)
-                # if the TP cannot be placed because price is already past it, close instead
-                if act.tp_price is not None:
-                    self._close(CloseRequest(act.ticket, act.symbol, "TP not placeable, close"))
+                # any other failure (too many requests, no connection, a lost reply, stops / freeze level, ...): the
+                # position keeps its SL and the time stop, the TP is sent again on the next bar (EA: same rule)
+                log.warning("modify failed %s ticket=%s: %s (SL kept, TP retried next bar)", act.symbol, act.ticket,
+                            res.message)
+
+    def _beyond_tp(self, pos: PositionView, act: ModifyRequest) -> bool:
+        """True when a fresh quote is already at or beyond the requested TP (bid for a long, ask for a short)."""
+        if act.tp_price is None:
+            return False
+        try:
+            t = self.broker.tick(act.symbol)
+        except Exception:  # noqa: BLE001 - no quote: nothing proves the TP is unplaceable
+            return False
+        if t is None:
+            return False
+        px = t.bid if pos.direction > 0 else t.ask
+        return px >= act.tp_price if pos.direction > 0 else px <= act.tp_price
 
     def _close(self, req: CloseRequest) -> None:
         if self.cfg.engine.dry_run:

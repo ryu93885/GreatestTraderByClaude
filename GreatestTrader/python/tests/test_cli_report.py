@@ -10,6 +10,7 @@ import pytest
 import fake_mt5
 import main
 from fake_mt5 import S
+from fakes import synthetic_m15
 from greatest_trader.broker import mt5_broker
 from greatest_trader.config import Config
 from greatest_trader.journal import TradeJournal
@@ -38,18 +39,22 @@ def write_cfg(tmp_path):
     return p
 
 
-def test_reset_halt_clears_the_halt_and_keeps_the_state(tmp_path):
+def test_reset_halt_stores_a_request_and_keeps_the_state(tmp_path):
+    """reset-halt only stores the request: the engine applies it at its next start after the cash-flow check
+    (test_live_ops: test_reset_halt_is_applied_after_the_first_cash_flow_check)."""
     cfg = write_cfg(tmp_path)
     st = RiskState(peak_equity=10_000, last_equity=7_900, halted=True, halt_reason="max drawdown 21.0% reached",
                    account_login=5, cash_init=True, cash_tickets=[[9, 0.0]], clock_mode="ny7")
     st.save(tmp_path / "state" / "state.json")
-    assert main.main(["reset-halt", "-c", str(cfg), "--rebase-peak"]) == 0  # MT5 absent: last equity is used
+    assert main.main(["reset-halt", "-c", str(cfg), "--rebase-peak"]) == 0
     st2 = RiskState.load(tmp_path / "state" / "state.json")
-    assert not st2.halted and st2.peak_equity == 7_900
+    assert st2.reset_request == "rebase" and st2.halted and st2.peak_equity == 10_000
     assert (st2.account_login, st2.cash_tickets, st2.clock_mode) == (5, [[9, 0.0]], "ny7")
     j = pd.read_csv(tmp_path / "journal" / f"trades_{datetime.now(timezone.utc):%Y}.csv")
-    assert j.event.tolist() == ["reset_halt"] and "peak equity rebased" in j.reason.iloc[0]
+    assert j.event.tolist() == ["reset_halt"] and "rebase the peak" in j.reason.iloc[0]
     assert list((tmp_path / "logs").glob("reset-halt_*.log"))
+    assert main.main(["reset-halt", "-c", str(cfg)]) == 0
+    assert RiskState.load(tmp_path / "state" / "state.json").reset_request == "clear"
 
 
 def test_reset_halt_refuses_while_the_engine_runs(tmp_path):
@@ -162,3 +167,145 @@ def test_edge_monitor_table(tmp_path):
                      "ticket": k})
     t = edge_monitor_table(j.closed_trades(), 250)
     assert t.status.tolist() == ["WARN", "REVIEW", "ok"] and t.trades.tolist() == [60, 70, 250]
+
+
+def test_backtest_command_loads_conversion_pairs_from_the_data_dir(tmp_path, capsys):
+    """A pair that is not traded but sits in data_dir converts the lots of a traded symbol (GBPCHF in a USD
+    account needs USDCHF): the 20-lot cap binds."""
+    cfg = backtest_setup(tmp_path, (("GBPCHF", 1.25, 1), ("USDCHF", 0.92, 2), ("AUDNZD", 1.08, 3)), ["GBPCHF"])
+    assert main.main(["backtest", "-c", str(cfg)]) == 0
+    out = capsys.readouterr().out
+    assert "conversion pairs (not traded): USDCHF" in out and "AUDNZD" not in out
+    t = pd.read_csv(tmp_path / "out" / "trades.csv")
+    assert len(t) and (abs(t.lots - 20) < 1e-9).all()
+
+
+def backtest_setup(tmp_path, pairs, traded, equity=1_000_000_000):
+    d = tmp_path / "data"
+    d.mkdir()
+    for s, b, seed in pairs:
+        synthetic_m15(datetime(2021, 3, 1), 10, b, 0.0001, seed=seed, spike_at=datetime(2021, 3, 3, 0, 30)) \
+            .rename_axis("time").to_csv(d / f"{s}_M15.csv")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"night_reversion:\n  symbols: [{', '.join(traded)}]\neuro_session:\n  enabled: false\nbroker:\n"
+                   f"  server_time_mode: ny7\nrisk:\n  blackout_start: ''\n  blackout_end: ''\n"
+                   f"engine:\n  log_dir: {tmp_path / 'logs'}\n  state_file: {tmp_path / 'state.json'}\n"
+                   f"backtest:\n  data_dir: {d}\n  output_dir: {tmp_path / 'out'}\n  initial_equity: {equity}\n",
+                   encoding="utf-8")
+    return cfg
+
+
+def test_backtest_output_survives_a_non_utf8_redirected_stdout(tmp_path):
+    """Redirected output on an English Windows (cp1252) crashed on the Japanese tables before the report was
+    written. stdout is switched to UTF-8 (errors replaced)."""
+    import os
+    import subprocess
+    import sys
+    cfg = backtest_setup(tmp_path, (("GBPCHF", 1.25, 1), ("USDCHF", 0.92, 2)), ["GBPCHF"], equity=10_000)
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+    r = subprocess.run([sys.executable, str(Path(main.__file__)), "backtest", "-c", str(cfg)], env=env,
+                       capture_output=True, timeout=300)
+    assert r.returncode == 0, r.stdout.decode("utf-8", "replace")[-2000:] + r.stderr.decode("utf-8", "replace")
+    assert "月利".encode("utf-8") in r.stdout and (tmp_path / "out" / "summary.txt").exists()
+
+
+# ------------------------------------------------------------------ exit codes (3_run_live.bat stops on 10)
+@pytest.mark.parametrize("body, text", [
+    ("risk:\n  max_lot_per_order: 20\n", "unknown config key: risk.max_lot_per_order"),
+    ("risk:\n\tmax_lots_per_order: 20\n", "not valid YAML"),
+    ("preset: classic_standard\nrisk:\n  risk_nr: 0.005\n", "only apply with risk.profile: custom"),
+    ("risk:\n  max_drawdown_halt: 2\n", "max_drawdown_halt"),
+    ("preset: nosuchpreset\n", "unknown preset"),
+])
+def test_config_errors_stop_with_exit_code_10(tmp_path, capsys, body, text):
+    p = tmp_path / "config.yaml"
+    p.write_text(body, encoding="utf-8")
+    assert main.main(["live", "-c", str(p), "--live-orders"]) == 10
+    out = capsys.readouterr().out
+    assert "CONFIG ERROR" in out and text in out
+    assert main.main(["live", "-c", str(tmp_path / "missing.yaml")]) == 10
+
+
+def test_missing_metatrader5_package_stops_with_exit_code_10(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(mt5_broker, "mt5", None)
+    assert main.main(["live", "-c", str(write_cfg(tmp_path)), "--live-orders"]) == 10
+    out = capsys.readouterr().out
+    assert "MetaTrader5 package is not installed" in out and "setup_windows.bat" in out
+
+
+def test_help_lists_the_exit_codes(capsys):
+    with pytest.raises(SystemExit):
+        main.main(["--help"])
+    out = capsys.readouterr().out
+    assert "exit codes:" in out and "10  stopped on purpose" in out and "0 normal" not in out
+
+
+# ------------------------------------------------------------------ report --from, download
+def report_months(tmp_path, monkeypatch, frm, deals=None):
+    fake_mt5.reset()
+    monkeypatch.setattr(mt5_broker, "mt5", fake_mt5)
+    S.deals = [deal(*d) for d in (DEALS_12M if deals is None else deals)]
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cfg = write_cfg(tmp_path)
+    assert main.main(["report", "-c", str(cfg), "--from", frm]) == 0
+    m = pd.read_csv(tmp_path / "out" / "live_report" / "monthly_returns.csv", index_col=0)
+    by = pd.read_csv(tmp_path / "out" / "live_report" / "pnl_by_strategy.csv")
+    return list(m.index), float(by.pnl.sum()) if len(by) else 0.0
+
+
+DEALS_12M = [("2025-11-02", 2, 10_000.0, 0, 0)] + [(f"2026-{m:02d}-10", 1, 100.0, 7101, 1) for m in range(1, 13)]
+
+
+def test_report_from_is_parsed_as_a_month(tmp_path, monkeypatch):
+    full = [f"2026-{m:02d}" for m in range(1, 13)]
+    assert report_months(tmp_path / "a", monkeypatch, "2026-01") == (full, 1200.0)
+    assert report_months(tmp_path / "b", monkeypatch, "2026-1") == (full, 1200.0)  # was: only Oct-Dec in the table
+    months, pnl = report_months(tmp_path / "c", monkeypatch, "2026-02-15")  # the month of that day
+    assert months == full[1:] and pnl == 1100.0  # table and P/L by strategy cover the same months
+    with pytest.raises(SystemExit):
+        main.main(["report", "-c", str(write_cfg(tmp_path)), "--from", "Feb"])
+
+
+def test_report_with_an_empty_history(tmp_path, monkeypatch):
+    assert report_months(tmp_path, monkeypatch, "2026-01", deals=[]) == ([], 0.0)  # was: TypeError
+    assert "no deals in the history" in (tmp_path / "out" / "live_report" / "summary.txt").read_text(encoding="utf-8")
+
+
+def test_history_none_with_success_is_an_empty_history(tmp_path, monkeypatch):
+    fake_mt5.reset()
+    monkeypatch.setattr(mt5_broker, "mt5", fake_mt5)
+    monkeypatch.setattr(fake_mt5, "history_deals_get", lambda *a, **k: None)  # last_error() = (1, 'Success')
+    b = mt5_broker.MT5Broker(Config())
+    b.connect()
+    assert len(b.history_deals(datetime(2000, 1, 1), datetime(2030, 1, 1))) == 0 and b.cash_flows() == []
+    monkeypatch.setattr(fake_mt5, "last_error", lambda: (-10005, "IPC timeout"))
+    with pytest.raises(RuntimeError, match="history_deals_get failed"):
+        b.history_deals(datetime(2000, 1, 1), datetime(2030, 1, 1))
+
+
+def test_download_continues_after_a_missing_pair(tmp_path, monkeypatch, capsys):
+    import numpy as np
+    fake_mt5.reset()
+    monkeypatch.setattr(mt5_broker, "mt5", fake_mt5)
+    for s in ("GBPJPY", "EURUSD"):  # EURJPY (first in the list) is not offered by this broker
+        S.specs[s] = dict(digits=3 if s.endswith("JPY") else 5, point=0.001 if s.endswith("JPY") else 0.00001,
+                          volume_min=0.01, volume_max=100, volume_step=0.01, trade_stops_level=0)
+    dt = np.dtype([("time", "<i8"), ("open", "<f8"), ("high", "<f8"), ("low", "<f8"), ("close", "<f8"),
+                   ("tick_volume", "<u8"), ("spread", "<i4"), ("real_volume", "<u8")])
+
+    def copy_rates_range(name, tf, t0, t1):
+        a = np.zeros(4, dtype=dt)
+        a["time"] = int(t0.timestamp()) // 900 * 900 + np.arange(4) * 900
+        a["open"] = a["high"] = a["low"] = a["close"] = 1.0
+        a["spread"] = 10
+        return a
+
+    monkeypatch.setattr(fake_mt5, "copy_rates_range", copy_rates_range, raising=False)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"night_reversion:\n  symbols: [EURJPY, GBPJPY]\nengine:\n  log_dir: {tmp_path / 'logs'}\n"
+                   f"  state_file: {tmp_path / 'state.json'}\nbacktest:\n  data_dir: {tmp_path / 'data'}\n",
+                   encoding="utf-8")
+    assert main.main(["download", "-c", str(cfg), "--years", "0.01"]) == 0
+    assert sorted(p.name for p in (tmp_path / "data").glob("*.csv")) == ["EURUSD_M15.csv", "GBPJPY_M15.csv"]
+    out = capsys.readouterr().out
+    assert "NOT downloaded (1)" in out and "EURJPY" in out

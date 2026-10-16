@@ -2,7 +2,8 @@
 
 * journal/trades_YYYY.csv : one row per entry (event=open) and per closed position (event=close), plus
   operator events (reset_halt). R = P/L / risk amount of the trade (money lost at the stop at entry).
-* journal/equity_log.csv  : one row per market day (written at the day change).
+* journal/equity_log.csv  : one row per market day (written at the day change): closing equity, peak, drawdown,
+  month-to-date return, cash flows so far, account balance, trades, halt / entry-block status.
 
 The R-based edge monitor reads the closed trades back: rw = sum(base_risk x R) / sum(base_risk) over the last
 N closed trades, base_risk = preset risk x symbol multiplier BEFORE drawdown scaling, so the statistic does not
@@ -23,7 +24,7 @@ TRADE_FIELDS = ["event", "time_utc", "server_time", "strategy", "symbol", "direc
                 "fill_price", "sl", "tp", "risk_pct", "risk_amount", "base_risk", "ticket", "close_time",
                 "close_price", "close_reason", "pnl", "R", "reason"]
 EQUITY_FIELDS = ["market_date", "time_utc", "close_equity", "peak_equity", "drawdown", "month_return",
-                 "cash_flow_total", "opens", "closes", "halted", "entries_blocked"]
+                 "cash_flow_total", "opens", "closes", "halted", "entries_blocked", "balance"]
 EDGE_MIN_TRADES = 50  # the R monitor needs at least this many closed trades before it can warn
 
 
@@ -32,10 +33,16 @@ class TradeJournal:
         self.dir = Path(directory)
 
     def _append(self, path: Path, fieldnames: list[str], row: dict) -> bool:
-        """Append one CSV row; a write problem is logged but never stops trading."""
+        """Append one CSV row; a write problem is logged but never stops trading. A file written by an older
+        version keeps its own header (columns added later are left out of its rows), so it stays readable."""
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
             new = not path.exists() or path.stat().st_size == 0
+            if not new:
+                with open(path, "r", newline="", encoding="utf-8") as f:
+                    header = next(csv.reader(f), None)
+                if header and header != fieldnames and set(header) <= set(fieldnames):
+                    fieldnames = header
             with open(path, "a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 if new:

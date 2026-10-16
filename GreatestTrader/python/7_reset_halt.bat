@@ -1,5 +1,7 @@
 @echo off
 REM Clear a drawdown HALT without losing the rest of the state (peak, deposits/withdrawals, clock, account).
+REM The request is stored in the state: the engine clears the halt at its next start, right after it has
+REM checked the deposits/withdrawals made while it was stopped (start 3_run_live.bat afterwards).
 REM Stop the live engine first (close the 3_run_live window). Check the account before resuming!
 REM Add --rebase-peak below to also set the peak equity to the current equity (drawdown restarts at 0%).
 cd /d %~dp0

@@ -12,7 +12,9 @@ from greatest_trader.broker.base import CashFlow
 from greatest_trader.config import Config, load_config
 from greatest_trader.engine import M15, LiveEngine
 from greatest_trader.journal import TradeJournal, risk_weighted_r
+from greatest_trader.live_report import edge_monitor_table
 from greatest_trader.notify import Notifier
+from greatest_trader.risk import RiskState
 from greatest_trader.strategies import PositionView
 
 SPIKE = datetime(2021, 3, 3, 0, 30)
@@ -103,17 +105,42 @@ def test_cash_flow_first_run_dedup_and_restart(tmp_path):
     assert not sent(eng2, "CASH FLOW")
 
 
-def test_flow_booked_between_the_equity_read_and_the_scan(tmp_path):
+def test_equity_is_read_after_the_deal_scan(tmp_path):
+    """k = E / (E - F) and the guards of the loop use ONE equity read taken after the deal scan (EA finding ea#1:
+    an equity read before the scan does not contain a flow booked in between)."""
     eng, br = make(cfg_for(tmp_path, preset="stable5"), eurjpy())
     br.set_time(datetime(2021, 3, 2, 22, 0, 5))
     eng.step()
+    calls = []
+    flows, equity = br.cash_flows, br.account_equity
+    br.cash_flows = lambda: (calls.append("deals"), flows())[1]
+    br.account_equity = lambda: (calls.append("equity"), equity())[1]
     br.add_cash(-400)
-    reads = iter([10_000.0, 9_600.0])  # the first read of the loop still saw the old equity
-    br.account_equity = lambda: next(reads, 9_600.0)
     br.set_time(datetime(2021, 3, 2, 22, 0, 10))
     eng.step()
+    assert calls[:2] == ["deals", "equity"] and calls.count("equity") == 1
     assert eng.state.peak_equity == pytest.approx(9_600) and eng.state.last_equity == 9_600
     assert not sent(eng, "MONTH STOP")
+
+
+def test_reset_halt_is_applied_after_the_first_cash_flow_check(tmp_path):
+    """reset-halt --rebase-peak while a 5,000 deposit was made with the engine stopped: the deposit is applied to
+    the OLD peak first, then the peak is rebased to the equity that contains it (EA: InpResetHalt). Rebasing first
+    multiplied the deposit onto the new peak: 'HALT: drawdown 38.8%' at once."""
+    cfg = cfg_for(tmp_path, preset="stable5")
+    RiskState(peak_equity=10_000, last_equity=7_900, day="2021-03-02", month="2021-03", day_start_equity=7_900,
+              month_start_equity=8_000, halted=True, halt_reason="max drawdown 21.0% reached", account_login=111,
+              cash_init=True, cash_tickets=[[1, 0.0]], reset_request="rebase").save(tmp_path / "state.json")
+    eng, br = make(cfg, eurjpy(), equity=7_900)
+    br.set_time(datetime(2021, 3, 2, 10, 0, 5))
+    br.add_cash(5_000, "deposit while stopped")
+    eng.step()
+    st = eng.state
+    assert not st.halted and st.reset_request == "" and st.peak_equity == pytest.approx(12_900)
+    assert eng.risk.risk_fraction("NR", 12_900) == pytest.approx(0.035)
+    assert sent(eng, "CASH FLOW +5,000.00") and sent(eng, "RESET HALT") and not sent(eng, "HALT: max drawdown")
+    j = pd.read_csv(tmp_path / "journal" / "trades_2021.csv")
+    assert j.event.tolist() == ["reset_halt"] and "applied by the engine" in j.reason.iloc[0]
 
 
 def test_several_flows_in_one_loop_compound_exactly(tmp_path):
@@ -193,10 +220,105 @@ def test_vps_clock_drift_is_reported_and_never_verifies(tmp_path):
     cfg = cfg_for(tmp_path, mode="auto")
     br = FakeBroker({"EURJPY": synthetic_m15(datetime(2025, 1, 13), 10, 160.0, 0.01)})
     eng = LiveEngine(cfg, br, Notifier(cfg.notify), utcnow=lambda: NY7.server_to_utc(br.now) + timedelta(minutes=5))
-    for k in range(5):
+    for k in range(3):  # the first read is no observation, then 2 off-grid observations: no alert yet
         br.set_time(datetime(2025, 1, 21, 10, 0, 5) + timedelta(seconds=5 * k))
         eng.step()
-    assert not eng.clock_verified and len(sent(eng, "check the Windows time synchronisation")) == 1
+    assert not sent(eng, "PC CLOCK")
+    for k in range(3, 6):
+        br.set_time(datetime(2025, 1, 21, 10, 0, 5) + timedelta(seconds=5 * k))
+        eng.step()
+    assert not eng.clock_verified and len(sent(eng, "check the Windows time synchronisation")) == 1  # 6-hourly
+    assert "PC clock off" in eng.entry_block() and "new entries wait" in sent(eng, "PC CLOCK")[0]
+
+
+def test_weekend_stale_tick_that_becomes_readable_never_counts(tmp_path):
+    """Saturday restart: the newest Friday tick 'advances' the server time one loop later (a symbol that was
+    unreadable, or the fake's one-off jump). No clock may be adopted, saved or used on the weekend."""
+    cfg = cfg_for(tmp_path, mode="auto")
+    br = FakeBroker({"EURJPY": synthetic_m15(datetime(2025, 1, 13), 14, 160.0, 0.01)})
+    wall = {"utc": datetime(2025, 1, 18, 8, 0, 0)}
+    eng = LiveEngine(cfg, br, Notifier(cfg.notify), utcnow=lambda: wall["utc"])
+    br.set_time(datetime(2025, 1, 17, 23, 59, 30))
+    eng.step()
+    br.now = datetime(2025, 1, 17, 23, 59, 58)  # within +-120 s of a half-hour step from the Saturday wall clock
+    for _ in range(5):
+        wall["utc"] += timedelta(seconds=5)
+        eng.step()
+    assert eng.state.clock_mode == "" and not eng.clock_verified and eng.state.day == "2025-01-17"
+    assert not sent(eng, "server clock")
+
+
+def test_friday_close_and_monday_open_raise_no_false_alarms(tmp_path):
+    """The last tick of the week was measured with a growing delay (false 'check the Windows time
+    synchronisation' at every pause of 2 minutes), and the stale-feed watchdog counted from Friday's close at
+    the Monday open ('no price updates for 2880 min'). A feed that stays silent after the open is reported."""
+    br = FakeBroker({"EURJPY": synthetic_m15(datetime(2025, 1, 13), 14, 160.0, 0.01)})
+    wall = {}
+    eng = LiveEngine(cfg_for(tmp_path), br, Notifier(Config().notify), utcnow=lambda: wall["utc"])
+    t = datetime(2025, 1, 17, 23, 58, 0)
+    while t <= datetime(2025, 1, 17, 23, 59, 58):  # Friday close, VPS clock exact, ticks seen 2 s late
+        br.set_time(t)
+        wall["utc"] = NY7.server_to_utc(t) + timedelta(seconds=2)
+        eng.step()
+        t += timedelta(seconds=2)
+    for _ in range(40):  # 200 s without ticks after the close
+        wall["utc"] += timedelta(seconds=5)
+        eng.step()
+    assert not sent(eng, "PC CLOCK") and not sent(eng, "no price updates")
+    for u in (datetime(2025, 1, 18, 12, 0), datetime(2025, 1, 19, 22, 0), datetime(2025, 1, 19, 22, 9)):
+        wall["utc"] = u  # Saturday; Monday 00:00 market time; 9 minutes later, still no tick
+        eng.step()
+    assert not sent(eng, "no price updates")
+    br.set_time(datetime(2025, 1, 20, 0, 9, 30))  # the broker's first tick of the week
+    wall["utc"] = NY7.server_to_utc(br.now) + timedelta(seconds=1)
+    eng.step()
+    assert not sent(eng, "no price updates")
+    eng2 = LiveEngine(cfg_for(tmp_path / "b"), br, Notifier(Config().notify), utcnow=lambda: wall["utc"])
+    br.set_time(datetime(2025, 1, 17, 23, 59, 58))
+    for u in (datetime(2025, 1, 19, 21, 0), datetime(2025, 1, 19, 22, 15), datetime(2025, 1, 19, 22, 21)):
+        wall["utc"] = u  # the feed never comes back after the weekend
+        eng2.step()
+    assert len(sent(eng2, "no price updates for 21 min")) == 1
+
+
+def test_auto_clock_change_is_adopted_or_blocked_after_three_observations(tmp_path):
+    """Shared rule with the EA: a verified clock keeps allowing entries until CLOCK_CONFIRM observations
+    disagree; 3 identical ones are adopted, 3 that disagree among themselves block new entries."""
+    cfg = cfg_for(tmp_path, mode="auto")
+    br = FakeBroker({"EURJPY": synthetic_m15(datetime(2025, 1, 13), 10, 160.0, 0.01)})
+    wall = {"utc": datetime(2025, 1, 21, 8, 0, 5)}  # the VPS clock is exact; the broker's offset changes
+    eng = LiveEngine(cfg, br, Notifier(cfg.notify), utcnow=lambda: wall["utc"])
+
+    def loop(offset_h):
+        wall["utc"] += timedelta(seconds=5)
+        br.set_time(wall["utc"] + timedelta(hours=offset_h))
+        eng.step()
+
+    for _ in range(2):
+        loop(2)  # NY7 in winter
+    assert eng.clock_verified and eng.entry_block() == "" and eng.state.clock_mode == "ny7"
+    for k, off in enumerate((3, 4, 5)):  # differing observations that never agree with each other
+        loop(off)
+        assert eng.entry_block() == ("" if k < 2 else "broker clock mismatch: observed +5.0 h, expected +2.0 h")
+    assert sent(eng, "NEW ENTRIES BLOCKED") and not sent(eng, "CHANGED")
+    for _ in range(4):  # then steady on GMT+0 (the first tick goes back in time: no observation)
+        loop(0)
+    assert (eng.clock.mode, eng.clock.offset) == ("fixed", 0.0) and eng.entry_block() == ""
+    assert sent(eng, "server clock CHANGED")
+
+
+def test_explicit_clock_allows_entries_from_the_start(tmp_path):
+    cfg = cfg_for(tmp_path, mode="ny7")
+    eng, br = make(cfg, eurjpy(), utcnow=lambda: datetime(2021, 3, 2, 12, 0))  # no tick advances: no observation
+    assert eng.clock_verified and eng.clock_problem == ""
+    br.set_time(datetime(2021, 3, 2, 10, 0, 5))
+    eng.step()
+    assert eng.entry_block() == ""
+    cfg2 = cfg_for(tmp_path / "auto", mode="auto")
+    eng2, br2 = make(cfg2, eurjpy(), utcnow=lambda: datetime(2021, 3, 2, 12, 0))
+    br2.set_time(datetime(2021, 3, 2, 10, 0, 5))
+    eng2.step()
+    assert eng2.entry_block().startswith("server clock not verified yet")
 
 
 def test_stale_feed_watchdog_only_on_market_days(tmp_path):
@@ -263,6 +385,65 @@ def test_broken_euro_session_does_not_stop_night_reversion(tmp_path):
     assert {"EURCAD", "EURJPY"} <= set(opened) and "EURUSD" not in opened
 
 
+def test_failing_symbol_is_notified_every_6_hours_and_in_the_daily_summary(tmp_path, monkeypatch):
+    t = [0.0]
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: t[0])
+    cfg = cfg_for(tmp_path, syms=["EURJPY", "GBPJPY"])
+    data = {s: synthetic_m15(datetime(2025, 1, 13), 5, 160.0, 0.01, seed=k) for k, s in enumerate(("EURJPY", "GBPJPY"))}
+    eng, br = make(cfg, data)
+    orig = br.rates
+    broken = {"GBPJPY"}
+
+    def rates(base, tf, n):
+        if base in broken:
+            raise RuntimeError(f"copy_rates {base} M15 failed")
+        return orig(base, tf, n)
+
+    br.rates = rates
+    start = datetime(2025, 1, 14, 0, 0, 5)  # Tuesday
+    for k in range(289):  # every 5 minutes for 24 hours
+        t[0] = k * 300.0
+        br.set_time(start + timedelta(minutes=5 * k))
+        eng.step()
+    alerts = sent(eng, "GBPJPY failing for")
+    assert len(alerts) == 4 and alerts[0].startswith("GBPJPY failing for 60 loops")  # 05:00, 11:00, 17:00, 23:00
+    daily = sent(eng, "DAILY 2025-01-14")
+    assert daily and "failing: GBPJPY (288 loops)" in daily[0]
+    broken.clear()
+    t[0] += 300
+    br.set_time(start + timedelta(minutes=5 * 289))
+    eng.step()
+    assert sent(eng, "GBPJPY works again") and eng.failing() == []
+
+
+def test_recovery_is_notified_only_after_an_error_notification(tmp_path, monkeypatch):
+    """Failures that come and go: 'recovered' is sent only for a failure whose ERROR was sent, at most every 30
+    minutes (it used to be sent after every failed loop: 360 notifications an hour)."""
+    t = [0.0]
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: t[0])
+    eng, br = make(cfg_for(tmp_path), eurjpy(start=datetime(2021, 3, 1), days=5))
+    br.set_time(datetime(2021, 3, 2, 10, 0, 5))
+    real_step, n = eng.step, [0]
+
+    def flaky_step():  # every other loop fails
+        n[0] += 1
+        if n[0] % 2 == 0:
+            raise RuntimeError("positions_get failed: (-10005, 'IPC timeout')")
+        real_step()
+
+    def fake_sleep(s):
+        t[0] += 5
+        br.set_time(br.now + timedelta(seconds=5))
+        if t[0] > 3600:
+            raise KeyboardInterrupt
+
+    eng.step = flaky_step
+    monkeypatch.setattr(engine_mod.time, "sleep", fake_sleep)
+    assert eng.run_forever() == 10
+    errors, recovered = sent(eng, "ERROR: positions_get failed"), sent(eng, "recovered after")
+    assert len(errors) == 2 and len(recovered) == 2  # 360 fail/recover pairs in the hour
+
+
 def test_unavailable_symbol_at_start_is_disabled_and_notified(tmp_path):
     cfg = cfg_for(tmp_path, syms=["EURJPY", "XYZJPY"])
     eng, br = make(cfg, eurjpy(spike_at=SPIKE), equity=1_000_000)
@@ -322,6 +503,19 @@ def test_daily_summary_and_equity_log(tmp_path):
     assert list(log.market_date) == ["2021-03-02"] and log.close_equity.iloc[0] == 10_100
 
 
+def test_equity_log_of_an_older_version_keeps_its_columns(tmp_path):
+    old = "market_date,time_utc,close_equity,peak_equity,drawdown,month_return,cash_flow_total,opens,closes," \
+          "halted,entries_blocked\n2021-03-01,2021-03-01 21:00:05,10000,10000,0,0,0,0,0,False,\n"
+    (tmp_path / "equity_log.csv").write_text(old, encoding="utf-8")
+    j = TradeJournal(tmp_path)
+    assert j.equity({"market_date": "2021-03-02", "close_equity": 10_100, "balance": 10_050})
+    log = pd.read_csv(tmp_path / "equity_log.csv")  # still one consistent table
+    assert list(log.market_date) == ["2021-03-01", "2021-03-02"] and "balance" not in log
+    j2 = TradeJournal(tmp_path / "new")
+    j2.equity({"market_date": "2021-03-02", "close_equity": 10_100, "balance": 10_050})
+    assert pd.read_csv(tmp_path / "new" / "equity_log.csv").balance.tolist() == [10_050]
+
+
 def test_trade_journal_open_and_close_with_r(tmp_path):
     cfg = cfg_for(tmp_path)
     eng, br = make(cfg, eurjpy(spike_at=SPIKE), equity=1_000_000)
@@ -376,6 +570,18 @@ def test_edge_monitor_warn_review_and_recovery(tmp_path):
         br.set_time(t)
         eng.step()
     assert sent(eng, "back to") and eng.state.edge_neg_months == 0
+
+
+def test_report_edge_monitor_uses_market_months_like_the_engine():
+    """NR trades of the first market day of April close on March 31 (21:00-23:59 UTC): the report must count them
+    in April, as the engine's month-end evaluation does (it showed a March WARN the engine never sent)."""
+    rows = [{"event": "close", "time_utc": f"2026-03-{2 + k // 3:02d} 01:{k % 3:02d}:00", "R": 0.10,
+             "base_risk": 0.035} for k in range(60)]
+    rows += [{"event": "close", "time_utc": f"2026-03-31 {21 + k // 3}:{(k % 3) * 20:02d}:00", "R": -1.5,
+              "base_risk": 0.035} for k in range(6)]
+    t = edge_monitor_table(pd.DataFrame(rows), 250)
+    assert t.loc["2026-03", "trades"] == 60 and t.loc["2026-03", "status"] == "ok"
+    assert t.loc["2026-04", "trades"] == 66 and t.loc["2026-04", "status"] == "WARN"
 
 
 def test_risk_weighted_r_uses_base_risk_weights():

@@ -36,13 +36,16 @@ broker:
 #     (max_lots_per_order 20ロット) に達すると、利益は % ではなく金額でほぼ一定になります。
 #   ※ 3つの目標（月利5%・DD20%以内・最悪月-2%）を同時に満たすプリセットはありません。詳細は docs/05_安定化改修報告書.md
 #   ※ 本番の最初は、下の risk: でリスクを半分にして始めてください（例: risk_nr: 0.0175, risk_es: 0.00875）。
+#     risk_nr / risk_es が効くのは profile: custom のプリセット（stable5 / stable4 / safe2）だけです。
+#     classic_* では risk: の profile: を conservative / standard / aggressive で選びます
+#     （classic_* に risk_nr / risk_es を書くと、無視されないよう起動時に設定エラーで止まります）。
 #   プリセットの中身は python/greatest_trader/presets/*.yaml にあります。
 #   下の risk: に書いた項目はプリセットより優先されます（書かなかった項目はプリセットの値のまま）。
 # ---------------------------------------------------------------------
 preset: stable5
 
 # risk:                            # ← 個別に上書きしたい場合だけコメントを外して記入
-#   risk_nr: 0.035                 # 中核4ペア(GBPCAD/EURCAD/AUDCAD/GBPCHF)の1取引リスク (0.035 = 3.5%)
+#   risk_nr: 0.035                 # 中核4ペア(GBPCAD/EURCAD/AUDCAD/GBPCHF)の1取引リスク (0.035 = 3.5%、profile: custom のみ)
 #   risk_es: 0.0175                # Euro Session の1取引リスク
 #   # symbol_risk_mult: 中核以外のペアのリスク倍率。書くと表全体が置き換わる（書かなかったペアは 1.0）ため、
 #   #                   変更する場合はプリセットの 10 ペアをすべて書くこと
@@ -56,7 +59,8 @@ preset: stable5
 #   monthly_loss_limit: 0.0        # 当月 -x% で当月の新規停止 (0=オフ)
 #   monthly_hard_stop: 0.03        # 当月 -3% で全決済し当月停止
 #   max_drawdown_halt: 0.20        # 最高資産から -20% で全新規停止（stable5/stable4/safe2 は 0.20、classic_* は 0.40）
-#                                  # 解除: エンジンを止めて python main.py reset-halt（--rebase-peak で最高資産を現在値に）
+#                                  # 解除: エンジンを止めて python main.py reset-halt（--rebase-peak で最高資産を現在値に）。
+#                                  #       次の起動時、停止中の入出金を確認した後にエンジンが適用します
 #                                  # ※ state/state.json は削除しないこと（最高資産・入出金・時計の記録が消えます）
 #   blackout_start: "12-20"        # 年末年始は新規エントリーしない（12/20〜1/5、空欄でオフ）
 #   blackout_end: "01-05"
@@ -127,7 +131,7 @@ monitor:
 # ---------------------------------------------------------------------
 engine:
   dry_run: true              # ★true = 注文を出さずにシグナルのみ記録。本番は false (または --live-orders)
-  poll_seconds: 5            # 監視間隔(秒)
+  poll_seconds: 5            # 監視間隔(秒、1〜20)
   state_file: state/state.json   # 状態ファイル（毎日バックアップ14世代）。ドライランは state/state_dryrun.json を使用
   log_dir: logs              # logs/<コマンド>_YYYY-MM-DD.log（800日保存）、再起動記録 logs/restarts.log
   journal_dir: journal       # 取引記録 journal/trades_YYYY.csv と日次資産 journal/equity_log.csv（追記のみ）

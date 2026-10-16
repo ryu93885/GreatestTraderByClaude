@@ -10,6 +10,7 @@ import pandas as pd
 from ..strategies.base import PositionView
 
 CASH_DEAL_TYPES = (2, 3, 6)  # MT5 DEAL_TYPE_BALANCE, DEAL_TYPE_CREDIT, DEAL_TYPE_BONUS
+DEAL_TYPE_CREDIT = 3
 
 
 @dataclass
@@ -48,6 +49,26 @@ class CashFlow:
     amount: float  # + deposit, - withdrawal (account currency)
     type: int  # 2 balance, 3 credit, 6 bonus
     comment: str = ""
+
+
+@dataclass
+class CashScan:
+    """One cash-flow check: the cash deals of the scan window plus ONE account read taken AFTER the history read
+    (so that k = E / (E - F) uses an equity that contains every flow the scan found)."""
+    flows: list[CashFlow]
+    equity: float
+    newest_deal: int | None = None  # newest deal ticket of ANY type (trade or cash) in the history; None = unknown
+    money: float | None = None  # balance + credit at the account read; None = unknown (no cash-flow lag guard)
+    scan_money: float | None = None  # balance + credit when the history was read (differs: booked meanwhile)
+    balance: float | None = None
+
+
+@dataclass
+class HistoryCheck:
+    """The WHOLE deal history, read for the first-run priming of the cash-flow cursor."""
+    flows: list[CashFlow]  # every balance / credit / bonus deal
+    complete: bool | None  # the deals add up to the balance (and the credit); None = cannot be checked
+    detail: str = ""
 
 
 @dataclass
@@ -106,6 +127,18 @@ class Broker(ABC):
     def cash_flows(self) -> list[CashFlow]:
         """Recent deposits / withdrawals / credit / bonus deals (the engine de-duplicates by ticket)."""
         return []
+
+    def cash_scan(self, fresh: bool = False) -> CashScan:
+        """The engine's cash-flow check: cash_flows() first, then the account (equity, balance + credit).
+        fresh=True: the engine waits for a deal that explains a balance change, read the history again.
+        This default knows neither the balance nor the deal tickets: no cash-flow lag guard."""
+        flows = self.cash_flows()
+        return CashScan(flows, self.account_equity())
+
+    def history_check(self) -> HistoryCheck:
+        """First run: every cash deal of the whole history and whether the history is complete (None = cannot be
+        checked: the engine primes the cash-flow cursor at once)."""
+        return HistoryCheck(self.cash_flows(), None)
 
     def closed_trade(self, ticket: int) -> ClosedTrade | None:
         """P/L of a position that is no longer open (None while the deal history does not show it yet)."""

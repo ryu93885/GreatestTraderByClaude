@@ -16,6 +16,7 @@ import pandas as pd
 
 from .broker.base import CASH_DEAL_TYPES
 from .journal import EDGE_MIN_TRADES
+from .timeutil import utc_index_to_market
 
 BACKTEST_12M_P5 = -0.016  # stable5 backtest: 5th percentile of the rolling 12-month returns
 BACKTEST_12M_WORST = -0.084  # stable5 backtest: worst rolling 12-month return
@@ -109,7 +110,9 @@ def edge_monitor_table(closes: pd.DataFrame, window: int) -> pd.DataFrame:
     d = d[d.base_risk > 0]
     if len(d) == 0:
         return pd.DataFrame(columns=cols)
-    d["month"] = pd.to_datetime(d["time_utc"]).dt.to_period("M")
+    # market-time month (NY+7), like the engine's month-end evaluation: an NR trade of the 1st market day closes
+    # on the previous UTC day (21:00-23:59 UTC) but belongs to the new month
+    d["month"] = utc_index_to_market(pd.DatetimeIndex(pd.to_datetime(d["time_utc"]))).to_period("M")
     rows, streak = {}, 0
     for m in pd.period_range(d.month.min(), d.month.max(), freq="M"):
         w = d[d.month <= m].tail(window)

@@ -13,6 +13,7 @@ from greatest_trader.broker.base import OrderResult
 from greatest_trader.config import Config, load_config
 from greatest_trader.engine import LiveEngine
 from greatest_trader.notify import Notifier
+from greatest_trader.strategies import ModifyRequest
 from greatest_trader.timeutil import ServerClock
 
 SPIKE = datetime(2021, 3, 3, 0, 30)  # Wednesday, market time (= server time for ny7 brokers)
@@ -100,6 +101,38 @@ def test_unpriced_open_position_fills_the_total_risk_cap(tmp_path):
     views = eng._open_risk(broker.positions(eng.magics))
     assert views[0].risk_amount == float("inf")
     assert not eng.risk.can_open("NR", "GBPJPY", views, 1_000_000, -1, 1000)[0]
+
+
+def test_position_without_stop_loss_fills_the_total_risk_cap(tmp_path):
+    """Fail closed, like the EA: an own position without a stop loss has unlimited risk (it counted as 0 and the
+    engine kept opening trades); a stop at or beyond the entry leaves no remaining risk."""
+    data = {"EURJPY": synthetic_m15(datetime(2021, 3, 1), 5, 130.0, 0.01, spike_at=SPIKE)}
+    eng, broker = make_engine(make_cfg(tmp_path), data)
+    broker.set_time(datetime(2021, 3, 2, 22, 0, 5))
+    broker.open_position("EURJPY", 1, 0.1, None, None, 7101, "GT_NR")  # SL removed by hand
+    eng.risk.cfg.max_total_risk = 0.05
+    views = eng._open_risk(broker.positions(eng.magics))
+    assert views[0].risk_amount == float("inf")
+    assert eng.risk.can_open("NR", "GBPJPY", views, 1_000_000, -1, 1000) == (False, "max total open risk")
+    assert any("has NO stop loss" in m for m in eng.notifier.recent)
+    broker.positions_[0].sl = broker.positions_[0].open_price + 0.05  # stop beyond the entry: no remaining risk
+    assert eng._open_risk(broker.positions(eng.magics))[0].risk_amount == 0.0
+
+
+def test_failed_tp_modify_closes_only_when_the_price_is_beyond_the_tp(tmp_path):
+    """EA rule: after a failed TP update the NR position is closed only when a fresh quote is already past the
+    requested TP; any other failure keeps the position (SL and time stop) and the TP is retried on the next bar."""
+    data = {"EURJPY": synthetic_m15(datetime(2021, 3, 1), 5, 130.0, 0.01, spike_at=SPIKE)}
+    eng, broker = make_engine(make_cfg(tmp_path), data)
+    broker.set_time(datetime(2021, 3, 2, 22, 0, 5))
+    broker.open_position("EURJPY", 1, 0.1, 129.0, None, 7101, "GT_NR")
+    pos = broker.positions(eng.magics)[0]
+    broker.modify_position = lambda *a: OrderResult(False, message="retcode=10024 too many requests")
+    bid = broker.tick("EURJPY").bid
+    eng._apply(ModifyRequest(pos.ticket, "EURJPY", bid + 0.20, "TP -> moving average"), pos)  # TP not reached
+    assert broker.positions_ and not any(x[0] == "close" for x in broker.log)
+    eng._apply(ModifyRequest(pos.ticket, "EURJPY", bid - 0.01, "TP -> moving average"), pos)  # price past the TP
+    assert not broker.positions_ and ("close", "EURJPY", "GT price beyond TP (TP not placeable)") in broker.log
 
 
 def test_live_engine_ignores_stale_bar_on_startup(tmp_path):
@@ -311,3 +344,73 @@ def test_backtest_missing_conversion_pair_leaves_symbol_uncapped(tmp_path, caplo
     t = res.trades
     assert len(t) and t.lots.isna().all()
     assert t.iloc[0].risk_amount == pytest.approx(1e12 * cfg.risk.base_risk("nr"))  # uncapped
+
+
+def test_fx_converter_falls_back_when_the_direct_pair_is_stale():
+    """A direct pair without a fresh price (its data ended, a gap) gives way to the route through USD instead of
+    returning NaN (a JPY account kept USDCHF trades uncapped after the CHFJPY data ended in 2019)."""
+    idx = pd.date_range("2021-03-01", periods=30, freq="1D")
+
+    def px(v, n=30):
+        return pd.DataFrame({"open": [v] * n}, index=idx[:n])
+
+    fx = _FxConverter({"USDJPY": px(110.0), "USDCHF": px(0.90), "CHFJPY": px(122.0, 1)})
+    t = idx[20:24].to_numpy(dtype="datetime64[ns]")  # 19+ days after the last CHFJPY bar
+    assert np.allclose(fx.rate("CHF", "JPY", t), 110.0 / 0.90)
+    early = idx[:1].to_numpy(dtype="datetime64[ns]")
+    assert np.allclose(fx.rate("CHF", "JPY", early), 122.0)  # the fresh direct pair wins
+    # a direct pair 3 days old gives way to a fresh route through USD; with no other route it is still used
+    fx2 = _FxConverter({"USDJPY": px(110.0), "GBPUSD": px(1.40), "GBPJPY": px(150.0, 2)})
+    t3 = idx[4:5].to_numpy(dtype="datetime64[ns]")
+    assert np.allclose(fx2.rate("GBP", "JPY", t3), 1.40 * 110.0)
+    fx3 = _FxConverter({"GBPJPY": px(150.0, 2)})
+    assert np.allclose(fx3.rate("GBP", "JPY", t3), 150.0)
+
+
+def test_jpy_account_lot_cap_after_the_conversion_pair_ends(caplog):
+    start = datetime(2021, 3, 1)
+    data = {"USDCHF": synthetic_m15(start, 10, 0.90, 0.0001, seed=3),
+            "USDJPY": synthetic_m15(start, 10, 110.0, 0.01, seed=4),
+            "CHFJPY": synthetic_m15(start, 2, 122.0, 0.01, seed=5)}  # the direct conversion pair ends early
+    cfg = Config()
+    cfg.night_reversion.symbols = ["USDCHF"]
+    cfg.euro_session.enabled = False
+    cfg.broker.server_time_mode = "ny7"
+    cfg.risk.blackout_start = cfg.risk.blackout_end = ""
+    cfg.backtest.account_currency = "JPY"
+    cfg.backtest.initial_equity = 1e12  # every trade far above the 20-lot cap
+    with caplog.at_level(logging.WARNING, logger="greatest_trader.backtest"):
+        t = Backtester(cfg, data).run().trades
+    late = t[pd.to_datetime(t.entry_time) > pd.Timestamp(start) + pd.Timedelta(days=9)]
+    assert len(late) > 0 and late.lots.notna().all() and (abs(late.lots - 20) < 1e-9).all()
+    assert not any("NOT applied" in r.message for r in caplog.records)
+
+
+def test_margin_check_fails_closed_without_a_base_rate(caplog):
+    """backtest.leverage: a symbol whose base currency cannot be converted must not get margin = NaN (that let
+    every other entry pass the free-margin check too): its signals are skipped, with a counted warning."""
+    start = datetime(2021, 3, 1)
+    syms = [("AUDCAD", 0.95, 0.0001), ("GBPCAD", 1.70, 0.0001), ("EURCAD", 1.50, 0.0001), ("GBPCHF", 1.25, 0.0001)]
+    data = {s: synthetic_m15(start, 15, b, p, seed=7 + k) for k, (s, b, p) in enumerate(syms)}
+    data["EURUSD"] = synthetic_m15(start, 15, 1.20, 0.0001, seed=20)  # converts CAD (via EURCAD)
+    data["USDCHF"] = synthetic_m15(start, 15, 0.92, 0.0001, seed=21)  # converts CHF; nothing converts AUD
+    cfg = Config()
+    cfg.night_reversion.symbols = [s for s, _, _ in syms]
+    cfg.euro_session.enabled = False
+    cfg.broker.server_time_mode = "ny7"
+    cfg.risk.blackout_start = cfg.risk.blackout_end = ""
+    cfg.risk.max_lots_per_order = 0
+    cfg.backtest.initial_equity = 100_000.0
+    cfg.backtest.leverage = 5.0  # a few lots fit; concurrent positions compete for the free margin
+    with caplog.at_level(logging.WARNING, logger="greatest_trader.backtest"):
+        t = Backtester(cfg, data).run().trades
+    assert len(t) > 0 and "AUDCAD" not in set(t.symbol) and np.isfinite(t.notional).all()
+    assert any("AUDCAD" in r.message and "margin check" in r.message for r in caplog.records)
+    cfg.night_reversion.symbols = [s for s, _, _ in syms[1:]]  # the unconvertible symbol changes nothing else
+    t2 = Backtester(cfg, data).run().trades
+    cols = ["entry_time", "symbol", "lots"]
+    assert t[cols].equals(t2[cols])
+    cfg.backtest.leverage = 1.0  # 1:1: no position of 1 lot (100k notional) or more fits into 80% of 100k
+    t3 = Backtester(cfg, data).run().trades
+    assert (t3.lots < 1.0).all()
+

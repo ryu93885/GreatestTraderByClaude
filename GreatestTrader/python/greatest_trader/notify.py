@@ -55,6 +55,10 @@ class Notifier:
             self._put(("msg", text))
         return True
 
+    def reset(self, key: str) -> None:
+        """Forget when `key` was last sent: the next message with that key goes out at once."""
+        self._last.pop(key, None)
+
     def heartbeat(self) -> None:
         """Called by the engine after every healthy loop: pings notify.healthcheck_url at most every 5 minutes,
         so the external service raises an alarm when the loop stops (dead VPS, hung process, MT5 down)."""
