@@ -178,7 +178,8 @@ datetime g_primeRefAt = 0;       // first run: since when the cash-flow deals be
 int      g_primeRefN = 0;        // ... their number, ticket sum and ticket xor (a fingerprint of the set)
 ulong    g_primeRefSum = 0;
 ulong    g_primeRefXor = 0;
-datetime g_primeNote = 0;
+datetime g_primeNote = 0;        // ... last 'history cannot be read' alert
+datetime g_primeTry = 0;         // ... last priming attempt (the whole history is read at most every 5 s)
 
 //--- broker clock
 ENUM_GT_SERVER_TIME g_clockMode = GT_SERVER_NY7; // effective mode (AUTO -> NY7 in the tester)
@@ -498,6 +499,7 @@ void ResetStateVars()
    g_primeRefSum = 0;
    g_primeRefXor = 0;
    g_primeNote = 0;
+   g_primeTry = 0;
    g_clkHave = false;
    g_clkOffset = 0;
    g_ddAlertDay = 0;
@@ -1781,6 +1783,9 @@ bool TryPrimeFlowCursor()
    datetime now = TimeLocal();
    if(g_primeStart == 0 || Secs(now, g_primeStart) < 0)
       g_primeStart = now;
+   if(g_primeTry != 0 && Secs(now, g_primeTry) < 5 && Secs(now, g_primeTry) >= 0)
+      return false;
+   g_primeTry = now;
    bool late = (Secs(now, g_primeStart) >= GT_PRIME_MAX_SEC);
    if(!HistorySelect(0, GT_FAR_FUTURE))
      {
@@ -1842,7 +1847,12 @@ bool TryPrimeFlowCursor()
    g_lastBalCred = 0.0;   // the first scan (same cycle) takes balance + credit as the reference
    g_pendingSince = 0;
    g_stateDirty = true;
-   string how = sums ? "deals match balance and credit" : (stable ? "cash-flow deals unchanged for 60 s" : "NOT confirmed");
+   string how = "NOT confirmed";
+   if(sums)
+      how = "deals match balance and credit";
+   else
+      if(stable)
+         how = StringFormat("cash-flow deals unchanged for %d s", GT_PRIME_STABLE_SEC);
    Log(StringFormat("cash-flow tracking started: %d existing deals marked as seen (cursor #%s, %s)", n,
                     IntegerToString((long)mx), how));
    if(!sums && !stable)
