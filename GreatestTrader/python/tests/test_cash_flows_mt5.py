@@ -209,6 +209,22 @@ def test_flow_booked_while_the_history_is_read_is_decided_next_loop(monkeypatch,
     assert st.peak_equity == pytest.approx(5_000) and not st.halted and not st.month_halted  # was: HALT 50%
 
 
+def test_equity_log_and_daily_summary_carry_the_balance(monkeypatch, tmp_path, clock):
+    import pandas as pd
+    eng = make(monkeypatch, tmp_path)
+    S.now = calendar.timegm(datetime(2021, 3, 5, 23, 59, 50).timetuple())  # Friday (ny7 server = market time)
+    S.ticks["EURJPY"]["time"] = S.now
+    eng.step()
+    S.equity = 10_120.0  # floating profit
+    S.now = calendar.timegm(datetime(2021, 3, 8, 0, 0, 3).timetuple())  # Monday open
+    S.ticks["EURJPY"]["time"] = S.now
+    eng.step()
+    log = pd.read_csv(tmp_path / "journal" / "equity_log.csv")
+    assert list(log.market_date) == ["2021-03-05"] and log.balance.iloc[0] == 10_000
+    msg = sent(eng, "DAILY 2021-03-05 Fri: equity 10,000.00 USD (balance 10,000.00)")
+    assert msg, list(eng.notifier.recent)
+
+
 # ------------------------------------------------------------------ first-run priming
 def test_priming_waits_for_a_complete_history(monkeypatch, tmp_path, clock):
     """11,000 on the account = a 7-day-old deposit of 10,000 + 1,000 profit. The terminal's history is empty at

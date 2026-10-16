@@ -671,7 +671,9 @@ class LiveEngine:
 
     # ------------------------------------------------------------------ monitoring
     def _new_day(self, before: tuple, utc: datetime) -> None:
-        """Equity log row and daily summary for the market day that just ended."""
+        """Equity log row and daily summary for the market day that just ended. The market day changes with the
+        server time, i.e. at the first price of the next market day: Friday's summary arrives at the Monday open
+        (the weekday in the text says which day it covers)."""
         st = self.state
         prev_day, _, close, peak, month_start, opens, closes = before
         dd = max(0.0, 1 - close / peak) if peak > 0 and close > 0 else 0.0
@@ -683,8 +685,14 @@ class LiveEngine:
                              "halted": st.halted, "entries_blocked": block,
                              "balance": self._balance if self._balance is not None else ""})
         if self.cfg.monitor.daily_summary:
-            parts = [f"DAILY {prev_day}: equity {close:,.2f} {self.broker.account_currency()}", f"DD {dd:.1%}",
-                     f"month-to-date {mret:+.2%} (flow-adjusted)", f"trades opened {opens} / closed {closes}"]
+            try:
+                wd = f" {datetime.strptime(prev_day, '%Y-%m-%d'):%a}"
+            except ValueError:
+                wd = ""
+            bal = f" (balance {self._balance:,.2f})" if self._balance is not None else ""
+            parts = [f"DAILY {prev_day}{wd}: equity {close:,.2f} {self.broker.account_currency()}{bal}",
+                     f"DD {dd:.1%}", f"month-to-date {mret:+.2%} (flow-adjusted)",
+                     f"trades opened {opens} / closed {closes}"]
             if st.halted:
                 parts.append(f"HALTED ({st.halt_reason}) -> python main.py reset-halt")
             if st.month_halted or st.day_halted:
