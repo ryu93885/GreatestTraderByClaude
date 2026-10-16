@@ -2,7 +2,7 @@
 retry policy, reconnect after a terminal restart, spec refresh, cash flows and deal history."""
 import calendar
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -220,6 +220,32 @@ def test_transient_tp_modify_error_keeps_the_position(b, cfg):
     assert len(S.positions) == 1 and S.positions[0]["tp"] == 130.3
     eng._apply(ModifyRequest(pos.ticket, "EURJPY", 130.25, "TP -> moving average"), pos)  # next bar: works
     assert len(S.positions) == 1 and S.calls["order_send"] == 3
+
+
+def test_weekend_restart_with_a_late_symbol_adopts_no_clock(cfg, clock, tmp_path):
+    """Saturday 08:00 UTC restart in auto mode: EURUSD's (Friday) tick is unreadable in the first loop and readable
+    in the next. The maximum of the latest ticks 'advanced', and a fixed -8 h clock was adopted, saved and used
+    (a fake Saturday market day)."""
+    import numpy as np
+    S.specs["EURUSD"] = dict(digits=5, point=0.00001, volume_min=0.01, volume_max=100.0, volume_step=0.01,
+                             trade_stops_level=0, filling_mode=1)
+    S.rates[("EURUSD", fake_mt5.TIMEFRAME_M15)] = np.zeros(0)
+    ep = lambda dt: calendar.timegm(dt.timetuple())  # noqa: E731
+    S.now = ep(datetime(2025, 1, 17, 23, 59, 58))
+    S.ticks["EURJPY"] = dict(time=ep(datetime(2025, 1, 17, 23, 59, 30)), bid=160.0, ask=160.02)
+    S.ticks.pop("EURUSD", None)
+    cfg.night_reversion.symbols = ["EURJPY", "EURUSD"]
+    cfg.broker.server_time_mode = "auto"
+    wall = {"utc": datetime(2025, 1, 18, 8, 0, 0)}
+    eng = LiveEngine(cfg, MT5Broker(cfg), Notifier(cfg.notify), utcnow=lambda: wall["utc"])
+    eng.start()
+    for k in range(6):
+        if k == 1:
+            S.ticks["EURUSD"] = dict(time=ep(datetime(2025, 1, 17, 23, 59, 58)), bid=1.03, ask=1.0301)
+        eng.step()
+        wall["utc"] += timedelta(seconds=5)
+    assert eng.state.clock_mode == "" and not eng.clock_verified and eng.entry_block()
+    assert eng.state.day in ("", "2025-01-17") and not any("server clock" in m for m in eng.notifier.recent)
 
 
 def test_netting_account_is_detected(b, cfg):

@@ -250,6 +250,9 @@ class Config:
             raise ValueError("monitor.edge_window_trades must be an integer >= 1")
         if not _is_num(m.stale_feed_minutes) or m.stale_feed_minutes <= 0:
             raise ValueError("monitor.stale_feed_minutes must be > 0")
+        if not _is_num(self.engine.poll_seconds) or not 1 <= self.engine.poll_seconds <= 20:
+            # bar signals are acted on within 150 s of the close and clock observations need ticks read < 30 s apart
+            raise ValueError(f"engine.poll_seconds must be between 1 and 20 (got {self.engine.poll_seconds!r})")
         b = self.backtest
         if not _is_num(b.leverage) or b.leverage < 0 or not _is_num(b.contract_size) or b.contract_size <= 0:
             raise ValueError("backtest.leverage must be >= 0 and backtest.contract_size > 0")

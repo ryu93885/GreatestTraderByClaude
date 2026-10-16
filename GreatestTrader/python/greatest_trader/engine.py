@@ -10,8 +10,10 @@ One loop every engine.poll_seconds:
   6. trade journal of closed positions, heartbeat, dead-man-switch ping, state save (only on change).
 
 New entries need a verified server clock (auto mode: measured from fresh ticks after every start) and are
-blocked while the configured clock disagrees with the broker. Closes, time stops, TP management and hard
-stops keep working with the last known clock.
+blocked after 3 observations that disagree with the clock in use; they also wait while the first-run deal history
+is not confirmed complete, while the deal history cannot be read and while a balance change is not yet explained
+by the deal history (cash flow pending, at most 60 s). Closes, time stops, TP management and hard stops keep
+working with the last known clock.
 """
 from __future__ import annotations
 
@@ -33,7 +35,7 @@ from .notify import Notifier
 from .ops import EXIT_RESTART, EXIT_STOP, format_versions, process_memory_mb, versions
 from .risk import RiskManager, RiskState
 from .strategies import CloseRequest, EntryRequest, EuroSession, ModifyRequest, NightReversion, PositionView
-from .timeutil import ServerClock, detect_server_mode, utc_to_market
+from .timeutil import ServerClock, detect_server_mode, market_to_utc, utc_to_market
 
 log = logging.getLogger(__name__)
 M15 = timedelta(minutes=15)
@@ -41,8 +43,10 @@ H1 = timedelta(hours=1)
 FRESH_SIGNAL = timedelta(seconds=150)  # act on a closed bar only if it closed within this time
 MARGIN_USE_MAX = 0.8  # a new position may use at most 80% of the current free margin
 CLOCK_TOL = 120.0  # s: a fresh tick lies within this distance of a whole half-hour offset from real UTC
-TICK_FRESH = 120.0  # s: ... and the server time advanced at most this long ago (VPS clock)
-CLOCK_CONFIRM = 3  # identical observations to adopt a changed offset (auto) / mismatches to block entries
+TICK_FRESH = 30.0  # s: a clock observation needs a symbol's own tick time to have advanced within this time
+CLOCK_CONFIRM = 3  # identical observations to adopt a changed offset (auto) / mismatches to block entries /
+#                    off-grid observations in a row before the PC-clock alert
+SESSION_GRACE = timedelta(minutes=10)  # stale-feed watchdog: the first tick of a session may come this late
 MAX_FAIL_SECONDS = 1800.0  # continuous failure -> CRITICAL notification and exit code 3 (wrapper restarts)
 HEARTBEAT_SECONDS = 3600.0
 SYMBOL_RETRY_SECONDS = 3600.0  # unavailable symbols are tried again this often
@@ -85,11 +89,13 @@ class LiveEngine:
         self._init_clock()
         self._started = False
         self._sym_fail: dict[str, int] = {}
-        self._prev_st: datetime | None = None
-        self._st_moved_utc: datetime | None = None  # VPS UTC when the server time last advanced
+        self._sym_tick: dict[str, tuple[datetime, datetime]] = {}  # symbol -> (its last tick time, VPS UTC of read)
+        self._st_moved_utc: datetime | None = None  # VPS UTC when a symbol's own tick time last advanced
         self._watch_from_utc: datetime | None = None  # stale-feed watchdog reference
-        self._clock_cand: float | None = None
+        self._clock_cand: float | None = None  # auto: candidate offset (hours) and its identical observations
         self._clock_n = 0
+        self._clock_mis = 0  # consecutive observations that disagree with the clock in use
+        self._drift_n = 0  # consecutive fresh observations off the half-hour grid (PC clock off)
         self._account_problem = ""
         self._balance: float | None = None  # account balance at the last cash-flow check (equity log)
         self._lot_cap_day: dict[str, str] = {}
@@ -249,14 +255,16 @@ class LiveEngine:
             return
         if not self._check_account():
             return
+        ticks = {}
         for s in self.symbols():
             try:
-                self.broker.tick(s)
+                ticks[s] = self.broker.tick(s)
             except Exception as exc:  # noqa: BLE001 - handled per symbol below
                 log.debug("tick %s failed: %s", s, exc)
+                ticks[s] = None
         self._retry_disabled()
         utc = self._utcnow()
-        self._check_clock(utc)
+        self._check_clock(utc, *self._track_ticks(ticks, utc))
         now_server = self.broker.server_time()
         if now_server is None:
             return
@@ -376,73 +384,125 @@ class LiveEngine:
         m = utc_to_market(utc)
         return m.weekday() < 5 and (m.month, m.day) not in FX_HOLIDAYS
 
-    def _check_clock(self, utc: datetime) -> None:
-        """Verify the server clock from fresh ticks and watch the price feed.
+    def _session_open_utc(self, utc: datetime) -> datetime | None:
+        """UTC start (00:00 market time) of the current market day when the market was closed the day before
+        (Monday after the weekend, the day after Dec 25 / Jan 1), else None."""
+        m = utc_to_market(utc)
+        prev = m.date() - timedelta(days=1)
+        if prev.weekday() >= 5 or (prev.month, prev.day) in FX_HOLIDAYS:
+            return market_to_utc(datetime(m.year, m.month, m.day))
+        return None
 
-        A measurement is valid only when the server time advanced within the last TICK_FRESH seconds AND lies
-        within CLOCK_TOL of a whole half-hour offset from real UTC (a stale weekend tick never qualifies).
-        auto: a different offset is adopted after CLOCK_CONFIRM identical observations (persisted, notified);
-        new entries wait until the clock was verified after start-up. ny7 / fixed: CLOCK_CONFIRM mismatches
-        in a row block new entries until the clock matches again."""
-        st = self.broker.server_time()
+    def _track_ticks(self, ticks: dict, utc: datetime) -> tuple[bool, datetime | None]:
+        """Per symbol: did its OWN tick time advance since its previous successful read? The first read after a
+        symbol was unreadable (terminal just started, reconnect, symbol re-enabled) never counts, so a stale
+        Friday tick that becomes readable on a Saturday cannot look like a new tick.
+        Returns (any advance: the feed moves, newest advanced tick time whose previous read was at most
+        TICK_FRESH seconds ago: a tick at most that old, usable for a clock observation)."""
+        moved, fresh = False, None
+        old = {s: v for s, v in self._sym_tick.items() if s in ticks}
+        self._sym_tick = {}
+        for s, t in ticks.items():
+            if t is None:
+                continue  # unreadable now: its next successful read starts afresh
+            self._sym_tick[s] = (t.time, utc)
+            prev = old.get(s)
+            if prev is None or t.time <= prev[0]:
+                continue
+            moved = True
+            if (utc - prev[1]).total_seconds() <= TICK_FRESH:
+                fresh = t.time if fresh is None else max(fresh, t.time)
+        return moved, fresh
+
+    def _check_clock(self, utc: datetime, moved: bool, fresh: datetime | None) -> None:
+        """Watch the price feed and verify the server clock (shared rule with the EA, spec section 3).
+
+        * Stale feed: notified when no symbol's tick advanced for monitor.stale_feed_minutes on a market day,
+          counted from the last advance but never from before the current session's open (+ SESSION_GRACE).
+        * Observation: only from a tick that advanced within the last TICK_FRESH seconds, only while the market
+          is open (a stale weekend tick never counts): server - UTC rounded to 30 minutes. A fresh tick that is
+          not within CLOCK_TOL of a whole half-hour offset is no observation: the PC clock is off (notified after
+          CLOCK_CONFIRM in a row, then every 6 hours).
+        * auto: new entries wait for the first observation after start-up that confirms the clock in use (the
+          persisted offset, else the NY7 rule); a different offset is adopted after CLOCK_CONFIRM identical
+          observations (persisted, notified).
+        * every mode: CLOCK_CONFIRM consecutive mismatches that are not adopted block new entries until the clock
+          matches again. Closes, time stops, TP management and hard stops always run with the clock in use."""
         if self._watch_from_utc is None:
             self._watch_from_utc = utc
-        if st is None:
-            return
-        prev, self._prev_st = self._prev_st, st
-        if prev is not None and st > prev:
+        if moved:
             self._st_moved_utc = self._watch_from_utc = utc
-        stale = utc - self._watch_from_utc
-        if stale > timedelta(minutes=self.cfg.monitor.stale_feed_minutes) and self._market_open(utc):
-            self._alert(f"no price updates for {stale.total_seconds() / 60:.0f} min on a market day (terminal "
-                        f"disconnected? feed stopped?)", key="stale-feed", every=3600)
-        if self._st_moved_utc is None or (utc - self._st_moved_utc).total_seconds() > TICK_FRESH:
-            return  # no fresh tick: no measurement (weekend, holiday, frozen feed)
-        diff = (st - utc).total_seconds()
+        if self._market_open(utc):
+            since = self._watch_from_utc
+            opened = self._session_open_utc(utc)
+            if opened is not None and since < opened:
+                since, ref = opened, opened + SESSION_GRACE  # Monday / after a holiday: not since Friday
+            else:
+                ref = since
+            if utc - ref > timedelta(minutes=self.cfg.monitor.stale_feed_minutes):
+                self._alert(f"no price updates for {(utc - since).total_seconds() / 60:.0f} min on a market day "
+                            f"(terminal disconnected? feed stopped?)", key="stale-feed", every=3600)
+        if fresh is None or not self._market_open(utc):
+            return  # no fresh tick: no observation (weekend, holiday, frozen feed, stale tick)
+        auto = self.cfg.broker.server_time_mode == "auto"
+        diff = (fresh - utc).total_seconds()
         nearest = round(diff / 1800.0) * 1800.0
         if abs(diff - nearest) > CLOCK_TOL or abs(nearest) > 14 * 3600:
-            self._alert(f"server time {st:%Y-%m-%d %H:%M:%S} vs VPS UTC {utc:%Y-%m-%d %H:%M:%S}: no whole half-hour "
-                        f"offset ({diff - nearest:+.0f} s) -> check the Windows time synchronisation",
-                        key="clock-drift", every=6 * 3600)
+            self._drift_n += 1
+            off = diff - nearest if abs(nearest) <= 14 * 3600 else diff
+            if self._drift_n >= CLOCK_CONFIRM:
+                effect = ("new entries wait until the broker clock is verified" if auto and not self.clock_verified
+                          else "trading continues with the clock in use")
+                self._alert(f"PC CLOCK: server time {fresh:%Y-%m-%d %H:%M:%S} vs VPS UTC {utc:%Y-%m-%d %H:%M:%S} is "
+                            f"{off:+.0f} s off a whole half-hour offset ({self._drift_n} observations in a row) -> "
+                            f"check the Windows time synchronisation; {effect}", key="clock-drift", every=6 * 3600)
             return
+        self._drift_n = 0
         observed = nearest / 3600.0
         expected = (self.clock.utc_to_server(utc) - utc).total_seconds() / 3600.0
-        auto = self.cfg.broker.server_time_mode == "auto"
         if abs(observed - expected) < 0.01:
-            self._clock_cand, self._clock_n = None, 0
+            self._clock_cand, self._clock_n, self._clock_mis = None, 0, 0
             if not self.clock_verified:
                 self.clock_verified = True
                 log.info("server clock verified: %s (offset %+.1f h)", self.clock, observed)
             if self.clock_problem:
                 self.clock_problem = ""
-                self._alert(f"broker clock matches the configured {self.clock} again ({observed:+.1f} h): new "
-                            f"entries allowed")
+                self._alert(f"broker clock matches the {'clock in use' if auto else 'configured'} {self.clock} again "
+                            f"({observed:+.1f} h): new entries allowed")
             if auto and (self.state.clock_mode, self.state.clock_offset) != (self.clock.mode, self.clock.offset):
                 self.state.clock_mode, self.state.clock_offset = self.clock.mode, self.clock.offset
             return
+        self._clock_mis += 1
         if auto:
-            self.clock_verified = False
             self._clock_n = self._clock_n + 1 if self._clock_cand == observed else 1
             self._clock_cand = observed
+            log.info("server clock observation %+.1f h differs from %+.1f h in use (%d/%d identical)", observed,
+                     expected, self._clock_n, CLOCK_CONFIRM)
             if self._clock_n >= CLOCK_CONFIRM:
                 old, first = self.clock, not self.state.clock_mode
-                mode, off = detect_server_mode(st, utc)
+                mode, off = detect_server_mode(fresh, utc)
                 self.clock = ServerClock(mode, off)
                 self.state.clock_mode, self.state.clock_offset = mode, off
                 self.clock_verified = True
-                self._clock_cand, self._clock_n = None, 0
+                self._clock_cand, self._clock_n, self._clock_mis = None, 0, 0
+                self.clock_problem = ""
                 self._alert(f"server clock {'detected' if first else 'CHANGED'}: {self.clock} (observed offset "
                             f"{observed:+.1f} h, was {old}; persisted)")
+                return
         else:
-            self._clock_n += 1
-            if self._clock_n >= CLOCK_CONFIRM:
-                self.clock_problem = f"broker clock mismatch: observed {observed:+.1f} h, expected {expected:+.1f} h"
-                self._alert(f"NEW ENTRIES BLOCKED: {self.clock_problem} (check broker.server_time_mode)",
-                            key="clock-mismatch", every=3600, level=logging.ERROR)
+            log.info("server clock observation %+.1f h differs from the configured %+.1f h (%d/%d)", observed,
+                     expected, self._clock_mis, CLOCK_CONFIRM)
+        if self._clock_mis >= CLOCK_CONFIRM:
+            self.clock_problem = f"broker clock mismatch: observed {observed:+.1f} h, expected {expected:+.1f} h"
+            self._alert(f"NEW ENTRIES BLOCKED: {self.clock_problem} "
+                        f"({'observations disagree' if auto else 'check broker.server_time_mode'})",
+                        key="clock-mismatch", every=3600, level=logging.ERROR)
 
     def entry_block(self) -> str:
         """Why new entries are not allowed right now ('' = allowed)."""
         if self.cfg.broker.server_time_mode == "auto" and not self.clock_verified:
+            if self._drift_n >= CLOCK_CONFIRM:
+                return "server clock not verified yet (PC clock off - check the Windows time synchronisation)"
             return "server clock not verified yet (waiting for fresh ticks)"
         return self.clock_problem
 

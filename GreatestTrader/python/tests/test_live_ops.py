@@ -215,10 +215,97 @@ def test_vps_clock_drift_is_reported_and_never_verifies(tmp_path):
     cfg = cfg_for(tmp_path, mode="auto")
     br = FakeBroker({"EURJPY": synthetic_m15(datetime(2025, 1, 13), 10, 160.0, 0.01)})
     eng = LiveEngine(cfg, br, Notifier(cfg.notify), utcnow=lambda: NY7.server_to_utc(br.now) + timedelta(minutes=5))
-    for k in range(5):
+    for k in range(3):  # the first read is no observation, then 2 off-grid observations: no alert yet
         br.set_time(datetime(2025, 1, 21, 10, 0, 5) + timedelta(seconds=5 * k))
         eng.step()
-    assert not eng.clock_verified and len(sent(eng, "check the Windows time synchronisation")) == 1
+    assert not sent(eng, "PC CLOCK")
+    for k in range(3, 6):
+        br.set_time(datetime(2025, 1, 21, 10, 0, 5) + timedelta(seconds=5 * k))
+        eng.step()
+    assert not eng.clock_verified and len(sent(eng, "check the Windows time synchronisation")) == 1  # 6-hourly
+    assert "PC clock off" in eng.entry_block() and "new entries wait" in sent(eng, "PC CLOCK")[0]
+
+
+def test_weekend_stale_tick_that_becomes_readable_never_counts(tmp_path):
+    """Saturday restart: the newest Friday tick 'advances' the server time one loop later (a symbol that was
+    unreadable, or the fake's one-off jump). No clock may be adopted, saved or used on the weekend."""
+    cfg = cfg_for(tmp_path, mode="auto")
+    br = FakeBroker({"EURJPY": synthetic_m15(datetime(2025, 1, 13), 14, 160.0, 0.01)})
+    wall = {"utc": datetime(2025, 1, 18, 8, 0, 0)}
+    eng = LiveEngine(cfg, br, Notifier(cfg.notify), utcnow=lambda: wall["utc"])
+    br.set_time(datetime(2025, 1, 17, 23, 59, 30))
+    eng.step()
+    br.now = datetime(2025, 1, 17, 23, 59, 58)  # within +-120 s of a half-hour step from the Saturday wall clock
+    for _ in range(5):
+        wall["utc"] += timedelta(seconds=5)
+        eng.step()
+    assert eng.state.clock_mode == "" and not eng.clock_verified and eng.state.day == "2025-01-17"
+    assert not sent(eng, "server clock")
+
+
+def test_friday_close_and_monday_open_raise_no_false_alarms(tmp_path):
+    """The last tick of the week was measured with a growing delay (false 'check the Windows time
+    synchronisation' at every pause of 2 minutes), and the stale-feed watchdog counted from Friday's close at
+    the Monday open ('no price updates for 2880 min'). A feed that stays silent after the open is reported."""
+    br = FakeBroker({"EURJPY": synthetic_m15(datetime(2025, 1, 13), 14, 160.0, 0.01)})
+    wall = {}
+    eng = LiveEngine(cfg_for(tmp_path), br, Notifier(Config().notify), utcnow=lambda: wall["utc"])
+    t = datetime(2025, 1, 17, 23, 58, 0)
+    while t <= datetime(2025, 1, 17, 23, 59, 58):  # Friday close, VPS clock exact, ticks seen 2 s late
+        br.set_time(t)
+        wall["utc"] = NY7.server_to_utc(t) + timedelta(seconds=2)
+        eng.step()
+        t += timedelta(seconds=2)
+    for _ in range(40):  # 200 s without ticks after the close
+        wall["utc"] += timedelta(seconds=5)
+        eng.step()
+    assert not sent(eng, "PC CLOCK") and not sent(eng, "no price updates")
+    for u in (datetime(2025, 1, 18, 12, 0), datetime(2025, 1, 19, 22, 0), datetime(2025, 1, 19, 22, 9)):
+        wall["utc"] = u  # Saturday; Monday 00:00 market time; 9 minutes later, still no tick
+        eng.step()
+    assert not sent(eng, "no price updates")
+    br.set_time(datetime(2025, 1, 20, 0, 9, 30))  # the broker's first tick of the week
+    wall["utc"] = NY7.server_to_utc(br.now) + timedelta(seconds=1)
+    eng.step()
+    assert not sent(eng, "no price updates")
+    eng2 = LiveEngine(cfg_for(tmp_path / "b"), br, Notifier(Config().notify), utcnow=lambda: wall["utc"])
+    br.set_time(datetime(2025, 1, 17, 23, 59, 58))
+    for u in (datetime(2025, 1, 19, 21, 0), datetime(2025, 1, 19, 22, 15), datetime(2025, 1, 19, 22, 21)):
+        wall["utc"] = u  # the feed never comes back after the weekend
+        eng2.step()
+    assert len(sent(eng2, "no price updates for 21 min")) == 1
+
+
+def test_auto_clock_change_is_adopted_or_blocked_after_three_observations(tmp_path):
+    """Shared rule with the EA: a verified clock keeps allowing entries until CLOCK_CONFIRM observations
+    disagree; 3 identical ones are adopted, 3 that disagree among themselves block new entries."""
+    cfg = cfg_for(tmp_path, mode="auto")
+    br = FakeBroker({"EURJPY": synthetic_m15(datetime(2025, 1, 13), 10, 160.0, 0.01)})
+    wall = {"utc": datetime(2025, 1, 21, 8, 0, 5)}  # the VPS clock is exact; the broker's offset changes
+    eng = LiveEngine(cfg, br, Notifier(cfg.notify), utcnow=lambda: wall["utc"])
+
+    def loop(offset_h):
+        wall["utc"] += timedelta(seconds=5)
+        br.set_time(wall["utc"] + timedelta(hours=offset_h))
+        eng.step()
+
+    for _ in range(2):
+        loop(2)  # NY7 in winter
+    assert eng.clock_verified and eng.entry_block() == "" and eng.state.clock_mode == "ny7"
+    for k, off in enumerate((3, 4, 5)):  # differing observations that never agree with each other
+        loop(off)
+        assert eng.entry_block() == ("" if k < 2 else "broker clock mismatch: observed +5.0 h, expected +2.0 h")
+    assert sent(eng, "NEW ENTRIES BLOCKED") and not sent(eng, "CHANGED")
+    for _ in range(4):  # then steady on GMT+0 (the first tick goes back in time: no observation)
+        loop(0)
+    assert (eng.clock.mode, eng.clock.offset) == ("fixed", 0.0) and eng.entry_block() == ""
+    assert sent(eng, "server clock CHANGED")
+
+
+def test_explicit_clock_allows_entries_from_the_start(tmp_path):
+    cfg = cfg_for(tmp_path, mode="ny7")
+    eng, _ = make(cfg, eurjpy())
+    assert eng.clock_verified and eng.entry_block() == ""
 
 
 def test_stale_feed_watchdog_only_on_market_days(tmp_path):

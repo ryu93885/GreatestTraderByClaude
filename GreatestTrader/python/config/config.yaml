@@ -131,7 +131,7 @@ monitor:
 # ---------------------------------------------------------------------
 engine:
   dry_run: true              # ★true = 注文を出さずにシグナルのみ記録。本番は false (または --live-orders)
-  poll_seconds: 5            # 監視間隔(秒)
+  poll_seconds: 5            # 監視間隔(秒、1〜20)
   state_file: state/state.json   # 状態ファイル（毎日バックアップ14世代）。ドライランは state/state_dryrun.json を使用
   log_dir: logs              # logs/<コマンド>_YYYY-MM-DD.log（800日保存）、再起動記録 logs/restarts.log
   journal_dir: journal       # 取引記録 journal/trades_YYYY.csv と日次資産 journal/equity_log.csv（追記のみ）
