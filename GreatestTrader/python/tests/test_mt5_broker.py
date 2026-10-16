@@ -15,6 +15,7 @@ from greatest_trader.config import Config
 from greatest_trader.engine import FatalError, LiveEngine
 from greatest_trader.notify import Notifier
 from greatest_trader.ops import EXIT_RESTART
+from greatest_trader.strategies import ModifyRequest
 from greatest_trader.timeutil import ServerClock
 
 NY7 = ServerClock("ny7")
@@ -206,6 +207,19 @@ def test_cash_flows_and_closed_trade_from_history(b, clock):
     b.close_position(r.ticket, "EURJPY")
     ct = b.closed_trade(r.ticket)
     assert ct.reason == "expert" and ct.pnl == pytest.approx((130.10 - 130.01) * 100000 * 0.1 - 6.0)
+
+
+def test_transient_tp_modify_error_keeps_the_position(b, cfg):
+    """retcode 10024 (too many requests) on the TP update: the position is kept with its SL (it used to be closed
+    at market); the next bar sends the TP again."""
+    eng = LiveEngine(cfg, b, Notifier(cfg.notify))
+    b.open_position("EURJPY", 1, 0.1, 129.5, 130.3, 7101, "GT_NR")
+    pos = b.positions(eng.magics)[0]
+    S.retcodes = [10024]
+    eng._apply(ModifyRequest(pos.ticket, "EURJPY", 130.25, "TP -> moving average"), pos)
+    assert len(S.positions) == 1 and S.positions[0]["tp"] == 130.3
+    eng._apply(ModifyRequest(pos.ticket, "EURJPY", 130.25, "TP -> moving average"), pos)  # next bar: works
+    assert len(S.positions) == 1 and S.calls["order_send"] == 3
 
 
 def test_netting_account_is_detected(b, cfg):

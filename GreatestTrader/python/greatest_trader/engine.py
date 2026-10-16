@@ -46,6 +46,7 @@ CLOCK_CONFIRM = 3  # identical observations to adopt a changed offset (auto) / m
 MAX_FAIL_SECONDS = 1800.0  # continuous failure -> CRITICAL notification and exit code 3 (wrapper restarts)
 HEARTBEAT_SECONDS = 3600.0
 SYMBOL_RETRY_SECONDS = 3600.0  # unavailable symbols are tried again this often
+SYMBOL_FAIL_ALERT = 60  # loops in a row before a failing symbol is notified (then every 6 hours)
 STATE_SAVE_SECONDS = 60.0  # equity-only changes are written at most this often (everything else at once)
 CLOSED_LOOKUP_TRIES = 120  # loops to wait for the deal history of a closed position before journaling it
 FX_HOLIDAYS = {(12, 25), (1, 1)}  # market dates without trading
@@ -70,7 +71,8 @@ class LiveEngine:
         self.notifier = notifier or Notifier(cfg.notify)
         self.nr = NightReversion(cfg.night_reversion)
         self.es = EuroSession(cfg.euro_session)
-        self.state = RiskState.load(cfg.engine.state_file)  # never raises: backups, else HALTED
+        # corrupt -> newest backup, else HALTED; a file that stays locked raises (exit 1: the wrapper restarts)
+        self.state = RiskState.load(cfg.engine.state_file)
         self.risk = RiskManager(cfg.risk, self.state)
         self.journal = TradeJournal(cfg.engine.journal_dir)
         self.magics = {cfg.night_reversion.magic: "NR", cfg.euro_session.magic: "ES"}
@@ -99,12 +101,14 @@ class LiveEngine:
         self._saved_key = ""
 
     # ------------------------------------------------------------------ helpers
-    def _alert(self, text: str, key: str | None = None, every: float = 0.0, level: int = logging.WARNING) -> None:
-        """Log and notify. A keyed alert is sent (and logged at `level`) at most every `every` seconds."""
+    def _alert(self, text: str, key: str | None = None, every: float = 0.0, level: int = logging.WARNING) -> bool:
+        """Log and notify. A keyed alert is sent (and logged at `level`) at most every `every` seconds.
+        Returns True when it was sent."""
         if self.notifier.send(text, key=key, every=every):
             log.log(level, text)
-        else:
-            log.debug(text)
+            return True
+        log.debug(text)
+        return False
 
     def all_symbols(self) -> list[str]:
         syms = []
@@ -183,7 +187,7 @@ class LiveEngine:
     def run_forever(self) -> int:
         """Run until stopped. Returns the process exit code: EXIT_STOP (10) after Ctrl+C, EXIT_RESTART (3) after
         30 minutes of continuous failure (the wrapper starts a fresh process). FatalError propagates."""
-        fails, first_fail, next_start = 0, None, 0.0
+        fails, first_fail, next_start, told = 0, None, 0.0, False
         try:
             while True:
                 t0 = time.monotonic()
@@ -193,9 +197,11 @@ class LiveEngine:
                             self.start()
                     if self._started:
                         self.step()
-                        if fails:
-                            self._alert(f"recovered after {fails} failed loops")
-                        fails, first_fail = 0, None
+                        if fails and told:  # the operator got an ERROR for this failure: tell the recovery too
+                            self._alert(f"recovered after {fails} failed loops", key="loop-recovered", every=1800)
+                        elif fails:
+                            log.info("recovered after %d failed loops", fails)
+                        fails, first_fail, told = 0, None, False
                 except FatalError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - keep running, but tell the operator
@@ -207,7 +213,8 @@ class LiveEngine:
                         log.error("loop failed (%d in a row): %s", fails, exc)
                     else:
                         log.debug("loop failed (%d in a row): %s", fails, exc)
-                    self._alert(f"ERROR: {exc}", key="loop-error", every=1800, level=logging.ERROR)
+                    if self._alert(f"ERROR: {exc}", key="loop-error", every=1800, level=logging.ERROR):
+                        told = True
                     if not self._started:
                         next_start = time.monotonic() + min(60.0, 5.0 * 2 ** min(fails - 1, 4))
                     elif fails % 12 == 0:
@@ -295,8 +302,9 @@ class LiveEngine:
         self._save_state()
 
     def _isolated(self, name: str, fn, *args) -> None:
-        """Run one symbol's work; a failure is logged (full traceback only now and then) and notified after
-        60 loops in a row, and never stops the other symbols."""
+        """Run one symbol's work; a failure is logged (full traceback only now and then), notified after 60 loops
+        in a row and then every 6 hours while it lasts (also listed in the daily summary), and never stops the
+        other symbols."""
         try:
             fn(*args)
         except Exception as exc:  # noqa: BLE001
@@ -307,12 +315,17 @@ class LiveEngine:
                 log.error("%s failed (%d in a row): %s", name, n, exc)
             else:
                 log.debug("%s failed (%d in a row): %s", name, n, exc)
-            if n == 60:
+            if n >= SYMBOL_FAIL_ALERT:
                 self._alert(f"{name} failing for {n} loops: {exc} (the other symbols keep trading)",
                             key=f"symfail-{name}", every=6 * 3600)
             return
-        if self._sym_fail.pop(name, 0) >= 60:
+        if self._sym_fail.pop(name, 0) >= SYMBOL_FAIL_ALERT:
+            self.notifier.reset(f"symfail-{name}")  # a new failure is notified again after 60 loops
             self._alert(f"{name} works again")
+
+    def failing(self) -> list[str]:
+        """Symbols (and ES) failing for SYMBOL_FAIL_ALERT loops or more in a row."""
+        return sorted(n for n, k in self._sym_fail.items() if k >= SYMBOL_FAIL_ALERT)
 
     def _save_state(self) -> None:
         """Write the state when it changed; equity-only changes at most every STATE_SAVE_SECONDS."""
@@ -503,6 +516,8 @@ class LiveEngine:
                 parts.append(f"entries blocked: {block}")
             if self.disabled:
                 parts.append(f"unavailable symbols: {', '.join(sorted(self.disabled))}")
+            if self.failing():
+                parts.append("failing: " + ", ".join(f"{n} ({self._sym_fail[n]} loops)" for n in self.failing()))
             if self.notifier.failed_total:
                 parts.append(f"notification failures so far: {self.notifier.failed_total}")
             self._alert(" | ".join(parts), level=logging.INFO)
@@ -553,10 +568,10 @@ class LiveEngine:
         self._last_heartbeat = time.monotonic()
         mem = process_memory_mb()
         log.info("heartbeat: server=%s market=%s utc=%s equity=%.2f DD=%.1f%% open=%d halted=%s clock=%s%s "
-                 "entries=%s unavailable=%s mem=%s notify_failures=%d | GreatestTrader=%s %s", now_server, now_mkt,
-                 now_utc, equity, self.risk.drawdown(equity) * 100, len(positions), self.state.halted, self.clock,
-                 "" if self.clock_verified else " (unverified)", self.entry_block() or "allowed",
-                 sorted(self.disabled) or "-", f"{mem:.0f}MB" if mem is not None else "n/a",
+                 "entries=%s unavailable=%s failing=%s mem=%s notify_failures=%d | GreatestTrader=%s %s", now_server,
+                 now_mkt, now_utc, equity, self.risk.drawdown(equity) * 100, len(positions), self.state.halted,
+                 self.clock, "" if self.clock_verified else " (unverified)", self.entry_block() or "allowed",
+                 sorted(self.disabled) or "-", self.failing() or "-", f"{mem:.0f}MB" if mem is not None else "n/a",
                  self.notifier.failed_total, __version__, format_versions({**versions(), **self.broker.versions()}))
 
     # ------------------------------------------------------------------ trade journal
@@ -726,12 +741,20 @@ class LiveEngine:
     # ------------------------------------------------------------------ execution
     def _open_risk(self, positions: list[PositionView]) -> list[PositionView]:
         """Attach the remaining risk (loss to stop, account currency) to each position.
-        Only needed (and only priced) when the total-risk cap is on."""
+        Only needed (and only priced) when the total-risk cap is on. Fail closed (EA: same rule): an own position
+        WITHOUT a stop loss, or one that cannot be priced, counts as unlimited risk and fills the cap; a stop at
+        or beyond the entry price leaves no remaining risk."""
         if self.cfg.risk.max_total_risk <= 0:
             return positions
         for p in positions:
             p.risk_amount = 0.0
-            if p.sl and ((p.direction > 0 and p.sl < p.open_price) or (p.direction < 0 and p.sl > p.open_price)):
+            if not p.sl:
+                p.risk_amount = float("inf")
+                self._alert(f"{p.strategy} {p.symbol} ticket={p.ticket} has NO stop loss: its open risk counts as "
+                            f"unlimited, so the total-risk cap blocks new entries until it has a stop or is closed",
+                            key=f"nosl-{p.ticket}", every=6 * 3600)
+                continue
+            if (p.direction > 0 and p.sl < p.open_price) or (p.direction < 0 and p.sl > p.open_price):
                 try:
                     p.risk_amount = self.broker.loss_per_lot(p.symbol, p.direction, p.open_price, p.sl) * p.volume
                 except Exception as exc:  # noqa: BLE001 - fail closed: an unpriced position fills the risk cap
@@ -833,11 +856,27 @@ class LiveEngine:
             res = self.broker.modify_position(act.ticket, act.symbol, pos.sl, act.tp_price)
             if res.ok:
                 log.info("MODIFY %s %s TP -> %s (%s)", pos.strategy, act.symbol, act.tp_price, act.reason)
+            elif self._beyond_tp(pos, act):
+                # the TP can never be placed: a fresh quote is already past it -> take the profit at market
+                self._close(CloseRequest(act.ticket, act.symbol, "price beyond TP (TP not placeable)"))
             else:
-                log.warning("modify failed %s: %s", act.symbol, res.message)
-                # if the TP cannot be placed because price is already past it, close instead
-                if act.tp_price is not None:
-                    self._close(CloseRequest(act.ticket, act.symbol, "TP not placeable, close"))
+                # any other failure (too many requests, no connection, a lost reply, stops / freeze level, ...): the
+                # position keeps its SL and the time stop, the TP is sent again on the next bar (EA: same rule)
+                log.warning("modify failed %s ticket=%s: %s (SL kept, TP retried next bar)", act.symbol, act.ticket,
+                            res.message)
+
+    def _beyond_tp(self, pos: PositionView, act: ModifyRequest) -> bool:
+        """True when a fresh quote is already at or beyond the requested TP (bid for a long, ask for a short)."""
+        if act.tp_price is None:
+            return False
+        try:
+            t = self.broker.tick(act.symbol)
+        except Exception:  # noqa: BLE001 - no quote: nothing proves the TP is unplaceable
+            return False
+        if t is None:
+            return False
+        px = t.bid if pos.direction > 0 else t.ask
+        return px >= act.tp_price if pos.direction > 0 else px <= act.tp_price
 
     def _close(self, req: CloseRequest) -> None:
         if self.cfg.engine.dry_run:

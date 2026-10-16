@@ -24,7 +24,7 @@ import os
 import shutil
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from .config import RiskConfig
@@ -70,29 +70,64 @@ class RiskState:
 
     # ------------------------------------------------------------- persistence
     @classmethod
-    def load(cls, path: str | Path) -> "RiskState":
-        """Load the state; fall back to the newest readable daily backup. If no copy is readable, start
-        HALTED (the peak equity was lost: a human must check the account and run reset-halt).
+    def _parse(cls, text: str) -> "RiskState":
+        data = json.loads(text)  # JSONDecodeError is a ValueError
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+    @classmethod
+    def load(cls, path: str | Path, tries: int = 5, wait: float = 0.2) -> "RiskState":
+        """Load the state.
+
+        * A main file that cannot be OPENED (on Windows an anti-virus / indexer / backup tool may hold it for a
+          moment) is read again, like save() retries; if it stays locked, RuntimeError is raised (the process
+          exits and the wrapper restarts it): a lock is never mistaken for corruption, which would silently roll
+          the state back to the day's first backup (halts and monthly stops lost).
+        * A main file that is CORRUPT (not valid JSON / wrong types) is kept as <name>.<time>.corrupt.json and the
+          newest readable daily backup is used. If no copy is readable, the engine starts HALTED (the peak equity
+          was lost: a human must check the account and run reset-halt).
         `restored_from` tells the caller what happened ("" = normal load or a fresh start)."""
         p = Path(path)
-        cands = [p] + sorted(p.parent.glob(f"{p.stem}.*.bak.json"), reverse=True)
         errors = []
-        for c in cands:
-            if not c.exists():
-                continue
+        if p.exists():
+            text = None
+            for attempt in range(tries):
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        text = f.read()
+                    break
+                except UnicodeDecodeError as exc:  # garbage bytes: corruption, not a lock
+                    errors.append(f"{p.name}: {exc}")
+                    break
+                except OSError as exc:
+                    if attempt == tries - 1:
+                        raise RuntimeError(f"state file {p} cannot be read ({exc}): is another program (anti-virus, "
+                                           f"backup) holding it? Not starting on an older backup") from None
+                    time.sleep(wait)
+            if text is not None:
+                try:
+                    st = cls._parse(text)
+                    st.restored_from = ""
+                    return st
+                except (ValueError, TypeError) as exc:
+                    errors.append(f"{p.name}: {exc}")
+            keep = p.with_name(f"{p.stem}.{datetime.now():%Y%m%d-%H%M%S}.corrupt.json")
+            try:  # kept for inspection; the next save() writes a fresh state file
+                os.replace(p, keep)
+                log.error("state file %s is corrupt: kept as %s", p.name, keep.name)
+            except OSError as exc:
+                log.error("state file %s is corrupt and could not be renamed: %s", p.name, exc)
+        for c in sorted(p.parent.glob(f"{p.stem}.*.bak.json"), reverse=True):
             try:
                 with open(c, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    raise ValueError("not a JSON object")
-                st = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-            except (ValueError, TypeError, OSError) as exc:  # JSONDecodeError is a ValueError
+                    st = cls._parse(f.read())
+            except (ValueError, TypeError, OSError) as exc:
                 errors.append(f"{c.name}: {exc}")
                 continue
-            st.restored_from = "" if c == p else c.name
-            if c != p:
-                log.error("state file %s unreadable or missing (%s) -> restored from backup %s", p.name,
-                          "; ".join(errors) or "missing", c.name)
+            st.restored_from = c.name
+            log.error("state file %s unreadable or missing (%s) -> restored from backup %s", p.name,
+                      "; ".join(errors) or "missing", c.name)
             return st
         st = cls()
         st.restored_from = ""

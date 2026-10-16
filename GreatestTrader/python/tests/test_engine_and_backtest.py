@@ -13,6 +13,7 @@ from greatest_trader.broker.base import OrderResult
 from greatest_trader.config import Config, load_config
 from greatest_trader.engine import LiveEngine
 from greatest_trader.notify import Notifier
+from greatest_trader.strategies import ModifyRequest
 from greatest_trader.timeutil import ServerClock
 
 SPIKE = datetime(2021, 3, 3, 0, 30)  # Wednesday, market time (= server time for ny7 brokers)
@@ -100,6 +101,38 @@ def test_unpriced_open_position_fills_the_total_risk_cap(tmp_path):
     views = eng._open_risk(broker.positions(eng.magics))
     assert views[0].risk_amount == float("inf")
     assert not eng.risk.can_open("NR", "GBPJPY", views, 1_000_000, -1, 1000)[0]
+
+
+def test_position_without_stop_loss_fills_the_total_risk_cap(tmp_path):
+    """Fail closed, like the EA: an own position without a stop loss has unlimited risk (it counted as 0 and the
+    engine kept opening trades); a stop at or beyond the entry leaves no remaining risk."""
+    data = {"EURJPY": synthetic_m15(datetime(2021, 3, 1), 5, 130.0, 0.01, spike_at=SPIKE)}
+    eng, broker = make_engine(make_cfg(tmp_path), data)
+    broker.set_time(datetime(2021, 3, 2, 22, 0, 5))
+    broker.open_position("EURJPY", 1, 0.1, None, None, 7101, "GT_NR")  # SL removed by hand
+    eng.risk.cfg.max_total_risk = 0.05
+    views = eng._open_risk(broker.positions(eng.magics))
+    assert views[0].risk_amount == float("inf")
+    assert eng.risk.can_open("NR", "GBPJPY", views, 1_000_000, -1, 1000) == (False, "max total open risk")
+    assert any("has NO stop loss" in m for m in eng.notifier.recent)
+    broker.positions_[0].sl = broker.positions_[0].open_price + 0.05  # stop beyond the entry: no remaining risk
+    assert eng._open_risk(broker.positions(eng.magics))[0].risk_amount == 0.0
+
+
+def test_failed_tp_modify_closes_only_when_the_price_is_beyond_the_tp(tmp_path):
+    """EA rule: after a failed TP update the NR position is closed only when a fresh quote is already past the
+    requested TP; any other failure keeps the position (SL and time stop) and the TP is retried on the next bar."""
+    data = {"EURJPY": synthetic_m15(datetime(2021, 3, 1), 5, 130.0, 0.01, spike_at=SPIKE)}
+    eng, broker = make_engine(make_cfg(tmp_path), data)
+    broker.set_time(datetime(2021, 3, 2, 22, 0, 5))
+    broker.open_position("EURJPY", 1, 0.1, 129.0, None, 7101, "GT_NR")
+    pos = broker.positions(eng.magics)[0]
+    broker.modify_position = lambda *a: OrderResult(False, message="retcode=10024 too many requests")
+    bid = broker.tick("EURJPY").bid
+    eng._apply(ModifyRequest(pos.ticket, "EURJPY", bid + 0.20, "TP -> moving average"), pos)  # TP not reached
+    assert broker.positions_ and not any(x[0] == "close" for x in broker.log)
+    eng._apply(ModifyRequest(pos.ticket, "EURJPY", bid - 0.01, "TP -> moving average"), pos)  # price past the TP
+    assert not broker.positions_ and ("close", "EURJPY", "GT price beyond TP (TP not placeable)") in broker.log
 
 
 def test_live_engine_ignores_stale_bar_on_startup(tmp_path):

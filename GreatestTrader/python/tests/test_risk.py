@@ -202,3 +202,46 @@ def test_state_replace_is_retried_on_permission_error(tmp_path, monkeypatch):
     monkeypatch.setattr(risk_mod.time, "sleep", lambda s: None)
     RiskState(peak_equity=9.0).save(p)
     assert RiskState.load(p).peak_equity == 9.0 and len(fails) == 2
+
+
+def test_a_locked_state_file_is_read_again_not_rolled_back(tmp_path, monkeypatch):
+    """A PermissionError (anti-virus / indexer lock) is not corruption: the main file is read again instead of
+    silently restoring the day's first backup (which cleared halted / month_halted)."""
+    p = tmp_path / "state.json"
+    RiskState(peak_equity=10_000, month="2026-10").save(p)  # the first save of the day is also today's backup
+    RiskState(peak_equity=10_000, month="2026-10", halted=True, halt_reason="max drawdown 20.0%", month_halted=True,
+              cash_tickets=[[77, 1.0]]).save(p)
+    real_open, fails = open, []
+
+    def flaky_open(f, *a, **k):
+        if str(f) == str(p) and len(fails) < 2:
+            fails.append(1)
+            raise PermissionError(13, "The process cannot access the file because it is being used")
+        return real_open(f, *a, **k)
+
+    monkeypatch.setattr("builtins.open", flaky_open)
+    monkeypatch.setattr(risk_mod.time, "sleep", lambda s: None)
+    st = RiskState.load(p)
+    assert st.restored_from == "" and st.halted and st.month_halted and st.cash_tickets == [[77, 1.0]]
+
+    def locked(f, *a, **k):
+        if str(f) == str(p):
+            raise PermissionError(13, "locked")
+        return real_open(f, *a, **k)
+
+    monkeypatch.setattr("builtins.open", locked)
+    with pytest.raises(RuntimeError, match="cannot be read"):  # stays locked: restart, never an older backup
+        RiskState.load(p)
+
+
+def test_a_corrupt_state_file_is_kept_for_inspection(tmp_path):
+    p = tmp_path / "state.json"
+    RiskState(peak_equity=12_345.0).save(p)
+    p.write_text('{"peak_equity": 12345.0, "day": "2026-10-1', encoding="utf-8")
+    st = RiskState.load(p)
+    assert st.peak_equity == 12_345.0 and st.restored_from.endswith(".bak.json")
+    kept = list(tmp_path.glob("state.*.corrupt.json"))
+    assert len(kept) == 1 and kept[0].read_text(encoding="utf-8").startswith('{"peak_equity": 12345.0, "day"')
+    assert not p.exists()  # the next save writes a fresh file; the corrupt one is not overwritten
+    st.save(p)
+    assert RiskState.load(p).peak_equity == 12_345.0 and len(list(tmp_path.glob("state.*.corrupt.json"))) == 1

@@ -12,6 +12,7 @@ from greatest_trader.broker.base import CashFlow
 from greatest_trader.config import Config, load_config
 from greatest_trader.engine import M15, LiveEngine
 from greatest_trader.journal import TradeJournal, risk_weighted_r
+from greatest_trader.live_report import edge_monitor_table
 from greatest_trader.notify import Notifier
 from greatest_trader.risk import RiskState
 from greatest_trader.strategies import PositionView
@@ -284,6 +285,65 @@ def test_broken_euro_session_does_not_stop_night_reversion(tmp_path):
     assert {"EURCAD", "EURJPY"} <= set(opened) and "EURUSD" not in opened
 
 
+def test_failing_symbol_is_notified_every_6_hours_and_in_the_daily_summary(tmp_path, monkeypatch):
+    t = [0.0]
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: t[0])
+    cfg = cfg_for(tmp_path, syms=["EURJPY", "GBPJPY"])
+    data = {s: synthetic_m15(datetime(2025, 1, 13), 5, 160.0, 0.01, seed=k) for k, s in enumerate(("EURJPY", "GBPJPY"))}
+    eng, br = make(cfg, data)
+    orig = br.rates
+    broken = {"GBPJPY"}
+
+    def rates(base, tf, n):
+        if base in broken:
+            raise RuntimeError(f"copy_rates {base} M15 failed")
+        return orig(base, tf, n)
+
+    br.rates = rates
+    start = datetime(2025, 1, 14, 0, 0, 5)  # Tuesday
+    for k in range(289):  # every 5 minutes for 24 hours
+        t[0] = k * 300.0
+        br.set_time(start + timedelta(minutes=5 * k))
+        eng.step()
+    alerts = sent(eng, "GBPJPY failing for")
+    assert len(alerts) == 4 and alerts[0].startswith("GBPJPY failing for 60 loops")  # 05:00, 11:00, 17:00, 23:00
+    daily = sent(eng, "DAILY 2025-01-14")
+    assert daily and "failing: GBPJPY (288 loops)" in daily[0]
+    broken.clear()
+    t[0] += 300
+    br.set_time(start + timedelta(minutes=5 * 289))
+    eng.step()
+    assert sent(eng, "GBPJPY works again") and eng.failing() == []
+
+
+def test_recovery_is_notified_only_after_an_error_notification(tmp_path, monkeypatch):
+    """Failures that come and go: 'recovered' is sent only for a failure whose ERROR was sent, at most every 30
+    minutes (it used to be sent after every failed loop: 360 notifications an hour)."""
+    t = [0.0]
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: t[0])
+    eng, br = make(cfg_for(tmp_path), eurjpy(start=datetime(2021, 3, 1), days=5))
+    br.set_time(datetime(2021, 3, 2, 10, 0, 5))
+    real_step, n = eng.step, [0]
+
+    def flaky_step():  # every other loop fails
+        n[0] += 1
+        if n[0] % 2 == 0:
+            raise RuntimeError("positions_get failed: (-10005, 'IPC timeout')")
+        real_step()
+
+    def fake_sleep(s):
+        t[0] += 5
+        br.set_time(br.now + timedelta(seconds=5))
+        if t[0] > 3600:
+            raise KeyboardInterrupt
+
+    eng.step = flaky_step
+    monkeypatch.setattr(engine_mod.time, "sleep", fake_sleep)
+    assert eng.run_forever() == 10
+    errors, recovered = sent(eng, "ERROR: positions_get failed"), sent(eng, "recovered after")
+    assert len(errors) == 2 and len(recovered) == 2  # 360 fail/recover pairs in the hour
+
+
 def test_unavailable_symbol_at_start_is_disabled_and_notified(tmp_path):
     cfg = cfg_for(tmp_path, syms=["EURJPY", "XYZJPY"])
     eng, br = make(cfg, eurjpy(spike_at=SPIKE), equity=1_000_000)
@@ -410,6 +470,18 @@ def test_edge_monitor_warn_review_and_recovery(tmp_path):
         br.set_time(t)
         eng.step()
     assert sent(eng, "back to") and eng.state.edge_neg_months == 0
+
+
+def test_report_edge_monitor_uses_market_months_like_the_engine():
+    """NR trades of the first market day of April close on March 31 (21:00-23:59 UTC): the report must count them
+    in April, as the engine's month-end evaluation does (it showed a March WARN the engine never sent)."""
+    rows = [{"event": "close", "time_utc": f"2026-03-{2 + k // 3:02d} 01:{k % 3:02d}:00", "R": 0.10,
+             "base_risk": 0.035} for k in range(60)]
+    rows += [{"event": "close", "time_utc": f"2026-03-31 {21 + k // 3}:{(k % 3) * 20:02d}:00", "R": -1.5,
+              "base_risk": 0.035} for k in range(6)]
+    t = edge_monitor_table(pd.DataFrame(rows), 250)
+    assert t.loc["2026-03", "trades"] == 60 and t.loc["2026-03", "status"] == "ok"
+    assert t.loc["2026-04", "trades"] == 66 and t.loc["2026-04", "status"] == "WARN"
 
 
 def test_risk_weighted_r_uses_base_risk_weights():
