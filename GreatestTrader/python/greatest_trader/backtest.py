@@ -386,7 +386,7 @@ class Backtester:
                 p.entry, p.sl_dist = entry, req.sl_distance
                 p.sl = entry - req.direction * req.sl_distance
                 # sized on realized equity (live sizes on account equity incl. floating P/L; the difference
-                # is negligible here: stable5 5.38% vs 5.39%/month when sized on mark-to-market equity)
+                # is negligible here: stable5 changes by less than 0.01%/month when sized on MTM equity)
                 p.risk_amt = equity * rfrac
                 slip = nr_cfg.slippage_pips if strat == "NR" else es_cfg.slippage_pips
                 sig_i = j - 1 if strat == "NR" else j
