@@ -1892,6 +1892,25 @@ bool ScanDeals(double &flow, int &count)
    return fresh;
   }
 
+// keeps the newest deal ticket of any type current while the balance does not change, so that "a new deal" in
+// HandleCashFlows means one booked since the previous cycle (an entry deal booked an hour ago, which does not
+// change the balance, must not explain a later deposit or withdrawal)
+void TrackNewestDeal()
+  {
+   long fromL = (long)TimeCurrent() - 2 * 86400;
+   if(fromL < 0)
+      fromL = 0;
+   if(!HistorySelect((datetime)fromL, GT_FAR_FUTURE))
+      return;
+   int n = HistoryDealsTotal();
+   for(int i = 0; i < n; i++)
+     {
+      ulong tk = HistoryDealGetTicket(i);
+      if(tk > g_allTicket)
+         g_allTicket = tk;
+     }
+  }
+
 // rescale every equity baseline by k = E / (E - F) so that the percentage guards (DD scaling, max-DD halt,
 // daily limit, monthly stop, vol target / equity filter) stay exactly where they were before the flow
 void ApplyCashFlow(const double flow, const int count, const double eq)
@@ -1930,8 +1949,9 @@ void ApplyCashFlow(const double flow, const int count, const double eq)
    Log(StringFormat("CASH FLOW %+.2f detected, guards rebased (%s)", flow, how), true);
   }
 
-// Returns false ("pending") while a balance / credit change is not yet explained by any new deal (trade or cash)
-// in the history: in that cycle the peak is not raised, no halt / month / day stop is evaluated and nothing is
+// Returns false ("pending") while a balance / credit change is not yet explained by any new deal (trade or cash,
+// newer than the newest deal seen in the previous cycle) in the history: in that cycle the peak is not raised, no
+// halt / month / day stop is evaluated and nothing is
 // opened; closes, time stops and TP management continue. Pending lasts at most GT_FLOW_PENDING_SEC, then the
 // change counts as profit / loss. eq is read again AFTER the deal scan, so that k and this cycle's guards use an
 // equity that contains every flow the scan found. Live only (shared contract with the Python engine).
@@ -1943,6 +1963,10 @@ bool HandleCashFlows(double &eq)
    if(g_lastBalCred != 0.0 && MathAbs(bc - g_lastBalCred) < 0.005)
      {
       g_pendingSince = 0;
+      ulong allTk = g_allTicket;
+      TrackNewestDeal();
+      if(MathAbs(AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT) - bc) >= 0.005)
+         g_allTicket = allTk;   // a deal was booked during the read: it explains the change on the next cycle
       return true;
      }
    double flow = 0.0;
