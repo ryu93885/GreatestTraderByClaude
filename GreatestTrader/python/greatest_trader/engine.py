@@ -224,7 +224,10 @@ class LiveEngine:
 
     # ------------------------------------------------------------------ execution
     def _open_risk(self, positions: list[PositionView]) -> list[PositionView]:
-        """Attach the remaining risk (loss to stop, account currency) to each position."""
+        """Attach the remaining risk (loss to stop, account currency) to each position.
+        Only needed (and only priced) when the total-risk cap is on."""
+        if self.cfg.risk.max_total_risk <= 0:
+            return positions
         for p in positions:
             p.risk_amount = 0.0
             if p.sl and ((p.direction > 0 and p.sl < p.open_price) or (p.direction < 0 and p.sl > p.open_price)):

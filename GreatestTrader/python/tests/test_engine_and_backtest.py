@@ -89,9 +89,10 @@ def test_unpriced_open_position_fills_the_total_risk_cap(tmp_path):
         raise RuntimeError("no price")
 
     broker.loss_per_lot = broken
+    assert eng._open_risk(broker.positions(eng.magics))[0].risk_amount == 0.0  # cap off: not priced at all
+    eng.risk.cfg.max_total_risk = 0.05
     views = eng._open_risk(broker.positions(eng.magics))
     assert views[0].risk_amount == float("inf")
-    eng.risk.cfg.max_total_risk = 0.05
     assert not eng.risk.can_open("NR", "GBPJPY", views, 1_000_000, -1, 1000)[0]
 
 

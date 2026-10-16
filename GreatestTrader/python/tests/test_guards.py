@@ -128,12 +128,15 @@ def test_validation_of_v11_risk_keys():
     tmp = pathlib.Path(tempfile.mkdtemp())
     c = cfg_with(tmp, "preset: stable5\nrisk:\n  symbol_risk_mult:\n")
     assert c.risk.symbol_risk_mult == {}  # empty mapping -> no multipliers
-    c = cfg_with(tmp, "preset: stable5\nrisk:\n  symbol_risk_mult: {eurjpy: 0.5}\n")
-    assert c.risk.symbol_risk_mult == {"EURJPY": 0.5}
+    c = cfg_with(tmp, "preset: stable5\nrisk:\n  symbol_risk_mult: {eurjpy: 0.5, EURUSD.raw: 0.25}\n")
+    assert c.risk.symbol_risk_mult == {"EURJPY": 0.5, "EURUSD": 0.25}  # base names, like the EA
     for bad in ("symbol_risk_mult: {GBPCAD: 3.0}", "symbol_risk_mult: {GBPCAD: -1}", "max_total_risk: -0.05",
-                "monthly_hard_stop: 1.5", "max_same_direction_per_currency: -2", "dd_scale_floor: 2"):
+                "monthly_hard_stop: 1.5", "max_same_direction_per_currency: -2", "dd_scale_floor: 2",
+                "max_positions_per_currency: 0", "vol_mult_min:"):
         with pytest.raises(ValueError):
             cfg_with(tmp, f"preset: stable5\nrisk:\n  {bad}\n")
+    with pytest.raises(ValueError):
+        cfg_with(tmp, "night_reversion:\n  max_band_z:\n")
 
 
 def test_preset_label_shows_config_overrides(tmp_path):

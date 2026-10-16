@@ -193,19 +193,21 @@ class Config:
             for name in ("nr", "es"):
                 if r.base_risk(name) * m > 0.05 + 1e-12:
                     raise ValueError(f"risk per trade for {s} ({name}: base risk x symbol_risk_mult) must be <= 5%")
-            mults[str(s).upper()] = float(m)
+            mults[str(s).strip().upper()[:6]] = float(m)  # base name, like the EA (a broker suffix is ignored)
         r.symbol_risk_mult = mults
         for k in ("max_total_risk", "daily_loss_limit", "daily_hard_stop", "monthly_loss_limit", "monthly_hard_stop",
                   "max_drawdown_halt", "dd_scale_full", "dd_scale_floor", "vol_target_daily", "eq_filter_mult"):
             v = getattr(r, k)
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1:
                 raise ValueError(f"risk.{k} must be a fraction between 0 and 1 (got {v!r})")
-        for k in ("max_same_direction_per_currency", "max_positions_per_currency", "vol_lookback_days",
-                  "eq_filter_days"):
+        for k in ("max_same_direction_per_currency", "vol_lookback_days", "eq_filter_days"):
             v = getattr(r, k)
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
                 raise ValueError(f"risk.{k} must be an integer >= 0 (got {v!r})")
-        if not 0 <= r.vol_mult_min <= r.vol_mult_max:
+        if isinstance(r.max_positions_per_currency, bool) or not isinstance(r.max_positions_per_currency, int) \
+                or r.max_positions_per_currency < 1:
+            raise ValueError("risk.max_positions_per_currency must be an integer >= 1")
+        if not (_is_num(r.vol_mult_min) and _is_num(r.vol_mult_max) and 0 <= r.vol_mult_min <= r.vol_mult_max):
             raise ValueError("risk: need 0 <= vol_mult_min <= vol_mult_max")
         for v in (r.blackout_start, r.blackout_end):
             if v and not _valid_mmdd(v):
@@ -219,13 +221,18 @@ class Config:
             raise ValueError("indicator periods must be >= 2")
         if any(h < 0 or h > 23 for h in nr.entry_hours):
             raise ValueError("night_reversion.entry_hours must be 0..23")
-        if nr.max_band_z < 0 or nr.max_bar_range_atr < 0:
+        if not (_is_num(nr.max_band_z) and _is_num(nr.max_bar_range_atr)) or nr.max_band_z < 0 \
+                or nr.max_bar_range_atr < 0:
             raise ValueError("night_reversion.max_band_z / max_bar_range_atr must be >= 0 (0 = off)")
         es = self.euro_session
         if not (0 <= es.entry_utc_hour < es.exit_utc_hour <= 23):
             raise ValueError("euro_session: need 0 <= entry_utc_hour < exit_utc_hour <= 23")
         if es.direction not in (-1, 1):
             raise ValueError("euro_session.direction must be -1 (sell) or 1 (buy)")
+
+
+def _is_num(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
 def _valid_mmdd(v: str) -> bool:

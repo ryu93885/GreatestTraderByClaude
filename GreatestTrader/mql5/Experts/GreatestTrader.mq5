@@ -453,7 +453,27 @@ double SymbolMult(const string sym)
    return 1.0;
   }
 
-void ParseSymbolMult()
+bool IsPlainNumber(string v)
+  {
+   StringTrimLeft(v);
+   StringTrimRight(v);
+   int digits = 0, dots = 0;
+   for(int i = 0; i < StringLen(v); i++)
+     {
+      ushort c = StringGetCharacter(v, i);
+      if(c >= '0' && c <= '9')
+         digits++;
+      else
+         if(c == '.')
+            dots++;
+         else
+            return false;
+     }
+   return (digits > 0 && dots <= 1);
+  }
+
+// returns false (and prints the item) when an item is not SYMBOL:number
+bool ParseSymbolMult()
   {
    ArrayResize(g_multSym, 0);
    ArrayResize(g_multVal, 0);
@@ -461,9 +481,17 @@ void ParseSymbolMult()
    int n = StringSplit(InpSymbolRiskMult, ',', items);
    for(int i = 0; i < n; i++)
      {
-      string kv[];
-      if(StringSplit(items[i], ':', kv) != 2)
+      string item = items[i];
+      StringTrimLeft(item);
+      StringTrimRight(item);
+      if(StringLen(item) == 0)
          continue;
+      string kv[];
+      if(StringSplit(item, ':', kv) != 2 || !IsPlainNumber(kv[1]))
+        {
+         Print("[GT] InpSymbolRiskMult: invalid item '", item, "' (expected SYMBOL:number, e.g. EURJPY:0.25)");
+         return false;
+        }
       string k = kv[0];
       StringTrimLeft(k);
       StringTrimRight(k);
@@ -473,8 +501,12 @@ void ParseSymbolMult()
       ArrayResize(g_multSym, m + 1);
       ArrayResize(g_multVal, m + 1);
       g_multSym[m] = k;
-      g_multVal[m] = StringToDouble(kv[1]);
+      string v = kv[1];
+      StringTrimLeft(v);
+      StringTrimRight(v);
+      g_multVal[m] = StringToDouble(v);
      }
+   return true;
   }
 
 int ParseMMDD(const string v)
@@ -1128,7 +1160,8 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
      }
 
-   ParseSymbolMult();
+   if(!ParseSymbolMult())
+      return INIT_PARAMETERS_INCORRECT;
    for(int i = 0; i < ArraySize(g_multVal); i++)
       if(g_multVal[i] < 0.0 || BaseRisk(true) * g_multVal[i] > 0.05 + 1e-12 || BaseRisk(false) * g_multVal[i] > 0.05 + 1e-12)
         {
