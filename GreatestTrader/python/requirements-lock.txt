@@ -1,0 +1,8 @@
+# Exact versions tested with GreatestTrader on Python 3.13 (setup_windows.bat installs this file).
+# Change a pin only after the tests pass with the new version: python -m pytest -q
+MetaTrader5==5.0.6231 ; sys_platform == "win32"
+numpy==2.5.3
+pandas==3.0.5
+python-dateutil==2.9.0.post0
+six==1.17.0
+PyYAML==6.0.3

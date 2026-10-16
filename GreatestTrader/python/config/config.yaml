@@ -19,7 +19,9 @@ account:
 broker:
   symbol_suffix: ""          # 通貨ペア名の接尾辞。例 ".raw" "-STD" "m" (EURUSD.raw など)
   symbol_map: {}             # 個別に名前が違う場合: {"EURUSD": "EURUSDmicro"}
-  server_time_mode: auto     # auto=自動判定 / ny7=GMT+2(冬)/+3(夏) / fixed=固定オフセット
+  server_time_mode: auto     # auto=稼働中に最新ティックから常時計測（起動後に確認できるまで新規エントリーしない。
+                             #      週末の再起動でも古いティックで判定しない。変化は3回連続で確認してから採用し通知）
+                             # ny7=GMT+2(冬)/+3(夏) / fixed=固定オフセット（どちらも常時検証し、3回連続で食い違うと新規停止＋通知）
   server_gmt_offset: 2.0     # fixed のときのサーバー時間の GMT オフセット(時間)
   commission_per_lot: 0.0    # 1ロット往復の手数料(口座通貨)。ECN口座は必ず設定 例: 7.0(USD口座) / 1000(JPY口座)
   deviation_points: 20       # 成行注文の許容スリッページ(ポイント)
@@ -30,6 +32,8 @@ broker:
 #           stable4               より堅牢（中核ペアの1取引リスク2%）。過去検証: 月利4.4% / 最大DD約11% / 最悪月-3.7%
 #           safe2                 最悪月 -2% 前後を優先。過去検証: 月利2.0% / 最大DD約12% / 最悪月-2.0%
 #           classic_conservative / classic_standard / classic_aggressive   v1.0 と同じ考え方（保護機能なし）
+#   ※ 上の過去検証値は 1注文のロット上限が効かない（小さな口座の）場合の値です。資産が増えて上限
+#     (max_lots_per_order 20ロット) に達すると、利益は % ではなく金額でほぼ一定になります。
 #   ※ 3つの目標（月利5%・DD20%以内・最悪月-2%）を同時に満たすプリセットはありません。詳細は docs/05_安定化改修報告書.md
 #   ※ 本番の最初は、下の risk: でリスクを半分にして始めてください（例: risk_nr: 0.0175, risk_es: 0.00875）。
 #   プリセットの中身は python/greatest_trader/presets/*.yaml にあります。
@@ -51,10 +55,16 @@ preset: stable5
 #   daily_loss_limit: 0.01         # 当日 -1% で当日の新規停止
 #   monthly_loss_limit: 0.0        # 当月 -x% で当月の新規停止 (0=オフ)
 #   monthly_hard_stop: 0.03        # 当月 -3% で全決済し当月停止
-#   max_drawdown_halt: 0.40        # 最高資産から -40% で全新規停止 (state/state.json を削除で解除)
+#   max_drawdown_halt: 0.20        # 最高資産から -20% で全新規停止（stable5/stable4/safe2 は 0.20、classic_* は 0.40）
+#                                  # 解除: エンジンを止めて python main.py reset-halt（--rebase-peak で最高資産を現在値に）
+#                                  # ※ state/state.json は削除しないこと（最高資産・入出金・時計の記録が消えます）
 #   blackout_start: "12-20"        # 年末年始は新規エントリーしない（12/20〜1/5、空欄でオフ）
 #   blackout_end: "01-05"
 #   min_lot_policy: skip           # 計算ロットが最小ロット未満: skip=見送り / min=最小ロットで発注
+#   max_lots_per_order: 20         # 1注文の最大ロット（全戦略、0=オフ）。日付変更直後は流動性が薄いため、資産が増えても
+#                                  # ここで頭打ち。ブローカーの最大ロット(volume_max)も併せて適用（厳しい方が優先）
+#   max_risk_amount: 0             # 1取引の最大リスク額 = 損切り時の損失額（口座通貨、0=オフ）。例: 円口座で 300000
+#                                  # どちらの上限もポートフォリオ制限（合計リスク等）の判定より先に適用されます
 
 # ---------------------------------------------------------------------
 # 戦略1: Night Reversion (主力) — 日付変更直後の平均回帰
@@ -99,6 +109,18 @@ notify:
   slack_webhook: ""
   telegram_bot_token: ""
   telegram_chat_id: ""
+  healthcheck_url: ""        # 死活監視 (例: healthchecks.io の Ping URL)。正常稼働中は5分ごとにアクセスし、
+                             # 止まる（VPS停止・MT5切断・異常終了）と外部サービスから通知が届きます。空欄=オフ
+
+# ---------------------------------------------------------------------
+# 監視 (通知のみ。取引ルールは一切変えません)
+# ---------------------------------------------------------------------
+monitor:
+  dd_alert: 0.15             # 最高資産からのDDがこの値以上で通知（DD中は1日1回まで、0=オフ）
+  daily_summary: true        # 毎日（マーケット日付の切替時）に資産・DD・月初来リターン・取引数・停止状態を通知
+  edge_window_trades: 250    # 優位性モニター: 直近250件の決済の R（損益÷リスク額）をリスク加重平均し、
+                             # 月末にマイナスなら WARN、2か月連続なら REVIEW（コストと最新データの再検証を推奨）
+  stale_feed_minutes: 10     # 平日にサーバー時刻がこの分数以上進まないと通知（1時間ごと）
 
 # ---------------------------------------------------------------------
 # エンジン
@@ -106,8 +128,9 @@ notify:
 engine:
   dry_run: true              # ★true = 注文を出さずにシグナルのみ記録。本番は false (または --live-orders)
   poll_seconds: 5            # 監視間隔(秒)
-  state_file: state/state.json
-  log_dir: logs
+  state_file: state/state.json   # 状態ファイル（毎日バックアップ14世代）。ドライランは state/state_dryrun.json を使用
+  log_dir: logs              # logs/<コマンド>_YYYY-MM-DD.log（800日保存）、再起動記録 logs/restarts.log
+  journal_dir: journal       # 取引記録 journal/trades_YYYY.csv と日次資産 journal/equity_log.csv（追記のみ）
   log_level: INFO
   history_bars: 300
 
@@ -119,5 +142,8 @@ backtest:
   start:                     # 例 "2020-01-01" (空欄=データ全期間)
   end:
   initial_equity: 10000
+  account_currency: USD      # 口座通貨（USD / JPY など）。ロット上限の換算に読み込んだ通貨ペアを使用
+                             # 換算できるペアがない通貨ペアは上限なしで計算し、警告を表示
+  leverage: 0                # 口座レバレッジ（例 25）。指定すると本番と同じ証拠金チェックを行う（0=オフ）
   commission_pips: 0.0       # データのスプレッドに手数料が含まれない場合に加算する往復手数料(pips)
   output_dir: backtest_output

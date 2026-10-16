@@ -1,0 +1,4 @@
+# Optional extras: backtest charts (matplotlib) and the test suite (pytest), on top of the tested runtime pins.
+-r requirements-lock.txt
+matplotlib==3.11.2
+pytest==9.1.1
