@@ -5,7 +5,7 @@ import pandas as pd
 from fakes import FakeBroker, step_until, synthetic_m15
 from greatest_trader.backtest import Backtester
 from greatest_trader.broker.base import OrderResult
-from greatest_trader.config import Config
+from greatest_trader.config import Config, load_config
 from greatest_trader.engine import LiveEngine
 from greatest_trader.notify import Notifier
 from greatest_trader.timeutil import ServerClock
@@ -79,6 +79,22 @@ def test_live_engine_retries_flatten_while_hard_stop_active(tmp_path):
     assert any(x[0] == "close" and "monthly hard stop" in x[2] for x in broker.log)
 
 
+def test_unpriced_open_position_fills_the_total_risk_cap(tmp_path):
+    data = {"EURJPY": synthetic_m15(datetime(2021, 3, 1), 5, 130.0, 0.01, spike_at=SPIKE)}
+    eng, broker = make_engine(make_cfg(tmp_path), data)
+    broker.set_time(datetime(2021, 3, 2, 22, 0, 5))
+    broker.open_position("EURJPY", 1, 0.1, 129.0, None, 7101, "GT_NR")
+
+    def broken(*a, **k):
+        raise RuntimeError("no price")
+
+    broker.loss_per_lot = broken
+    views = eng._open_risk(broker.positions(eng.magics))
+    assert views[0].risk_amount == float("inf")
+    eng.risk.cfg.max_total_risk = 0.05
+    assert not eng.risk.can_open("NR", "GBPJPY", views, 1_000_000, -1, 1000)[0]
+
+
 def test_live_engine_ignores_stale_bar_on_startup(tmp_path):
     data = {"EURJPY": synthetic_m15(datetime(2021, 3, 1), 5, 130.0, 0.01, spike_at=SPIKE)}
     eng, broker = make_engine(make_cfg(tmp_path), data)
@@ -111,6 +127,42 @@ def test_backtest_matches_live_engine(tmp_path):
     step_until(eng, broker, datetime(2021, 3, 1, 0, 0), datetime(2021, 3, 5, 23, 45))
     bt = [(pd.Timestamp(r.entry_time), int(r.direction)) for r in t.itertuples()]
     assert opened == bt
+
+
+def test_backtest_matches_live_engine_when_guards_compete(tmp_path):
+    """Several pairs signal on the same bars and the stable5 guards (total risk, same direction) can admit
+    only some of them: live trading must pick exactly the same trades as the backtester, even when the
+    configured symbol order is not alphabetical."""
+    syms = [("EURJPY", 130.0, 0.01), ("GBPJPY", 150.0, 0.01), ("CHFJPY", 115.0, 0.01),
+            ("GBPCAD", 1.70, 0.0001), ("EURCAD", 1.50, 0.0001), ("AUDCAD", 0.95, 0.0001)]
+    data = {s: synthetic_m15(datetime(2021, 3, 1), 8, b, p, seed=7 + k) for k, (s, b, p) in enumerate(syms)}
+    cfg = load_config(None, preset="stable5")
+    cfg.night_reversion.symbols = list(data)  # not alphabetical
+    cfg.euro_session.enabled = False
+    cfg.engine.dry_run = False
+    cfg.engine.state_file = str(tmp_path / "state.json")
+    cfg.broker.server_time_mode = "ny7"
+    cfg.risk.blackout_start = cfg.risk.blackout_end = ""
+    # the fake broker's equity is constant: switch off the equity-driven guards on both sides
+    cfg.risk.dd_scale_full = cfg.risk.daily_loss_limit = cfg.risk.monthly_hard_stop = 0.0
+    cfg.backtest.spreads_pips = {s: 1.0 for s in data}
+    res = Backtester(cfg, data).run()
+    bt = sorted((pd.Timestamp(r.entry_time), r.symbol, int(r.direction)) for r in res.trades.itertuples())
+
+    eng, broker = make_engine(cfg, data)
+    opened = []
+    orig = broker.open_position
+
+    def rec(base, direction, volume, sl, tp, magic, comment):
+        opened.append((pd.Timestamp(broker.now).floor("15min"), base, direction))
+        return orig(base, direction, volume, sl, tp, magic, comment)
+
+    broker.open_position = rec
+    step_until(eng, broker, datetime(2021, 3, 1, 0, 0), datetime(2021, 3, 8, 23, 45))
+    assert len(bt) >= 10
+    # several bars where the guards had to choose between competing signals
+    assert sum(1 for k in {t for t, _, _ in bt} if sum(1 for t, _, _ in bt if t == k) >= 2) >= 3
+    assert sorted(opened) == bt
 
 
 def test_backtest_es_times(tmp_path):

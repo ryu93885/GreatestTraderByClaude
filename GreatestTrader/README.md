@@ -18,7 +18,7 @@
 | **stable5（既定）** | **5.38%** | **−11.6%** | −4.75% | 27 / 182 | 月利 5% を目指したい |
 | stable4 | 4.37% | −10.7% | −3.67% | 21 / 182 | DD を抑えつつ急変動にも備えたい（推奨の中間案） |
 | safe2 | 2.00% | −11.7% | −2.00% | 0 / 182 | 毎月の損失を −2% 前後に抑えたい |
-| classic_aggressive（v1.0） | 6.42% | −33.0% | −14.93% | 34 / 182 | 参考（保護機能なし） |
+| classic_aggressive（v1.0 の設定） | 6.42% | −33.0% | −14.93% | 34 / 182 | 参考（保護機能なし） |
 
 > ⚠ **月利 5%・最大 DD 20% 以内・最悪月 −2% の 3 つを同時に満たすプリセットはありません**（理由は [docs/05_安定化改修報告書.md](docs/05_安定化改修報告書.md)）。
 > ⚠ 成績は取引コストに強く左右されます。コストが 0.5 pips 高いと stable5 の月利は 3.50% に下がります。本番の現実的な期待値は、stable5・stable4 で月利 3% 前後です。
@@ -48,7 +48,7 @@ GreatestTrader/
 │   ├── config/config.yaml     ← 設定ファイル（preset: stable5）
 │   ├── main.py
 │   ├── greatest_trader/       ← プログラム本体（presets/ にプリセット）
-│   └── tests/                 ← 自動テスト（pytest、51 件）
+│   └── tests/                 ← 自動テスト（pytest、62 件）
 └── mql5/
     ├── Experts/GreatestTrader.mq5   ← MT5 用 EA（既定値 = stable5）
     └── Presets/*.set                ← プリセット（Stable5_Default / Stable4_Robust / Safe2_WorstMonth2pct / Classic_*）

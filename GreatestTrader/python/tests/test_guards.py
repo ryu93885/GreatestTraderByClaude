@@ -98,3 +98,49 @@ def test_year_end_blackout():
     off = RiskManager(RiskConfig(blackout_start="", blackout_end=""))
     off.update_equity(10000, date(2021, 12, 25))
     assert off.can_open("NR", "EURJPY", [], 10000, 1, 10)[0]
+
+
+def test_daily_equity_history_survives_restart(tmp_path):
+    from greatest_trader.risk import RiskState
+    path = tmp_path / "s.json"
+    rm = RiskManager(RiskConfig(eq_filter_days=2, blackout_start="", blackout_end=""))
+    rm.update_equity(100.0, date(2021, 3, 1))
+    rm.update_equity(101.0, date(2021, 3, 2))
+    rm.update_equity(105.0, date(2021, 3, 2))  # close of 3/2
+    rm.state.save(path)
+    rm2 = RiskManager(rm.cfg, RiskState.load(path))  # restart
+    rm2.update_equity(106.0, date(2021, 3, 3))
+    assert rm2.state.daily_equity == [100.0, 105.0]
+
+
+def test_validation_of_v11_risk_keys():
+    import pytest
+
+    from greatest_trader.config import load_config
+
+    def cfg_with(tmp, text):
+        p = tmp / "c.yaml"
+        p.write_text(text, encoding="utf-8")
+        return load_config(p)
+
+    import pathlib
+    import tempfile
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    c = cfg_with(tmp, "preset: stable5\nrisk:\n  symbol_risk_mult:\n")
+    assert c.risk.symbol_risk_mult == {}  # empty mapping -> no multipliers
+    c = cfg_with(tmp, "preset: stable5\nrisk:\n  symbol_risk_mult: {eurjpy: 0.5}\n")
+    assert c.risk.symbol_risk_mult == {"EURJPY": 0.5}
+    for bad in ("symbol_risk_mult: {GBPCAD: 3.0}", "symbol_risk_mult: {GBPCAD: -1}", "max_total_risk: -0.05",
+                "monthly_hard_stop: 1.5", "max_same_direction_per_currency: -2", "dd_scale_floor: 2"):
+        with pytest.raises(ValueError):
+            cfg_with(tmp, f"preset: stable5\nrisk:\n  {bad}\n")
+
+
+def test_preset_label_shows_config_overrides(tmp_path):
+    from greatest_trader.config import load_config
+    p = tmp_path / "c.yaml"
+    p.write_text("preset: stable5\nrisk:\n  risk_nr: 0.0175\n  risk_es: 0.00875\n", encoding="utf-8")
+    c = load_config(p, preset="safe2")
+    assert c.preset == "safe2" and c.risk.risk_nr == 0.0175 and c.risk.max_total_risk == 0.02
+    assert c.preset_label() == "safe2 + config.yaml risk overrides (risk_es, risk_nr)"
+    assert load_config(None, preset="safe2").preset_label() == "safe2"

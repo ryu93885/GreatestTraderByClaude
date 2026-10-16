@@ -163,6 +163,12 @@ class Config:
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     preset: str = ""
 
+    def preset_label(self) -> str:
+        """Preset name for logs/reports, plus the risk keys that config.yaml overrides on top of it."""
+        name = self.preset or "-"
+        ov = getattr(self, "_risk_overrides", [])
+        return f"{name} + config.yaml risk overrides ({', '.join(ov)})" if self.preset and ov else name
+
     def broker_symbol(self, base: str) -> str:
         return self.broker.symbol_map.get(base, base + self.broker.symbol_suffix)
 
@@ -176,6 +182,31 @@ class Config:
                 raise ValueError(f"risk per trade for {name} must be between 0 and 5% (got {v})")
         if r.max_open_positions < 1:
             raise ValueError("risk.max_open_positions must be >= 1")
+        if r.symbol_risk_mult is None:  # an empty `symbol_risk_mult:` in YAML
+            r.symbol_risk_mult = {}
+        if not isinstance(r.symbol_risk_mult, dict):
+            raise ValueError("risk.symbol_risk_mult must be a mapping such as {EURJPY: 0.25}")
+        mults = {}
+        for s, m in r.symbol_risk_mult.items():
+            if isinstance(m, bool) or not isinstance(m, (int, float)) or m < 0:
+                raise ValueError(f"risk.symbol_risk_mult[{s}] must be a number >= 0 (got {m!r})")
+            for name in ("nr", "es"):
+                if r.base_risk(name) * m > 0.05 + 1e-12:
+                    raise ValueError(f"risk per trade for {s} ({name}: base risk x symbol_risk_mult) must be <= 5%")
+            mults[str(s).upper()] = float(m)
+        r.symbol_risk_mult = mults
+        for k in ("max_total_risk", "daily_loss_limit", "daily_hard_stop", "monthly_loss_limit", "monthly_hard_stop",
+                  "max_drawdown_halt", "dd_scale_full", "dd_scale_floor", "vol_target_daily", "eq_filter_mult"):
+            v = getattr(r, k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1:
+                raise ValueError(f"risk.{k} must be a fraction between 0 and 1 (got {v!r})")
+        for k in ("max_same_direction_per_currency", "max_positions_per_currency", "vol_lookback_days",
+                  "eq_filter_days"):
+            v = getattr(r, k)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError(f"risk.{k} must be an integer >= 0 (got {v!r})")
+        if not 0 <= r.vol_mult_min <= r.vol_mult_max:
+            raise ValueError("risk: need 0 <= vol_mult_min <= vol_mult_max")
         for v in (r.blackout_start, r.blackout_end):
             if v and not _valid_mmdd(v):
                 raise ValueError(f"risk.blackout_start/end must be MM-DD (got {v!r})")
@@ -188,6 +219,8 @@ class Config:
             raise ValueError("indicator periods must be >= 2")
         if any(h < 0 or h > 23 for h in nr.entry_hours):
             raise ValueError("night_reversion.entry_hours must be 0..23")
+        if nr.max_band_z < 0 or nr.max_bar_range_atr < 0:
+            raise ValueError("night_reversion.max_band_z / max_bar_range_atr must be >= 0 (0 = off)")
         es = self.euro_session
         if not (0 <= es.entry_utc_hour < es.exit_utc_hour <= 23):
             raise ValueError("euro_session: need 0 <= entry_utc_hour < exit_utc_hour <= 23")
@@ -246,5 +279,6 @@ def load_config(path: str | Path | None, preset: str | None = None) -> Config:
         _merge(cfg, load_preset(name), "preset:")
     _merge(cfg, data, "")
     cfg.preset = name or ""
+    cfg._risk_overrides = sorted((data.get("risk") or {}).keys())
     cfg.validate()
     return cfg

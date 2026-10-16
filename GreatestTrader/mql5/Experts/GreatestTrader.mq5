@@ -18,7 +18,7 @@ enum ENUM_GT_RISK
   {
    GT_RISK_CONSERVATIVE = 0, // Conservative 0.5% per trade
    GT_RISK_STANDARD     = 1, // Standard 1.0% per trade
-   GT_RISK_AGGRESSIVE   = 2, // Aggressive 1.5% per trade (5%/month target)
+   GT_RISK_AGGRESSIVE   = 2, // Aggressive 1.5% per trade (v1.0 classic; load Classic_Aggressive.set)
    GT_RISK_CUSTOM       = 3  // Custom (InpRiskNR / InpRiskES)
   };
 
@@ -468,6 +468,7 @@ void ParseSymbolMult()
       StringTrimLeft(k);
       StringTrimRight(k);
       StringToUpper(k);
+      k = StringSubstr(k, 0, 6);   // base name: a key typed with the broker suffix still matches
       int m = ArraySize(g_multSym);
       ArrayResize(g_multSym, m + 1);
       ArrayResize(g_multVal, m + 1);
@@ -600,8 +601,13 @@ double OpenRiskTotal()
       if(sl <= 0.0 || (dir > 0 && sl >= op) || (dir < 0 && sl <= op))
          continue;
       double l = LossPerLot(PositionGetString(POSITION_SYMBOL), dir, op, sl);
-      if(l > 0.0)
-         total += l * PositionGetDouble(POSITION_VOLUME);
+      if(l <= 0.0)
+        {
+         // fail closed: a position whose risk cannot be priced fills the total-risk cap
+         Log("cannot price open risk of " + PositionGetString(POSITION_SYMBOL) + ": treated as unlimited");
+         return 1e300;
+        }
+      total += l * PositionGetDouble(POSITION_VOLUME);
      }
    return total;
   }
@@ -1123,8 +1129,19 @@ int OnInit()
      }
 
    ParseSymbolMult();
+   for(int i = 0; i < ArraySize(g_multVal); i++)
+      if(g_multVal[i] < 0.0 || BaseRisk(true) * g_multVal[i] > 0.05 + 1e-12 || BaseRisk(false) * g_multVal[i] > 0.05 + 1e-12)
+        {
+         Print("[GT] InpSymbolRiskMult: ", g_multSym[i], " must be >= 0 and risk x multiplier must be <= 5 percent");
+         return INIT_PARAMETERS_INCORRECT;
+        }
    g_boStart = ParseMMDD(InpBlackoutStart);
    g_boEnd = ParseMMDD(InpBlackoutEnd);
+   if((StringLen(InpBlackoutStart) > 0 && g_boStart == 0) || (StringLen(InpBlackoutEnd) > 0 && g_boEnd == 0))
+     {
+      Print("[GT] blackout start/end must be MM-DD (e.g. 12-20) or empty");
+      return INIT_PARAMETERS_INCORRECT;
+     }
    if((g_boStart == 0) != (g_boEnd == 0))
      {
       Print("[GT] blackout start/end must both be MM-DD or both empty");
@@ -1157,6 +1174,18 @@ int OnInit()
       g_base[g_nsym] = b;
       g_nsym++;
      }
+   // process pairs in alphabetical order, like the Python engine and backtester: when several pairs
+   // signal on the same bar and a portfolio guard admits only some of them, the same ones are taken
+   for(int i = 1; i < g_nsym; i++)
+      for(int j = i; j > 0 && StringCompare(g_base[j - 1], g_base[j]) > 0; j--)
+        {
+         string tb = g_base[j - 1];
+         g_base[j - 1] = g_base[j];
+         g_base[j] = tb;
+         string ts = g_sym[j - 1];
+         g_sym[j - 1] = g_sym[j];
+         g_sym[j] = ts;
+        }
    ArrayResize(g_lastBar, g_nsym);
    for(int i = 0; i < g_nsym; i++)
       g_lastBar[i] = 0;
@@ -1183,9 +1212,9 @@ int OnInit()
    EventSetTimer(g_tester ? 60 : (InpTimerSec < 1 ? 1 : InpTimerSec));
 
    string prof = EnumToString(InpRiskProfile);
-   Log(StringFormat("started: %d NR symbols, ES=%s, profile=%s, NR risk=%.2f%%, ES risk=%.2f%%, server=%s",
+   Log(StringFormat("started: %d NR symbols, ES=%s, profile=%s, NR risk=%.2f%% (x InpSymbolRiskMult), ES risk=%.2f%%, server=%s",
                     g_nsym, (InpESEnabled && g_esOk) ? g_esSym : "off", prof, BaseRisk(true) * 100.0,
-                    BaseRisk(false) * 100.0, EnumToString(InpServerTime)), true);
+                    BaseRisk(false) * SymbolMult(g_esSym) * 100.0, EnumToString(InpServerTime)), true);
    if(!g_tester && !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
       Print("[GT] WARNING: Algo Trading is disabled in the terminal.");
    return INIT_SUCCEEDED;

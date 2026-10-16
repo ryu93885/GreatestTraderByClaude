@@ -93,14 +93,14 @@ def cmd_backtest(cfg, out: str | None) -> int:
     if len(res.trades) == 0:
         print("no trades")
         return 1
-    print(f"preset: {cfg.preset or '-'}")
+    print(f"preset: {cfg.preset_label()}")
     print(format_stats(res.stats()))
     print("\n[年利（各年）]")
     print(annual_table(res).to_string())
     print("\n[月利（%）]")
     print(yearly_table(res).to_string())
     path = save_report(res, out or cfg.backtest.output_dir,
-                       title=f"GreatestTrader {__version__} backtest (preset: {cfg.preset or '-'})")
+                       title=f"GreatestTrader {__version__} backtest (preset: {cfg.preset_label()})")
     print(f"\nreport saved to {path}")
     return 0
 
@@ -133,7 +133,11 @@ def main(argv: list[str] | None = None) -> int:
         cfg.engine.dry_run = True
     setup_logging(cfg.engine.log_dir, cfg.engine.log_level)
     logging.getLogger(__name__).info("GreatestTrader %s command=%s config=%s preset=%s", __version__, args.command,
-                                     args.config, cfg.preset or "-")
+                                     args.config, cfg.preset_label())
+    if args.preset and getattr(cfg, "_risk_overrides", []):
+        logging.getLogger(__name__).warning(
+            "--preset %s is combined with the risk: overrides in %s (%s). Remove them to use the pure preset.",
+            args.preset, args.config, ", ".join(cfg._risk_overrides))
     if args.command == "check":
         return cmd_check(cfg)
     if args.command == "live":

@@ -54,8 +54,13 @@ class LiveEngine:
         self._init_clock()
         eq = self.broker.account_equity()
         mode = "DRY-RUN (no orders)" if self.cfg.engine.dry_run else "LIVE"
-        msg = (f"started {mode}: equity={eq:.2f} {self.broker.account_currency()} profile={self.cfg.risk.profile} "
-               f"NR={self.cfg.risk.base_risk('nr'):.2%} ES={self.cfg.risk.base_risk('es'):.2%} clock={self.clock}")
+        r = self.cfg.risk
+        mults = [self.risk.symbol_mult(s) for s in self.cfg.night_reversion.symbols] or [1.0]
+        nr_lo, nr_hi = r.base_risk("nr") * min(mults), r.base_risk("nr") * max(mults)
+        es_risk = r.base_risk("es") * self.risk.symbol_mult(self.cfg.euro_session.symbol)
+        msg = (f"started {mode}: equity={eq:.2f} {self.broker.account_currency()} preset={self.cfg.preset_label()} "
+               f"profile={r.profile} NR={nr_lo:.2%}" + (f"-{nr_hi:.2%}" if nr_hi > nr_lo else "")
+               + f" ES={es_risk:.2%} (before DD scaling) clock={self.clock}")
         log.info(msg)
         self.notifier.send(msg)
 
@@ -123,7 +128,9 @@ class LiveEngine:
             for p in [p for p in positions if p.strategy == "NR"]:
                 if self.nr.time_stop_due(p, now_server):
                     self._close(CloseRequest(p.ticket, p.symbol, "time stop"))
-            for sym in self.cfg.night_reversion.symbols:
+            # same order as the backtester (alphabetical): when several pairs signal on the same bar and a
+            # portfolio guard can only admit some of them, live trading must pick the same ones
+            for sym in sorted(self.cfg.night_reversion.symbols):
                 self._nr_symbol(sym, now_server, equity)
 
         # ---- Euro Session
@@ -223,8 +230,10 @@ class LiveEngine:
             if p.sl and ((p.direction > 0 and p.sl < p.open_price) or (p.direction < 0 and p.sl > p.open_price)):
                 try:
                     p.risk_amount = self.broker.loss_per_lot(p.symbol, p.direction, p.open_price, p.sl) * p.volume
-                except Exception:  # noqa: BLE001 - be conservative if the broker cannot price it
-                    p.risk_amount = 0.0
+                except Exception as exc:  # noqa: BLE001 - fail closed: an unpriced position fills the risk cap
+                    log.warning("cannot price open risk of %s ticket=%s (%s): treated as unlimited", p.symbol,
+                                p.ticket, exc)
+                    p.risk_amount = float("inf")
         return positions
 
     def _enter(self, req: EntryRequest, positions: list[PositionView], equity: float) -> None:

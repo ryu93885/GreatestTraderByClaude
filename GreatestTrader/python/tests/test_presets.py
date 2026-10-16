@@ -45,6 +45,32 @@ def test_preset_loads_and_matches_mt5_set(name):
     assert st["InpBlackoutStart"] == cfg.risk.blackout_start and st["InpBlackoutEnd"] == cfg.risk.blackout_end
 
 
+EA_PROFILE = {"conservative": "0", "standard": "1", "aggressive": "2", "custom": "3"}
+EA_ALL = {"max_open_positions": ("InpMaxOpen", 1), "max_positions_per_currency": ("InpMaxPerCurrency", 1),
+          "dd_scale_full": ("InpDDScaleFull", 100), "dd_scale_floor": ("InpDDScaleFloor", 1),
+          "daily_loss_limit": ("InpDailyLossLimit", 100), "max_drawdown_halt": ("InpMaxDDHalt", 100),
+          "max_total_risk": ("InpMaxTotalRisk", 100), "max_same_direction_per_currency": ("InpMaxSameDirPerCcy", 1),
+          "daily_hard_stop": ("InpDailyHardStop", 100), "monthly_loss_limit": ("InpMonthlyLossLimit", 100),
+          "monthly_hard_stop": ("InpMonthlyHardStop", 100), "vol_target_daily": ("InpVolTargetDaily", 100),
+          "vol_lookback_days": ("InpVolLookbackDays", 1), "vol_mult_min": ("InpVolMultMin", 1),
+          "vol_mult_max": ("InpVolMultMax", 1), "eq_filter_days": ("InpEqFilterDays", 1),
+          "eq_filter_mult": ("InpEqFilterMult", 1)}
+
+
+@pytest.mark.parametrize("name", sorted(SET_NAMES))
+def test_mt5_set_equals_resolved_python_risk_config(name):
+    """Every risk input of the .set file equals the fully resolved Python RiskConfig of the preset."""
+    r = load_config(None, preset=name).risk
+    st = read_set(SET_DIR / f"GreatestTrader_{SET_NAMES[name]}.set")
+    assert st["InpRiskProfile"] == EA_PROFILE[r.profile], name
+    if r.profile == "custom":
+        assert abs(float(st["InpRiskNR"]) - r.risk_nr * 100) < 1e-9
+        assert abs(float(st["InpRiskES"]) - r.risk_es * 100) < 1e-9
+    for key, (ea_key, scale) in EA_ALL.items():
+        assert abs(float(st[ea_key]) - getattr(r, key) * scale) < 1e-9, (name, key)
+    assert (st["InpUseMinLot"] == "true") == (r.min_lot_policy == "min")
+
+
 def test_ea_default_inputs_equal_stable5_preset():
     import re
     src = (ROOT / "mql5" / "Experts" / "GreatestTrader.mq5").read_text()

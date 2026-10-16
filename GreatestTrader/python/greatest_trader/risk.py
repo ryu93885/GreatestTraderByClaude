@@ -36,6 +36,7 @@ class RiskState:
     month_halted: bool = False
     day_halted: bool = False
     daily_equity: list = field(default_factory=list)  # closing equity of past market days (most recent last)
+    last_equity: float = 0.0  # last equity seen (= the current day's close so far; survives restarts)
 
     @classmethod
     def load(cls, path: str | Path) -> "RiskState":
@@ -61,7 +62,6 @@ class RiskManager:
         self.cfg = cfg
         self.state = state or RiskState()
         self.flatten_reason = ""
-        self._last_equity: float | None = None
         self._adaptive_mult = self._compute_adaptive_mult()
 
     # ------------------------------------------------------------- equity
@@ -76,8 +76,8 @@ class RiskManager:
             st.peak_equity = equity
         dkey = market_day.isoformat()
         if st.day != dkey:
-            if st.day and self._last_equity is not None:
-                st.daily_equity.append(float(self._last_equity))
+            if st.day and st.last_equity > 0:
+                st.daily_equity.append(float(st.last_equity))
                 keep = max(c.vol_lookback_days, c.eq_filter_days) + 2
                 if len(st.daily_equity) > keep:
                     del st.daily_equity[:-keep]
@@ -85,7 +85,7 @@ class RiskManager:
             st.day_start_equity = equity
             st.day_halted = False
             self._adaptive_mult = self._compute_adaptive_mult()
-        self._last_equity = equity
+        st.last_equity = float(equity)
         mkey = dkey[:7]
         if st.month != mkey:
             st.month = mkey
