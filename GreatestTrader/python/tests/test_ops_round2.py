@@ -1,9 +1,11 @@
 """Operations fixes of review round 2: reset-halt wrapper, webhook User-Agent, config read retry and type checks,
 backtest clock warning."""
 import logging
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -137,3 +139,74 @@ def test_real_config_errors_still_exit_10(tmp_path, monkeypatch, capsys):
                 exc=PermissionError(13, "Permission denied", str(tmp_path)))
     assert main.main(["live", "-c", str(tmp_path), "--live-orders"]) == 10
     assert "is a folder" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ config: type checks of list / text keys
+def load(path):
+    return main._load(SimpleNamespace(config=str(path), preset=None))
+
+
+@pytest.mark.parametrize("yaml_text, words", [
+    ("night_reversion:\n  symbols: GBPCAD\n", "night_reversion.symbols must be a list"),
+    ("night_reversion:\n  symbols: []\n", "night_reversion.symbols is empty"),
+    ("night_reversion:\n  symbols:\n", "night_reversion.symbols must be a list"),
+    ("night_reversion:\n  symbols: [GBPCAD, 7]\n", "6 letters"),
+    ("night_reversion:\n  symbols: [GBP]\n", "6 letters"),
+    ("night_reversion:\n  symbols: [GBPCAD EURCAD]\n", "6 letters"),
+    ("night_reversion:\n  entry_hours: 0\n", "night_reversion.entry_hours must be a list"),
+    ("night_reversion:\n  entry_hours: [0, '1']\n", "night_reversion.entry_hours must be a list"),
+    ("night_reversion:\n  entry_hours: [24]\n", "0..23"),
+    ("night_reversion:\n  entry_hours: [1.0]\n", "whole numbers"),
+    ("euro_session:\n  symbol: [EURUSD]\n", "euro_session.symbol"),
+    ("euro_session:\n  symbol: 123456\n", "euro_session.symbol"),
+    ("euro_session:\n  weekdays: 0-4\n", "euro_session.weekdays must be a list"),
+    ("euro_session:\n  weekdays: [0, 7]\n", "0..6"),
+    ("euro_session:\n  weekdays: [true]\n", "euro_session.weekdays"),
+    ("broker:\n  server_time_mode: fixed\n  server_gmt_offset: '+2'\n", "broker.server_gmt_offset must be a number"),
+    ("broker:\n  server_gmt_offset:\n", "broker.server_gmt_offset must be a number"),
+    ("broker:\n  server_gmt_offset: 15\n", "between -12 and 14"),
+    ("broker:\n  symbol_suffix: 1\n", "broker.symbol_suffix must be text"),
+    ("broker:\n  symbol_map: [EURUSD]\n", "broker.symbol_map must be a mapping"),
+    ("broker:\n  symbol_map: {EURUSD: 5}\n", "broker.symbol_map must be a mapping"),
+    ("broker:\n  symbol_map: {EUR: EURUSD}\n", "6 letters"),
+])
+def test_wrong_types_are_config_errors(tmp_path, capsys, yaml_text, words):
+    """ops-backtest#3: `symbols: GBPCAD` used to pass and be split into G, B, P, C, A, D in live (and crash
+    backtest / download / check with a TypeError traceback): every such mistake is now CONFIG ERROR (exit 10)."""
+    cfg = write_cfg(tmp_path, yaml_text)
+    with pytest.raises(config_mod.ConfigError, match=re.escape(words)):
+        load(cfg)
+    for cmd in (["live", "--live-orders"], ["backtest"], ["download"], ["check"]):
+        assert main.main([cmd[0], "-c", str(cfg), *cmd[1:]]) == 10, cmd
+        out = capsys.readouterr().out
+        assert "CONFIG ERROR" in out and words in out, (cmd, out)
+
+
+def test_valid_lists_and_names_are_normalized(tmp_path):
+    cfg = write_cfg(tmp_path, "night_reversion:\n  symbols: [' gbpcad ', EURcad, EURUSD.raw]\n  entry_hours: [0]\n"
+                              "euro_session:\n  symbol: eurusd\n  weekdays: [0, 2, 4]\n"
+                              "broker:\n  server_time_mode: fixed\n  server_gmt_offset: 3\n  symbol_suffix:\n"
+                              "  symbol_map: {eurusd: ' EURUSDmicro '}\n")
+    c = load(cfg)
+    assert c.night_reversion.symbols == ["GBPCAD", "EURCAD", "EURUSD.raw"]
+    assert c.night_reversion.entry_hours == [0] and c.euro_session.weekdays == [0, 2, 4]
+    assert c.euro_session.symbol == "EURUSD" and c.broker.server_gmt_offset == 3
+    assert c.broker.symbol_suffix == "" and c.broker_symbol("EURUSD") == "EURUSDmicro"
+    assert c.broker_symbol("GBPCAD") == "GBPCAD"
+    # one pair is fine as a list; an empty list is fine when Night Reversion is off; tuples become lists
+    write_cfg(tmp_path, "night_reversion:\n  symbols: [GBPCAD]\n")
+    assert load(cfg).night_reversion.symbols == ["GBPCAD"]
+    off = config_mod.Config()
+    off.night_reversion.enabled = False
+    off.night_reversion.symbols = []
+    off.euro_session.weekdays = (0, 1)
+    off.validate()
+    assert off.euro_session.weekdays == [0, 1]
+
+
+def test_every_bundled_preset_and_the_shipped_config_still_validate():
+    for name in ["", *config_mod.available_presets()]:
+        c = config_mod.load_config(PY / "config" / "config.yaml", preset=name or None)
+        assert c.night_reversion.symbols == config_mod.DEFAULT_NR_SYMBOLS or c.preset, name
+        assert all(len(s) == 6 and s.isupper() for s in c.night_reversion.symbols)
+        assert isinstance(c.broker.server_gmt_offset, (int, float))
