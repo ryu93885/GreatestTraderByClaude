@@ -14,10 +14,14 @@ import time
 import urllib.request
 from collections import deque
 
+from . import __version__
 from .config import NotifyConfig
 
 log = logging.getLogger(__name__)
 PING_INTERVAL = 300.0  # seconds between dead-man-switch pings (notify.healthcheck_url)
+# Explicit User-Agent on every request (webhooks and the dead-man-switch ping): Discord, behind Cloudflare,
+# answers urllib's default 'Python-urllib/3.x' with HTTP 403 (error code 1010), so no message would arrive.
+USER_AGENT = f"GreatestTrader/{__version__} (+https://github.com/ryu93885/GreatestTraderByClaude)"
 
 
 class Notifier:
@@ -121,10 +125,10 @@ class Notifier:
 
     def _request(self, url: str, payload: dict | None) -> None:
         if payload is None:
-            req = urllib.request.Request(url, method="GET")
+            req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
         else:
             req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
-                                         headers={"Content-Type": "application/json"})
+                                         headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
         try:
             urllib.request.urlopen(req, timeout=5).read()
             self.failures = 0
