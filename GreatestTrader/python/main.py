@@ -113,7 +113,10 @@ def cmd_live(cfg) -> int:
         return EXIT_STOP  # the other instance keeps running: this wrapper must not loop
     notifier = Notifier(cfg.notify)
     try:
-        return LiveEngine(cfg, MT5Broker(cfg), notifier).run_forever()
+        engine = LiveEngine(cfg, MT5Broker(cfg), notifier)
+        if getattr(engine.journal, "alert", None) is None:  # 'journal file locked (open in Excel?) - N rows
+            engine.journal.alert = notifier.send           # pending' (the journal rate-limits it: 1 per hour)
+        return engine.run_forever()
     except FatalError as exc:
         log.critical("%s", exc)
         print(f"\nFATAL: {exc}")
