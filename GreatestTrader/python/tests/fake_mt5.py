@@ -103,9 +103,17 @@ def symbol_info_tick(name):
 
 
 def copy_rates_from_pos(name, tf, pos, count):
+    """Like MT5: a symbol's bar exists only after its first tick, so bar 0 is the bar of the symbol's latest tick
+    (S.ticks[name]['time'], else S.now); `pos` counts back from it, at most `count` bars."""
     if not _ok():
         return None
-    return S.rates.get((name, tf))
+    arr = S.rates.get((name, tf))
+    if arr is None or len(arr) == 0:
+        return arr
+    t = S.ticks[name]["time"] if S.ticks.get(name) else S.now
+    upto = arr[arr["time"] <= t]
+    end = len(upto) - pos
+    return upto[max(0, end - count):max(0, end)]
 
 
 def positions_get(symbol=None, ticket=None):

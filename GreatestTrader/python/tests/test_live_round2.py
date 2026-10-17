@@ -1,6 +1,7 @@
 """Round-2 live engine rules (decisions D8-D14 and the notification fixes py-clock-ops#3/#5), on the in-memory
 FakeBroker: TP inside the stops level, history gaps only logged, Monday-Friday market days, deferred entry signals,
 closed bars by time, Algo Trading off, reset-halt without --rebase-peak, recovery notices."""
+import logging
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -321,3 +322,70 @@ def test_stale_feed_and_paused_trading_get_recovery_notices(tmp_path, monkeypatc
     run(15 * 60, True, ALGO_OFF)  # second episode 12 min after the first (inside the old 30-min rate limit)
     run(60, True)
     assert kinds() == ["trading paused", "trading resumed", "trading paused", "trading resumed"]
+
+
+# ------------------------------------------------------------------ D9
+SPIKE = datetime(2021, 3, 3, 0, 30)  # NR signal bar (Wednesday, market time), closes at 00:45
+
+
+def gated_run(tmp_path, closed_until, syms=("EURJPY",), data=None, max_total_risk=None):
+    """Loops every 5 s from 00:40:03; the deal history cannot be read (an entry gate) from 00:44 until
+    `closed_until`."""
+    cfg = cfg_for(tmp_path, syms=syms)
+    if max_total_risk is not None:
+        cfg.risk.max_total_risk = max_total_risk
+    eng, br = make(cfg, data or eurjpy(spike_at=SPIKE), equity=1_000_000)
+    flows = br.cash_flows
+
+    def cash_flows():
+        if datetime(2021, 3, 3, 0, 44) <= br.now < closed_until:
+            raise RuntimeError("history_deals_get failed: (-10005, 'IPC timeout')")
+        return flows()
+
+    br.cash_flows = cash_flows
+    opened, real_open = [], br.open_position
+
+    def open_position(base, *a):
+        opened.append((br.now, base))
+        return real_open(base, *a)
+
+    br.open_position = open_position
+    t = datetime(2021, 3, 2, 22, 0, 3)
+    while t <= datetime(2021, 3, 3, 0, 52, 3):
+        br.set_time(t)
+        eng.step()
+        t += timedelta(seconds=5) if t >= datetime(2021, 3, 3, 0, 40) else timedelta(minutes=5)
+    return eng, [o for o in opened if o[0] >= datetime(2021, 3, 3, 0, 44)]  # entries of the 00:30 bar
+
+
+def test_signal_blocked_by_an_entry_gate_is_taken_when_the_gate_opens_within_150_s(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="greatest_trader.engine")
+    eng, opened = gated_run(tmp_path, closed_until=datetime(2021, 3, 3, 0, 46, 30))
+    assert opened == [(datetime(2021, 3, 3, 0, 46, 33), "EURJPY")]  # the first loop with the gate open
+    msgs = [r.message for r in caplog.records]
+    assert any("signal of the 2021-03-03 00:30:00 bar deferred: deal history cannot be read" in m for m in msgs)
+    assert any("deferred signal of the 2021-03-03 00:30:00 bar: entry gate open again" in m for m in msgs)
+    # the control: no gate -> taken in the first loop after the bar close (+2 s settle)
+    eng2, opened2 = gated_run(tmp_path / "b", closed_until=datetime(2021, 1, 1))
+    assert opened2 == [(datetime(2021, 3, 3, 0, 45, 3), "EURJPY")]
+
+
+def test_deferred_signal_is_dropped_after_150_s(tmp_path, caplog):
+    eng, opened = gated_run(tmp_path, closed_until=datetime(2021, 3, 3, 0, 47, 35))  # bar close + 155 s
+    assert opened == [] and eng._deferred == {}
+    assert any("signal of the 2021-03-03 00:30:00 bar dropped: not taken within 150 s" in r.message
+               for r in caplog.records)
+
+
+def test_deferred_signals_are_retried_alphabetically(tmp_path):
+    """Both pairs signal on the blocked bar; the total-risk cap admits one: at the retry the alphabetically first
+    pair gets it, as in the backtester."""
+    data = {"GBPJPY": synthetic_m15(datetime(2021, 3, 1), 5, 150.0, 0.01, spike_at=SPIKE),
+            "EURJPY": synthetic_m15(datetime(2021, 3, 1), 5, 130.0, 0.01, spike_at=SPIKE)}
+    until = datetime(2021, 3, 3, 0, 46, 30)
+    t = datetime(2021, 3, 3, 0, 46, 33)
+    eng, opened = gated_run(tmp_path, until, syms=("GBPJPY", "EURJPY"), data=data)
+    assert opened == [(t, "EURJPY"), (t, "GBPJPY")]  # without a cap both are taken, alphabetically
+    one = eng.risk.risk_fraction("NR", 1_000_000) * 1.5  # room for one trade only
+    eng2, opened2 = gated_run(tmp_path / "b", until, syms=("GBPJPY", "EURJPY"), data=data, max_total_risk=one)
+    assert opened2 == [(t, "EURJPY")]

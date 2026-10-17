@@ -40,6 +40,8 @@ CASH_RESCAN = 600.0  # deal history re-scanned at least this often (and whenever
 CASH_BURST = 60.0  # ... and on every call for this long after a balance / credit change
 CASH_WINDOW_DAYS = 30
 RECONNECT_FIRST_DELAY, RECONNECT_MAX_DELAY = 5.0, 60.0
+TF_SECONDS = {"M15": 900, "H1": 3600, "M1": 60}
+BAR_SETTLE = 2.0  # s: a bar counts as closed this long after its end (late ticks stamped in the old bar)
 DEAL_ENTRY_EXIT = (1, 2, 3)  # DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY
 DEAL_REASONS = {0: "manual", 1: "manual (mobile)", 2: "manual (web)", 3: "expert", 4: "SL", 5: "TP",
                 6: "stop out", 7: "rollover", 8: "variation margin", 9: "split"}
@@ -331,11 +333,21 @@ class MT5Broker(Broker):
         return max(self._tick_t.values()) if self._tick_t else None
 
     def rates(self, base: str, timeframe: str, count: int) -> pd.DataFrame:
-        arr = mt5.copy_rates_from_pos(self._name(base), self._tf[timeframe], 1, count)  # pos 1 = last CLOSED bar
+        """The newest `count` CLOSED bars. A bar is closed by TIME (EA: same rule): when the server time (newest
+        tick of any polled symbol) has reached its open + its length + BAR_SETTLE seconds. MT5 forms a symbol's new
+        bar only at its first tick, so 'the bar before the newest' (pos 1) missed the just-closed bar of a pair that
+        had not ticked in the new bar yet: every pair's bar is now evaluated in the same loop (alphabetical)."""
+        arr = mt5.copy_rates_from_pos(self._name(base), self._tf[timeframe], 0, count + 1)  # pos 0: newest bar
         if arr is None or len(arr) == 0:
             raise RuntimeError(f"copy_rates {base} {timeframe} failed: {mt5.last_error()}")
         df = pd.DataFrame(arr)
         df.index = pd.to_datetime(df["time"], unit="s")
+        now = self.server_time()
+        if now is None:
+            df = df.iloc[:-1]  # no server time yet: the newest bar may still be forming
+        else:
+            df = df[df.index + pd.Timedelta(seconds=TF_SECONDS[timeframe] + BAR_SETTLE) <= pd.Timestamp(now)]
+        df = df.iloc[-count:]
         spec = self.symbol_spec(base)
         df["spread_pips"] = df["spread"] * spec.point / spec.pip
         return df[["open", "high", "low", "close", "spread_pips"]]

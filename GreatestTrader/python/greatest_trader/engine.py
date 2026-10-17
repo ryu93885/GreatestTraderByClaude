@@ -42,6 +42,7 @@ log = logging.getLogger(__name__)
 M15 = timedelta(minutes=15)
 H1 = timedelta(hours=1)
 FRESH_SIGNAL = timedelta(seconds=150)  # act on a closed bar only if it closed within this time
+BAR_SETTLE = timedelta(seconds=2)  # a bar counts as closed this long after its end (late ticks of the old bar)
 MARGIN_USE_MAX = 0.8  # a new position may use at most 80% of the current free margin
 CLOCK_TOL = 120.0  # s: a fresh tick lies within this distance of a whole half-hour offset from real UTC
 TICK_FRESH = 30.0  # s: a clock observation needs a symbol's own tick time to have advanced within this time
@@ -116,6 +117,8 @@ class LiveEngine:
         self._lot_cap_day: dict[str, str] = {}
         self._closing: dict[int, str] = {}  # ticket -> reason of a close sent by the engine (journal)
         self._gap_logged: dict[str, datetime] = {}
+        # NR symbol -> (bar values, bar open server time, bar open market time) of a fresh signal an entry gate blocked
+        self._deferred: dict[str, tuple[dict, datetime, datetime]] = {}
         self._orders_off = ""  # this loop: only sending orders is off (Algo Trading): guards run, no orders
         self._health_told = ""  # a 'trading paused' notice was sent for this reason: tell the recovery too
         self._stale_told = False  # a stale-feed notice was sent: tell when prices move again
@@ -345,7 +348,10 @@ class LiveEngine:
                 if self.nr.time_stop_due(p, now_server):
                     self._close(CloseRequest(p.ticket, p.symbol, "time stop"))
             # same order as the backtester (alphabetical): when several pairs signal on the same bar and a
-            # portfolio guard can only admit some of them, live trading must pick the same ones
+            # portfolio guard can only admit some of them, live trading must pick the same ones; signals deferred
+            # by an entry gate (older bars' signals of the same window) go first, also alphabetically
+            for sym in sorted(self._deferred):
+                self._isolated(f"{sym} deferred", self._retry_deferred, sym, now_server, equity)
             for sym in sorted(self.cfg.night_reversion.symbols):
                 if sym not in self.disabled:
                     self._isolated(sym, self._nr_symbol, sym, now_server, equity)
@@ -893,12 +899,15 @@ class LiveEngine:
             self._alert(f"{sym}: no price from the terminal (symbol hidden from Market Watch?)", key=f"notick-{sym}",
                         every=3600)
             return
-        # cheap check: has a new M15 bar closed since we last looked?
-        bar_open_now = now_server.replace(minute=(now_server.minute // 15) * 15, second=0, microsecond=0)
-        last_closed_open = bar_open_now - M15
+        # cheap check: has a new M15 bar closed since we last looked? A bar is closed by TIME (EA: same rule): at its
+        # open + 15 min + BAR_SETTLE, whether or not this pair has ticked in the next bar yet, so every pair's bar is
+        # decided in the same loop, in alphabetical order (the guard capacity no longer goes to the first ticker)
+        t = now_server - BAR_SETTLE
+        last_closed_open = t.replace(minute=(t.minute // 15) * 15, second=0, microsecond=0) - M15
         if self.last_bar.get(sym) == last_closed_open:
             return
         df = self.broker.rates(sym, "M15", self.cfg.engine.history_bars)
+        df = df[df.index <= last_closed_open]  # the broker's rule too; this loop's server time decides
         if df.empty:
             return
         bar_time = df.index[-1].to_pydatetime()
@@ -938,13 +947,49 @@ class LiveEngine:
         if now_server - (bar_time + M15) > FRESH_SIGNAL:
             log.debug("%s bar %s is stale, skip entry check", sym, bar_time)
             return
-        bar_mkt = self.clock.server_to_market(bar_time)
+        self._nr_entry(sym, bar, bar_time, self.clock.server_to_market(bar_time), equity)
+
+    def _nr_entry(self, sym: str, bar: dict, bar_time: datetime, bar_mkt: datetime, equity: float,
+                  deferred: bool = False) -> None:
+        """Entry check of a fresh closed bar with the current quote (spread / cost filter, then every guard).
+        A signal that an entry gate blocks (cash flow pending, deal history not complete / unreadable, server clock
+        waiting / mismatch) is deferred, not dropped (EA: same rule): retried on the next loops while the bar is
+        fresh (FRESH_SIGNAL after its close), see _retry_deferred."""
+        tick = self.broker.tick(sym)
+        if tick is None:
+            return
+        spec = self.broker.symbol_spec(sym)
         spread_pips = (tick.ask - tick.bid) / spec.pip
         commission_pips = self._commission_pips(sym, tick)
         req = self.nr.entry_signal(sym, bar, bar_time, bar_mkt, spec.pip, spread_pips, commission_pips)
-        if req is not None:
-            positions = self.broker.positions(self.magics)
-            self._enter(req, positions, equity)
+        if req is None:
+            if deferred:
+                log.info("NR %s deferred signal of the %s bar: no signal any more at the current spread / cost, "
+                         "dropped", sym, bar_time)
+            return
+        block = self.entry_block()
+        if block:
+            if sym not in self._deferred:
+                log.info("NR %s signal of the %s bar deferred: %s (retried until %s)", sym, bar_time, block,
+                         bar_time + M15 + FRESH_SIGNAL)
+            self._deferred[sym] = (bar, bar_time, bar_mkt)
+            return
+        self._enter(req, self.broker.positions(self.magics), equity)
+
+    def _retry_deferred(self, sym: str, now_server: datetime, equity: float) -> None:
+        """A deferred NR signal: dropped (logged) once its bar is older than FRESH_SIGNAL; taken - with the current
+        quote and every guard checked again - as soon as no entry gate blocks it."""
+        bar, bar_time, bar_mkt = self._deferred[sym]
+        if now_server - (bar_time + M15) > FRESH_SIGNAL or sym in self.disabled:
+            del self._deferred[sym]
+            log.warning("NR %s signal of the %s bar dropped: not taken within %.0f s of the bar close (%s)", sym,
+                        bar_time, FRESH_SIGNAL.total_seconds(), self.entry_block() or "symbol unavailable")
+            return
+        if self.entry_block():
+            return  # still blocked: tried again on the next loop
+        del self._deferred[sym]
+        log.info("NR %s deferred signal of the %s bar: entry gate open again, checking it now", sym, bar_time)
+        self._nr_entry(sym, bar, bar_time, bar_mkt, equity, deferred=True)
 
     def _commission_pips(self, sym: str, tick) -> float:
         c = self.cfg.broker.commission_per_lot
