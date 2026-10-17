@@ -3,6 +3,7 @@ backtest clock warning."""
 import logging
 import re
 import threading
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import pytest
 
 import greatest_trader.config as config_mod
 import main
+from fakes import synthetic_m15
 from greatest_trader import __version__
 from greatest_trader.config import NotifyConfig
 from greatest_trader.notify import USER_AGENT, Notifier
@@ -210,3 +212,36 @@ def test_every_bundled_preset_and_the_shipped_config_still_validate():
         assert c.night_reversion.symbols == config_mod.DEFAULT_NR_SYMBOLS or c.preset, name
         assert all(len(s) == 6 and s.isupper() for s in c.night_reversion.symbols)
         assert isinstance(c.broker.server_gmt_offset, (int, float))
+
+
+# ------------------------------------------------------------------ backtest: the clock it assumes is shown
+@pytest.mark.parametrize("mode, clock, warned", [
+    ("auto", "NY+7 (GMT+2 winter / GMT+3 US summer time), assumed for server_time_mode: auto", True),
+    ("ny7", "NY+7 (GMT+2 winter / GMT+3 US summer time)", False),
+    ("fixed", "fixed GMT+2", False),
+])
+def test_backtest_shows_the_server_clock_and_warns_for_auto(tmp_path, capsys, mode, clock, warned):
+    """ops-backtest#6: with the shipped `server_time_mode: auto` the backtest silently read any broker's bars as
+    NY+7. It now says which clock it used, and for auto warns (console and summary.txt) to set fixed +
+    server_gmt_offset when 1_check.bat shows another offset."""
+    d = tmp_path / "data"
+    d.mkdir()
+    synthetic_m15(datetime(2021, 3, 1), 10, 1.25, 0.0001, seed=1, spike_at=datetime(2021, 3, 3, 0, 30)) \
+        .rename_axis("time").to_csv(d / "GBPCHF_M15.csv")
+    cfg = write_cfg(tmp_path, f"night_reversion:\n  symbols: [GBPCHF]\neuro_session:\n  enabled: false\n"
+                              f"broker:\n  server_time_mode: {mode}\nrisk:\n  blackout_start: ''\n  blackout_end: ''\n"
+                              f"  max_lots_per_order: 0\n")
+    cfg.write_text(cfg.read_text(encoding="utf-8").replace("backtest:\n", f"backtest:\n  data_dir: {d}\n"),
+                   encoding="utf-8")
+    assert main.main(["backtest", "-c", str(cfg)]) == 0
+    out = capsys.readouterr().out
+    summary = (tmp_path / "out" / "summary.txt").read_text(encoding="utf-8")
+    assert f"server clock: {clock}\n" in out
+    lines = summary.split("\n")
+    assert lines[0].startswith("# GreatestTrader ") and lines[2] == f"server clock: {clock}"
+    assert "## 戦略・通貨ペア別" in summary  # the rest of the report is still there
+    assert ("WARNING: broker.server_time_mode is auto: the backtest assumes NY+7" in summary) is warned
+    assert ("set broker.server_time_mode: fixed and broker.server_gmt_offset" in out) is warned
+    if warned:
+        assert out.rstrip().endswith("再実行してください。")  # printed last, after the tables
+        assert summary.index("WARNING") < summary.index("## 年利")

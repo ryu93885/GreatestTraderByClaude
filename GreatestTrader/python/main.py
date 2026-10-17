@@ -137,7 +137,7 @@ def cmd_download(cfg, years: float) -> int:
 
 
 def cmd_backtest(cfg, out: str | None) -> int:
-    from greatest_trader.backtest import Backtester, conversion_pairs, load_data_dir
+    from greatest_trader.backtest import Backtester, clock_note, conversion_pairs, load_data_dir
     from greatest_trader.report import annual_table, format_stats, save_report, yearly_table
 
     syms = list(dict.fromkeys(cfg.night_reversion.symbols + [cfg.euro_session.symbol]))
@@ -153,7 +153,9 @@ def cmd_backtest(cfg, out: str | None) -> int:
     if len(res.trades) == 0:
         print("no trades")
         return 1
+    clock, warning = clock_note(cfg)
     print(f"preset: {cfg.preset_label()}")
+    print(f"server clock: {clock}")
     r = cfg.risk
     print(f"capacity caps: max_lots_per_order={r.max_lots_per_order:g} max_risk_amount={r.max_risk_amount:g} "
           f"({cfg.backtest.account_currency}); capped trades: {int((res.trades.lots < res.trades.lots_uncapped - 1e-9).sum())}")
@@ -162,9 +164,16 @@ def cmd_backtest(cfg, out: str | None) -> int:
     print(annual_table(res).to_string())
     print("\n[月利（%）]")
     print(yearly_table(res).to_string())
-    path = save_report(res, out or cfg.backtest.output_dir,
-                       title=f"GreatestTrader {__version__} backtest (preset: {cfg.preset_label()})")
+    title = f"GreatestTrader {__version__} backtest (preset: {cfg.preset_label()})"
+    path = save_report(res, out or cfg.backtest.output_dir, title=title)
+    summary = Path(path) / "summary.txt"  # the clock it assumed goes right under the title
+    head = f"# {title}\n\n"
+    text = summary.read_text(encoding="utf-8")
+    note = f"server clock: {clock}\n" + (f"\n{warning}\n" if warning else "") + "\n"
+    summary.write_text(head + note + text[len(head):] if text.startswith(head) else note + text, encoding="utf-8")
     print(f"\nreport saved to {path}")
+    if warning:  # last, so that it is not scrolled away by the tables
+        print(f"\n{warning}")
     return 0
 
 

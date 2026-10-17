@@ -347,6 +347,26 @@ class _FxConverter:
         return out
 
 
+def clock_note(cfg: Config) -> tuple[str, str]:
+    """(server clock the backtest uses, warning or ''). The bars are stored in broker server time and the backtest
+    cannot measure the clock as live trading does: `auto` (the shipped default) is read as NY+7. On data from a
+    broker with another server time every NR entry hour, the ES 07:00 UTC entry and every day / month boundary
+    would be shifted without a word, so `auto` always prints (and writes into summary.txt) this warning."""
+    b = cfg.broker
+    if b.server_time_mode == "fixed":
+        return f"fixed GMT{b.server_gmt_offset:+g}", ""
+    if b.server_time_mode == "ny7":
+        return "NY+7 (GMT+2 winter / GMT+3 US summer time)", ""
+    return ("NY+7 (GMT+2 winter / GMT+3 US summer time), assumed for server_time_mode: auto",
+            "WARNING: broker.server_time_mode is auto: the backtest assumes NY+7 server time (GMT+2 winter / GMT+3 "
+            "US summer time, the usual MT5 clock). If 1_check.bat shows another offset for your broker, the entry "
+            "hours, the ES 07:00 UTC entry and the day / month boundaries of this backtest are shifted: set "
+            "broker.server_time_mode: fixed and broker.server_gmt_offset to that offset and run the backtest again.\n"
+            "注意: server_time_mode が auto のため、バックテストはサーバー時間を NY+7 (冬 GMT+2 / 夏 GMT+3) とみなして"
+            "います。1_check.bat で別のオフセットが表示されるブローカーのデータでは結果がずれるので、"
+            "broker.server_time_mode: fixed と server_gmt_offset を設定してから再実行してください。")
+
+
 # ---------------------------------------------------------------- engine
 class _Pos:
     __slots__ = ("strategy", "sym", "dir", "j", "entry", "sl", "sl_dist", "risk_amt", "cost", "pip",
