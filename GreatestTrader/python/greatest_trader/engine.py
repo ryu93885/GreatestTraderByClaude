@@ -1,7 +1,8 @@
 """Live trading engine (production).
 
 One loop every engine.poll_seconds:
-  1. broker health (a lost MT5 link is re-initialised) and account binding (no trading on another account);
+  1. broker health (a lost MT5 link is re-initialised; while only order sending is off - Algo Trading switched off -
+     steps 2-4 keep running but no order is sent) and account binding (no trading on another account);
   2. ticks of every symbol, server-clock verification, stale-feed watchdog;
   3. cash flows (deposits / withdrawals / credit / bonus) rebase the equity baselines BEFORE the guards;
   4. risk guards; at a market-day change the equity log + daily summary, at a month end the R monitor;
@@ -112,6 +113,9 @@ class LiveEngine:
         self._lot_cap_day: dict[str, str] = {}
         self._closing: dict[int, str] = {}  # ticket -> reason of a close sent by the engine (journal)
         self._gap_logged: dict[str, datetime] = {}
+        self._orders_off = ""  # this loop: only sending orders is off (Algo Trading): guards run, no orders
+        self._health_told = ""  # a 'trading paused' notice was sent for this reason: tell the recovery too
+        self._stale_told = False  # a stale-feed notice was sent: tell when prices move again
         self._last_heartbeat = -1e18
         self._last_sym_retry = time.monotonic()
         self._last_save = -1e18
@@ -215,7 +219,9 @@ class LiveEngine:
                     if self._started:
                         self.step()
                         if fails and told:  # the operator got an ERROR for this failure: tell the recovery too
-                            self._alert(f"recovered after {fails} failed loops", key="loop-recovered", every=1800)
+                            # never rate limited: `told` already is (one per notified ERROR), and a swallowed notice
+                            # would leave an ERROR as the operator's last message while the engine is healthy
+                            self._alert(f"recovered after {fails} failed loops")
                         elif fails:
                             log.info("recovered after %d failed loops", fails)
                         fails, first_fail, told = 0, None, False
@@ -261,8 +267,19 @@ class LiveEngine:
 
     def step(self) -> None:
         why = self.broker.health()
+        orders_only = bool(why) and bool(getattr(why, "orders_only", False))
         if why:
-            self._alert(f"trading paused: {why}", key="health", every=1800)
+            text = f"trading paused: {why}" + (
+                " (no orders; the cash-flow check and the guards keep running: a stop reached meanwhile is applied "
+                "when trading is possible again)" if orders_only else "")
+            if self._alert(text, key="health", every=1800):
+                self._health_told = str(why)
+        elif self._health_told:  # tell the recovery, and report a new incident at once
+            self.notifier.reset("health")
+            self._alert(f"trading resumed ({self._health_told}: cleared)")
+            self._health_told = ""
+        self._orders_off = str(why) if orders_only else ""
+        if why and not orders_only:
             return
         if not self._check_account():
             return
@@ -301,6 +318,12 @@ class LiveEngine:
             self._dd_alert(equity)
         positions = self.broker.positions(self.magics)
         self._sync_trades(positions, utc)
+        if self._orders_off:
+            # Algo Trading off (or the account allows no expert trading): the guards above ran and latched (EA: same
+            # rule); no close, modify or entry is sent - a hard stop reached meanwhile flattens once trading is on
+            self._heartbeat(now_server, now_mkt, now_utc, equity, positions)
+            self._save_state()
+            return
         stop_reason = self.risk.flatten_reason or self.risk.hard_stop_active()
         if stop_reason and positions:  # also retries closes that failed on the first attempt
             for p in positions:
@@ -460,6 +483,10 @@ class LiveEngine:
             self._watch_from_utc = utc
         if moved:
             self._st_moved_utc = self._watch_from_utc = utc
+            if self._stale_told:  # EA: same notice; a new freeze is reported again at once
+                self._stale_told = False
+                self.notifier.reset("stale-feed")
+                self._alert("prices are updating again (quotes are coming in)")
         if self._market_open(utc):
             since = self._watch_from_utc
             opened = self._session_open_utc(utc)
@@ -468,8 +495,9 @@ class LiveEngine:
             else:
                 ref = since
             if utc - ref > timedelta(minutes=self.cfg.monitor.stale_feed_minutes):
-                self._alert(f"no price updates for {(utc - since).total_seconds() / 60:.0f} min on a market day "
-                            f"(terminal disconnected? feed stopped?)", key="stale-feed", every=3600)
+                if self._alert(f"no price updates for {(utc - since).total_seconds() / 60:.0f} min on a market day "
+                               f"(terminal disconnected? feed stopped?)", key="stale-feed", every=3600):
+                    self._stale_told = True
         if fresh is None or not self._market_open(utc):
             return  # no fresh tick: no observation (weekend, holiday, frozen feed, stale tick)
         auto = self.cfg.broker.server_time_mode == "auto"
@@ -529,6 +557,8 @@ class LiveEngine:
 
     def entry_block(self) -> str:
         """Why new entries are not allowed right now ('' = allowed)."""
+        if self._orders_off:
+            return f"trading paused: {self._orders_off}"
         if self.cfg.broker.server_time_mode == "auto" and not self.clock_verified:
             if self._drift_n >= CLOCK_CONFIRM:
                 return "server clock not verified yet (PC clock off - check the Windows time synchronisation)"

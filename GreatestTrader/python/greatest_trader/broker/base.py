@@ -13,6 +13,20 @@ CASH_DEAL_TYPES = (2, 3, 6)  # MT5 DEAL_TYPE_BALANCE, DEAL_TYPE_CREDIT, DEAL_TYP
 DEAL_TYPE_CREDIT = 3
 
 
+class Health(str):
+    """broker.health() result: '' when trading decisions are safe, otherwise the reason (a str, so a broker that
+    returns a plain string still works). orders_only=True: the terminal is connected and the account data is valid,
+    only sending orders is off (Algo Trading switched off, the account does not allow expert trading): the engine
+    keeps the cash-flow check and the guards running (peak, day / month / halt latches, DD alert, daily summary)
+    but sends no order. A plain string (orders_only False) pauses the whole loop."""
+    orders_only: bool
+
+    def __new__(cls, reason: str = "", orders_only: bool = False):
+        obj = super().__new__(cls, reason)
+        obj.orders_only = bool(orders_only and reason)
+        return obj
+
+
 @dataclass
 class SymbolSpec:
     base: str  # e.g. "EURUSD"
@@ -96,8 +110,9 @@ class Broker(ABC):
             self.connect()
 
     def health(self) -> str:
-        """'' when trading decisions are safe, otherwise the reason why not (may re-initialise a lost link)."""
-        return ""
+        """'' when trading decisions are safe, otherwise the reason why not (may re-initialise a lost link); a
+        Health with orders_only=True when only order sending is off (see Health)."""
+        return Health()
 
     @abstractmethod
     def account_equity(self) -> float: ...

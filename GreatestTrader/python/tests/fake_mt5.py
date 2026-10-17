@@ -26,7 +26,7 @@ def reset():
         positions=[], deals=[], ticket=1000, deal_ticket=9000, selected=set(), specs={}, ticks={}, rates={},
         equity=10000.0, balance=10000.0, credit=0.0, login=111, server="Demo", margin_mode=2,
         order_send_none_once=False, order_send_none_no_exec=False, positions_get_none=False, init_count=0,
-        retcodes=[])
+        retcodes=[], account_trade_allowed=True, trade_expert=True)
 
 
 reset()
@@ -68,7 +68,8 @@ def account_info():
     if not _ok():
         return None
     return NS(login=S.login, server=S.server, currency="USD", leverage=100, equity=S.equity, balance=S.balance,
-              credit=S.credit, margin_free=S.equity, margin_mode=S.margin_mode)
+              credit=S.credit, margin_free=S.equity, margin_mode=S.margin_mode, trade_allowed=S.account_trade_allowed,
+              trade_expert=S.trade_expert)
 
 
 def terminal_info():

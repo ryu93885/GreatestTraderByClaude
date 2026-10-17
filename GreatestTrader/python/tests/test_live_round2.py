@@ -6,8 +6,10 @@ from datetime import datetime, timedelta
 import pandas as pd
 import pytest
 
-from fakes import FakeBroker, ny7_utc, synthetic_m15
-from greatest_trader.broker.base import OrderResult, Tick
+import greatest_trader.engine as engine_mod
+import greatest_trader.notify as notify_mod
+from fakes import NY7, FakeBroker, ny7_utc, synthetic_m15
+from greatest_trader.broker.base import Health, OrderResult, Tick
 from greatest_trader.engine import LiveEngine
 from greatest_trader.notify import Notifier
 from greatest_trader.strategies import PositionView
@@ -122,3 +124,139 @@ def test_first_run_on_a_weekend_books_the_friday(tmp_path):
     br.set_time(datetime(2021, 3, 6, 10, 0, 5))  # a Saturday tick (ny7: market time)
     eng.step()
     assert eng.state.day == "2021-03-05"
+
+
+# ------------------------------------------------------------------ D14 / parity#5
+ALGO_OFF = Health("Algo Trading is switched off in the MT5 terminal", orders_only=True)
+
+
+def test_algo_trading_off_still_latches_the_monthly_stop(tmp_path):
+    """Algo Trading is off while a position is open: equity dips to -3.5% for the month and recovers to -2.5% before
+    it is switched back on. The guards keep running (EA: same rule), so MONTH STOP is latched while it is off - no
+    order is sent then - and the position is closed as soon as trading is possible again."""
+    eng, br = make(cfg_for(tmp_path, preset="stable5"), eurjpy(), equity=100_000)
+    t = datetime(2021, 3, 3, 10, 0, 5)
+    br.set_time(t)
+    eng.step()
+    br.open_position("EURJPY", 1, 1.0, 129.0, None, 7101, "GT_NR")
+    br.health_reason = ALGO_OFF
+    for eq in (98_000, 96_500, 97_500):
+        t += timedelta(seconds=5)
+        br.set_time(t)
+        br.equity = eq
+        eng.step()
+    st = eng.state
+    assert st.month_halted and sent(eng, "MONTH STOP") and len(br.positions_) == 1  # latched, nothing sent
+    assert not [x for x in br.log if x[0] == "close"] and sent(eng, "trading paused: Algo Trading is switched off")
+    assert eng.entry_block().startswith("trading paused") and st.peak_equity == 100_000 and st.last_equity == 97_500
+    br.health_reason = ""
+    t += timedelta(seconds=5)
+    br.set_time(t)
+    eng.step()
+    assert br.positions_ == [] and ("close", "EURJPY", "GT monthly hard stop 3.0%") in br.log
+    assert sent(eng, "trading resumed (Algo Trading is switched off in the MT5 terminal: cleared)")
+    assert eng.entry_block() == ""
+
+
+def test_terminal_not_connected_still_pauses_everything(tmp_path):
+    eng, br = make(cfg_for(tmp_path, preset="stable5"), eurjpy(), equity=100_000)
+    t = datetime(2021, 3, 3, 10, 0, 5)
+    br.set_time(t)
+    eng.step()
+    br.health_reason = "MT5 terminal is not connected to the trade server"  # a plain reason: account data unsure
+    br.equity = 96_500
+    br.set_time(t + timedelta(seconds=5))
+    eng.step()
+    assert not eng.state.month_halted and eng.state.last_equity == 100_000
+
+
+# ------------------------------------------------------------------ py-clock-ops#3
+def test_recovery_notice_of_a_second_error_is_not_swallowed(tmp_path, monkeypatch):
+    """ERROR at t, 'recovered' at t+300; a second ERROR 1800 s after the first one, healed one loop later: its
+    'recovered' was dropped by a 30-minute rate limit, leaving ERROR as the operator's last message."""
+    clock = {"t": 1000.0}
+
+    class FakeTime:
+        monotonic = staticmethod(lambda: clock["t"])
+
+        @staticmethod
+        def sleep(s):
+            clock["t"] += s
+
+    monkeypatch.setattr(engine_mod, "time", FakeTime)
+    monkeypatch.setattr(notify_mod, "time", FakeTime)
+    eng, br = make(cfg_for(tmp_path), {"EURJPY": synthetic_m15(datetime(2025, 1, 13), 10, 160.0, 0.01)})
+    br.set_time(datetime(2025, 1, 21, 3, 0, 5))
+    t0 = 1060.0
+    fail = [(t0, t0 + 300), (t0 + 1800, t0 + 1805)]
+    orig = br.health
+
+    def health():
+        now = clock["t"]
+        if now >= t0 + 2400:
+            raise KeyboardInterrupt
+        br.set_time(br.now + timedelta(seconds=5))
+        if any(a <= now < b for a, b in fail):
+            raise RuntimeError("MT5 terminal unreachable (No IPC connection), reconnecting")
+        return orig()
+
+    br.health = health
+    assert eng.run_forever() == 10
+    msgs = [m for m in eng.notifier.recent if m.startswith("ERROR") or m.startswith("recovered")]
+    assert [m.split(":")[0].split(" after")[0] for m in msgs] == ["ERROR", "recovered", "ERROR", "recovered"]
+
+
+# ------------------------------------------------------------------ py-clock-ops#5
+def test_stale_feed_and_paused_trading_get_recovery_notices(tmp_path, monkeypatch):
+    """A frozen feed and Algo Trading switched off are notified, so is their end ('prices are updating again',
+    'trading resumed'), and a second incident inside the old rate-limit window is notified again at once (it was
+    silent for up to an hour)."""
+    clk = {"t": 0.0}
+
+    class T:
+        monotonic = staticmethod(lambda: clk["t"])
+        sleep = staticmethod(lambda s: None)
+
+    monkeypatch.setattr(notify_mod, "time", T)
+    cfg = cfg_for(tmp_path)
+    br = FakeBroker({"EURJPY": synthetic_m15(datetime(2025, 1, 13), 10, 160.0, 0.01)})
+    wall = {}
+    eng = LiveEngine(cfg, br, Notifier(cfg.notify), utcnow=lambda: wall["utc"])
+    s = {"srv": datetime(2025, 1, 21, 10, 0, 0)}
+    s["utc"] = NY7.server_to_utc(s["srv"])
+    log = []
+
+    def run(seconds, ticking, health=""):
+        br.health_reason = health
+        for _ in range(0, seconds, 5):
+            s["utc"] += timedelta(seconds=5)
+            clk["t"] += 5
+            if ticking:
+                s["srv"] = NY7.utc_to_server(s["utc"])
+                br.set_time(s["srv"])
+            wall["utc"] = s["utc"]
+            n = len(eng.notifier.recent)
+            eng.step()
+            log.extend(list(eng.notifier.recent)[n:])
+
+    def kinds():
+        out = []
+        for m in log:
+            for k in ("no price updates", "prices are updating again", "trading paused", "trading resumed"):
+                if m.startswith(k):
+                    out.append(k)
+        return out
+
+    run(60, True)
+    run(12 * 60, False)  # freeze 1
+    run(8 * 60, True)  # prices back
+    run(35 * 60, False)  # freeze 2, starts 20 min after freeze 1 (inside the old 1-hour rate limit)
+    run(10 * 60, True)
+    assert kinds() == ["no price updates", "prices are updating again", "no price updates",
+                       "prices are updating again"]
+    log.clear()
+    run(2 * 60, True, ALGO_OFF)
+    run(10 * 60, True)
+    run(15 * 60, True, ALGO_OFF)  # second episode 12 min after the first (inside the old 30-min rate limit)
+    run(60, True)
+    assert kinds() == ["trading paused", "trading resumed", "trading paused", "trading resumed"]

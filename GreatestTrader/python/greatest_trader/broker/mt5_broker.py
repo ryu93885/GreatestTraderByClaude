@@ -21,7 +21,7 @@ import pandas as pd
 
 from ..config import Config
 from ..strategies.base import PositionView, pip_size
-from .base import (CASH_DEAL_TYPES, DEAL_TYPE_CREDIT, Broker, CashFlow, CashScan, ClosedTrade, HistoryCheck,
+from .base import (CASH_DEAL_TYPES, DEAL_TYPE_CREDIT, Broker, CashFlow, CashScan, ClosedTrade, Health, HistoryCheck,
                    OrderResult, SymbolSpec, Tick)
 
 log = logging.getLogger(__name__)
@@ -123,11 +123,13 @@ class MT5Broker(Broker):
         self._clear_cache()
         self.connect()  # raises while the terminal is not back yet
 
-    def health(self) -> str:
-        """'' when trading decisions are safe, otherwise why not (the terminal is up but not connected to the
-        trade server, or Algo Trading is off). A lost IPC link (terminal restarted by an update, crashed,
-        closed) never comes back by itself: it is re-initialised with back-off up to 60 s, and RuntimeError is
-        raised while the terminal stays unreachable (the engine counts it as a failure: exit 3 after 30 min)."""
+    def health(self) -> Health:
+        """'' when trading decisions are safe, otherwise why not: the terminal is up but not connected to the
+        trade server (the whole loop pauses), or only sending orders is off - Algo Trading switched off, the account
+        does not allow (expert) trading - which is a Health with orders_only=True (the engine keeps its guards
+        running, sends no order). A lost IPC link (terminal restarted by an update, crashed, closed) never comes back
+        by itself: it is re-initialised with back-off up to 60 s, and RuntimeError is raised while the terminal
+        stays unreachable (the engine counts it as a failure: exit 3 after 30 min)."""
         ti = mt5.terminal_info()
         if ti is None:
             now = time.monotonic()
@@ -146,10 +148,18 @@ class MT5Broker(Broker):
                 raise RuntimeError(f"MT5 terminal_info unavailable after reconnect ({mt5.last_error()})")
             log.warning("MT5 connection re-established")
         if not ti.connected:
-            return "MT5 terminal is not connected to the trade server"
-        if not ti.trade_allowed and not self.cfg.engine.dry_run:
-            return "Algo Trading is switched off in the MT5 terminal"
-        return ""
+            return Health("MT5 terminal is not connected to the trade server")
+        if self.cfg.engine.dry_run:
+            return Health()
+        if not ti.trade_allowed:
+            return Health("Algo Trading is switched off in the MT5 terminal", orders_only=True)
+        info = mt5.account_info()
+        if info is not None and not getattr(info, "trade_allowed", True):
+            return Health("trading is not allowed on this account (investor password? account blocked?)",
+                          orders_only=True)
+        if info is not None and not getattr(info, "trade_expert", True):
+            return Health("the account does not allow expert (automated) trading", orders_only=True)
+        return Health()
 
     def versions(self) -> dict[str, str]:
         out = {"MetaTrader5": str(getattr(mt5, "__version__", "?"))}

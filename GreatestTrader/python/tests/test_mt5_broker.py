@@ -150,9 +150,18 @@ def test_reconnect_after_terminal_restart_with_backoff(b, clock):
     clock.t += 10
     assert b.health() == "" and S.init_count == 5
     S.connected = False
-    assert "not connected" in b.health()
+    h = b.health()
+    assert "not connected" in h and not h.orders_only  # the whole loop pauses
     S.connected, S.trade_allowed = True, False
-    assert "Algo Trading" in b.health()
+    h = b.health()
+    assert "Algo Trading" in h and h.orders_only  # D14: structured result, the guards keep running
+    S.trade_allowed, S.trade_expert = True, False
+    h = b.health()
+    assert "expert" in h and h.orders_only
+    S.trade_expert, S.account_trade_allowed = True, False
+    assert b.health().orders_only
+    S.account_trade_allowed = True
+    assert b.health() == "" and not b.health().orders_only
 
 
 def test_spec_refresh_logs_changes_and_market_watch_reselect(b, clock, caplog):
