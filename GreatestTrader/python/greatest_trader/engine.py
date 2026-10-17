@@ -862,10 +862,12 @@ class LiveEngine:
         bar = {k: float(row[k]) for k in ("close", "mid", "upper", "lower", "atr", "high", "low")}
         spec = self.broker.symbol_spec(sym)
 
-        # manage existing NR position on this symbol (TP -> SMA, time stop)
+        # manage existing NR position on this symbol (TP -> SMA, time stop); a new TP inside the stops level (+2
+        # points) cannot be placed: the position is closed at market instead (EA: same rule)
         positions = self.broker.positions(self.magics)
+        min_dist = (spec.stops_level_points + 2) * spec.point
         for p in [p for p in positions if p.strategy == "NR" and p.symbol == sym]:
-            for act in self.nr.manage_on_bar(p, bar, now_server, tick.bid, tick.ask):
+            for act in self.nr.manage_on_bar(p, bar, now_server, tick.bid, tick.ask, min_dist):
                 self._apply(act, p)
 
         # new entry only on a fresh bar close
@@ -1046,8 +1048,9 @@ class LiveEngine:
                 # the TP can never be placed: a fresh quote is already past it -> take the profit at market
                 self._close(CloseRequest(act.ticket, act.symbol, "price beyond TP (TP not placeable)"))
             else:
-                # any other failure (too many requests, no connection, a lost reply, stops / freeze level, ...): the
-                # position keeps its SL and the time stop, the TP is sent again on the next bar (EA: same rule)
+                # any other failure (too many requests, no connection, a lost reply, freeze level, ...): the position
+                # keeps its SL and the time stop, the TP is sent again on the next bar (EA: same rule). A TP inside the
+                # stops level never gets here: manage_on_bar closes the position instead ('price at moving average')
                 log.warning("modify failed %s ticket=%s: %s (SL kept, TP retried next bar)", act.symbol, act.ticket,
                             res.message)
 

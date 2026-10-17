@@ -77,3 +77,22 @@ def test_es_entry_and_exit():
     p = PositionView(2, "ES", "EURUSD", -1, 0.1, 1.2, now, 1.203, None)
     assert es.manage(p, datetime(2021, 3, 3, 12, 59), now) == []
     assert isinstance(es.manage(p, datetime(2021, 3, 3, 13, 0), now)[0], CloseRequest)
+
+
+def test_nr_manage_tp_inside_the_stops_level_closes():
+    """D13 (EA rule): a new TP on the profitable side within (stops level + 2) points of the price cannot be placed:
+    close at market ('price at moving average') instead of a modify that the server rejects."""
+    s = nr()
+    t = datetime(2021, 3, 3, 1, 0, 2)
+    # short at 150.40, new TP 150.10, ask 150.104: 4 points (0.001) away, stops level 10 -> min_dist 12 points
+    acts = s.manage_on_bar(pos(), bar(150.11, mid=150.10), t, 150.10, 150.104, min_dist=0.012)
+    assert isinstance(acts[0], CloseRequest) and acts[0].reason == "price at moving average"
+    # the same quote with stops level 0 (min_dist 2 points): the TP is placeable -> modify
+    acts = s.manage_on_bar(pos(), bar(150.11, mid=150.10), t, 150.10, 150.104, min_dist=0.002)
+    assert isinstance(acts[0], ModifyRequest) and acts[0].tp_price == 150.10
+    # an unfavourable moving average is never a close reason, however close the price is
+    acts = s.manage_on_bar(pos(), bar(150.45, mid=150.45), t, 150.44, 150.446, min_dist=0.012)
+    assert isinstance(acts[0], ModifyRequest) and acts[0].tp_price is None
+    # the backtester's default (min_dist 0) is unchanged: only a price at/beyond the TP closes
+    acts = s.manage_on_bar(pos(), bar(150.11, mid=150.10), t, 150.10, 150.104)
+    assert isinstance(acts[0], ModifyRequest)

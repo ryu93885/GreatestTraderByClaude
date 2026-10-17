@@ -526,8 +526,8 @@ def test_trade_journal_open_and_close_with_r(tmp_path):
     o, c = opens.iloc[0], closes.iloc[0]
     assert o.ticket == c.ticket and o.base_risk == pytest.approx(0.01) and o.risk_amount > 0
     assert o.risk_pct == pytest.approx(o.risk_amount / 1_000_000)
-    assert c.R == pytest.approx(c.pnl / o.risk_amount) and c.close_reason in ("TP", "SL", "time stop",
-                                                                               "price already beyond moving average")
+    assert c.R == pytest.approx(c.pnl / o.risk_amount) and c.close_reason in (
+        "TP", "SL", "time stop", "price already beyond moving average", "price at moving average")
     closes_df = TradeJournal(tmp_path / "journal").closed_trades()
     assert len(closes_df) == len(closes)
 

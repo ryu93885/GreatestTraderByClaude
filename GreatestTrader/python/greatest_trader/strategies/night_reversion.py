@@ -112,8 +112,12 @@ class NightReversion:
         return now_server >= entry_bar_open + self.cfg.max_hold_bars * BAR
 
     def manage_on_bar(self, pos: PositionView, last_bar: dict, now_server: datetime,
-                      bid: float, ask: float) -> list:
-        """Called after each newly closed M15 bar (and on start-up)."""
+                      bid: float, ask: float, min_dist: float = 0.0) -> list:
+        """Called after each newly closed M15 bar (and on start-up).
+
+        min_dist (live engine: (stops level + 2) x point, the EA's rule): a new TP on the profitable side that the
+        current price has already reached, or that lies closer to the price than min_dist (the server would reject
+        it as too close), closes the position at market instead of moving the TP."""
         if self.time_stop_due(pos, now_server):
             return [CloseRequest(pos.ticket, pos.symbol, "time stop")]
         tp = self.favorable_tp(pos.direction, pos.open_price, last_bar["mid"])
@@ -121,6 +125,8 @@ class NightReversion:
             px = bid if pos.direction > 0 else ask
             if (pos.direction > 0 and px >= tp) or (pos.direction < 0 and px <= tp):
                 return [CloseRequest(pos.ticket, pos.symbol, "price already beyond moving average")]
+            if abs(tp - px) < min_dist:
+                return [CloseRequest(pos.ticket, pos.symbol, "price at moving average")]
         if not _same_price(tp, pos.tp):
             return [ModifyRequest(pos.ticket, pos.symbol, tp, "TP -> moving average")]
         return []
