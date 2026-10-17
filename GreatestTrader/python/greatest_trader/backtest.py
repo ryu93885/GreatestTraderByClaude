@@ -279,7 +279,9 @@ class _FxConverter:
     AUD = EURUSD / EURAUD, ...). With the 14 default NR symbols every currency is covered for a USD or a
     JPY account. A rate older than 7 days counts as missing and the next candidate is tried; a direct pair
     older than 1 day (a data gap, or its data ended) gives way to the route through USD and is used again only
-    where that route has no price either."""
+    where that route has no price either. The same order holds for the USD leg itself (usd()): the direct USD
+    pair when it is at most 1 day old, else a cross, else the direct USD pair up to 7 days old - so a stale
+    direct pair also gives way for a USD account (where the account pair IS the USD leg)."""
 
     def __init__(self, data: dict[str, pd.DataFrame]):
         self.px = {}
@@ -298,19 +300,20 @@ class _FxConverter:
         out[stale] = np.nan
         return out
 
-    def _direct(self, ccy: str, t: np.ndarray) -> np.ndarray | None:
+    def _direct(self, ccy: str, t: np.ndarray, limit: np.timedelta64 = _STALE) -> np.ndarray | None:
         if ccy == "USD":
             return np.ones(len(t))
         if ccy + "USD" in self.px:
-            return self._asof(ccy + "USD", t)
+            return self._asof(ccy + "USD", t, limit)
         if "USD" + ccy in self.px:
-            return 1.0 / self._asof("USD" + ccy, t)
+            return 1.0 / self._asof("USD" + ccy, t, limit)
         return None
 
     def usd(self, ccy: str, t: np.ndarray) -> np.ndarray:
-        """Value of 1 unit of ccy in USD (NaN where no candidate is available)."""
-        out = self._direct(ccy, t)
-        out = np.full(len(t), np.nan) if out is None else out
+        """Value of 1 unit of ccy in USD (NaN where no candidate is available): the direct USD pair when it is at
+        most 1 day old, else a cross whose other leg has a USD pair, else the direct USD pair up to 7 days old."""
+        direct = self._direct(ccy, t, _STALE_DIRECT)
+        out = np.full(len(t), np.nan) if direct is None else direct
         for sym in sorted(self.px):
             if not np.isnan(out).any():
                 break
@@ -324,6 +327,8 @@ class _FxConverter:
             p = self._asof(sym, t)
             cand = o * p if b == ccy else o / p
             out = np.where(np.isfinite(out), out, cand)
+        if direct is not None and np.isnan(out).any():  # no cross either: the direct USD pair up to 7 days old
+            out = np.where(np.isfinite(out), out, self._direct(ccy, t))
         return out
 
     def rate(self, ccy: str, acct: str, t: np.ndarray) -> np.ndarray:
