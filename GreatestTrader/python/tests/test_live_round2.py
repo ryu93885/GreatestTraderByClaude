@@ -12,8 +12,69 @@ from fakes import NY7, FakeBroker, ny7_utc, synthetic_m15
 from greatest_trader.broker.base import Health, OrderResult, Tick
 from greatest_trader.engine import LiveEngine
 from greatest_trader.notify import Notifier
+from greatest_trader.risk import RiskState
 from greatest_trader.strategies import PositionView
 from test_live_ops import cfg_for, eurjpy, make, sent
+
+
+# ------------------------------------------------------------------ D8 / py-cashflow#4
+def halted_state(path, request, month_halted=False):
+    RiskState(peak_equity=10_000, last_equity=7_900, day="2021-03-10", month="2021-03", day_start_equity=7_900,
+              month_start_equity=7_900 if not month_halted else 8_500, month_halted=month_halted, halted=True,
+              halt_reason="max drawdown 21.0% reached on 2021-03-09", account_login=111, cash_init=True,
+              reset_request=request).save(path / "state.json")
+
+
+@pytest.mark.parametrize("equity,request_,resumed", [(7_900, "clear", False), (8_100, "clear", True),
+                                                     (7_900, "rebase", True)])
+def test_reset_halt_without_rebase_is_halted_again_and_says_so(tmp_path, equity, request_, resumed):
+    """7_reset_halt.bat used to store a plain 'clear': with the drawdown still >= 20% the engine halted again in the
+    same loop. The engine now says so and names the rebase; a clear after the drawdown recovered below the level,
+    and the rebase, resume trading."""
+    halted_state(tmp_path, request_)
+    eng, br = make(cfg_for(tmp_path, preset="stable5"), eurjpy(start=datetime(2021, 3, 8)), equity=equity)
+    br.set_time(datetime(2021, 3, 10, 10, 0, 5))
+    eng.start()
+    eng.step()
+    st = eng.state
+    assert st.halted is not resumed and st.reset_request == ""
+    assert sent(eng, "RESET HALT (python main.py reset-halt" + (" --rebase-peak" if request_ == "rebase" else ""))
+    noted = sent(eng, "RESET HALT had no effect: the drawdown 21.0%")
+    assert bool(noted) is not resumed
+    if noted:
+        assert "7_reset_halt.bat (python main.py reset-halt --rebase-peak)" in noted[0]
+
+
+def test_halt_hints_name_the_rebase(tmp_path):
+    RiskState(peak_equity=10_000, day="2021-03-10", month="2021-03", account_login=111, cash_init=True,
+              halted=True, halt_reason="max drawdown 21.0% reached on 2021-03-09").save(tmp_path / "state.json")
+    eng, br = make(cfg_for(tmp_path, preset="stable5"), eurjpy(start=datetime(2021, 3, 8)), equity=7_900)
+    br.set_time(datetime(2021, 3, 10, 23, 59, 55))
+    eng.start()
+    assert sent(eng, "HALTED: max drawdown 21.0% reached on 2021-03-09 (no new entries; to resume: stop the engine, "
+                     "run 7_reset_halt.bat (python main.py reset-halt --rebase-peak), start it)")
+    eng.step()
+    br.set_time(datetime(2021, 3, 11, 0, 0, 5))
+    eng.step()
+    assert sent(eng, "-> 7_reset_halt.bat (python main.py reset-halt --rebase-peak)")  # daily summary
+    eng2, br2 = make(cfg_for(tmp_path / "b", preset="stable5"), eurjpy(start=datetime(2021, 3, 8)), equity=10_000)
+    br2.set_time(datetime(2021, 3, 10, 10, 0, 5))
+    eng2.step()
+    br2.equity = 7_900
+    br2.set_time(datetime(2021, 3, 10, 10, 0, 10))
+    eng2.step()
+    assert sent(eng2, "HALT: max drawdown 21.0% reached on 2021-03-10 -> no new entries; to resume: stop the engine, "
+                      "run 7_reset_halt.bat")
+
+
+def test_reset_does_not_clear_the_monthly_stop(tmp_path):
+    halted_state(tmp_path, "rebase", month_halted=True)
+    eng, br = make(cfg_for(tmp_path, preset="stable5"), eurjpy(start=datetime(2021, 3, 8)), equity=7_900)
+    br.set_time(datetime(2021, 3, 10, 10, 0, 5))
+    eng.start()
+    eng.step()
+    assert not eng.state.halted and eng.state.month_halted
+    assert sent(eng, "the monthly hard stop stays in force until the month ends")
 
 STOPS_LEVEL = 10  # points
 

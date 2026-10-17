@@ -8,7 +8,8 @@
 * Drawdown scaling: risk x max(floor, 1 - DD / dd_scale_full)   (DD measured from equity peak).
 * Daily / monthly loss limits: no new entries for the rest of the market day / month.
 * Daily / monthly hard stops: close everything and stay flat for the rest of the day / month.
-* Max drawdown halt: no new entries at all once DD >= max_drawdown_halt (reset: `python main.py reset-halt`).
+* Max drawdown halt: no new entries at all once DD >= max_drawdown_halt (resume: `python main.py reset-halt
+  --rebase-peak` = 7_reset_halt.bat; a plain clear is halted again at once while DD is still >= the level).
 * Position limits: total open positions, positions per currency, one position per symbol,
   same-direction positions per currency and total open risk.
 * Year-end blackout: no new entries between blackout_start and blackout_end (market dates).
@@ -133,7 +134,8 @@ class RiskState:
         st.restored_from = ""
         if errors:
             st.halted = True
-            st.halt_reason = "state file corrupt and no readable backup: check the account, then run reset-halt"
+            st.halt_reason = ("state file corrupt and no readable backup: check the account, then run 7_reset_halt.bat "
+                              "(reset-halt --rebase-peak)")
             st.restored_from = "none (" + "; ".join(errors) + ")"
             log.error("no readable state file (%s): starting HALTED", "; ".join(errors))
         return st

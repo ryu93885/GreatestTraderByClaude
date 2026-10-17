@@ -58,6 +58,9 @@ FLOW_PENDING_SECONDS = 60.0  # a balance change without a new deal in the histor
 PRIME_STABLE_SECONDS = 60.0  # first run: cash deals of the history unchanged this long = the history is complete
 PRIME_MAX_SECONDS = 600.0  # first run: the cash-flow tracking starts after this long anyway (warning)
 FX_HOLIDAYS = {(12, 25), (1, 1)}  # market dates without trading
+# after a max-drawdown halt only a reset WITH the peak rebase resumes trading (a plain clear is halted again at once
+# while the drawdown is still at or above the halt level); 7_reset_halt.bat passes --rebase-peak (EA: InpResetHalt)
+RESUME_HINT = "to resume: stop the engine, run 7_reset_halt.bat (python main.py reset-halt --rebase-peak), start it"
 
 
 class FatalError(RuntimeError):
@@ -200,8 +203,7 @@ class LiveEngine:
         if self.state.reset_request:
             log.warning("reset-halt requested (%s): applied after the first cash-flow check", self.state.reset_request)
         elif self.state.halted:
-            self._alert(f"HALTED: {self.state.halt_reason} (no new entries; `python main.py reset-halt` to resume)",
-                        level=logging.ERROR)
+            self._alert(f"HALTED: {self.state.halt_reason} (no new entries; {RESUME_HINT})", level=logging.ERROR)
         self._started = True
 
     # ------------------------------------------------------------------ loop
@@ -305,12 +307,19 @@ class LiveEngine:
             # month / day stop decision, no entry this loop; closes, time stops, TP management and stops in force run
             self.risk.flatten_reason = ""
         else:
+            reset = ""
             if st.cash_init and not self._cash_problem:
-                self._apply_reset_request(equity)  # after this start's first cash-flow check
+                reset = self._apply_reset_request(equity)  # after this start's first cash-flow check
             before = (st.day, st.month, st.last_equity, st.peak_equity, st.month_start_equity, st.day_opens,
                       st.day_closes)
             for ev in self.risk.update_equity(equity, self._market_day(now_mkt)):
-                self._alert(ev)
+                self._alert(ev + (f" -> no new entries; {RESUME_HINT}" if ev.startswith("HALT:") and not reset else ""))
+            if reset == "clear" and st.halted:  # D8: a clear without the peak rebase cannot resume trading here
+                self._alert(f"RESET HALT had no effect: the drawdown {self.risk.drawdown(equity):.1%} from the peak "
+                            f"{st.peak_equity:,.2f} is still at or above the halt level "
+                            f"{self.cfg.risk.max_drawdown_halt:.0%}, so the halt was set again at once. A plain "
+                            f"`reset-halt` (without --rebase-peak) only helps once the drawdown is below the halt level; "
+                            f"{RESUME_HINT}", level=logging.ERROR)
             if before[0] and st.day != before[0]:
                 self._new_day(before, utc)
             if before[1] and st.month != before[1]:
@@ -699,17 +708,23 @@ class LiveEngine:
         self._prime_start = self._prime_ref = None
         return True
 
-    def _apply_reset_request(self, equity: float) -> None:
+    def _apply_reset_request(self, equity: float) -> str:
         """`reset-halt` request stored in the state: applied after the cash-flow check of this start, so that a
-        deposit made while the engine was stopped has already been applied to the old peak."""
+        deposit made while the engine was stopped has already been applied to the old peak. Returns the request
+        applied ("clear" | "rebase" | "" = none). The monthly hard stop is not cleared (it ends with the month)."""
         st = self.state
-        if not st.reset_request:
-            return
-        msg = self.risk.reset_halt(equity if st.reset_request == "rebase" else None)
+        req = st.reset_request
+        if not req:
+            return ""
+        msg = self.risk.reset_halt(equity if req == "rebase" else None)
         st.reset_request = ""
-        self._alert(f"RESET HALT (python main.py reset-halt, applied after the cash-flow check): {msg}")
+        if st.month_halted:
+            msg += "; the monthly hard stop stays in force until the month ends (a reset does not clear it)"
+        self._alert(f"RESET HALT (python main.py reset-halt{' --rebase-peak' if req == 'rebase' else ''}, applied "
+                    f"after the cash-flow check): {msg}")
         self.journal.trade({"event": "reset_halt", "time_utc": f"{self._utcnow():%Y-%m-%d %H:%M:%S}",
                             "reason": f"applied by the engine: {msg}"})
+        return req
 
     # ------------------------------------------------------------------ monitoring
     def _new_day(self, before: tuple, utc: datetime) -> None:
@@ -736,7 +751,7 @@ class LiveEngine:
                      f"DD {dd:.1%}", f"month-to-date {mret:+.2%} (flow-adjusted)",
                      f"trades opened {opens} / closed {closes}"]
             if st.halted:
-                parts.append(f"HALTED ({st.halt_reason}) -> python main.py reset-halt")
+                parts.append(f"HALTED ({st.halt_reason}) -> 7_reset_halt.bat (python main.py reset-halt --rebase-peak)")
             if st.month_halted or st.day_halted:
                 parts.append(f"stopped: {self.risk.hard_stop_active()}")
             if block:
