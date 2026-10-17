@@ -22,7 +22,7 @@ import logging
 import math
 import time
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -292,7 +292,7 @@ class LiveEngine:
                 self._apply_reset_request(equity)  # after this start's first cash-flow check
             before = (st.day, st.month, st.last_equity, st.peak_equity, st.month_start_equity, st.day_opens,
                       st.day_closes)
-            for ev in self.risk.update_equity(equity, now_mkt.date()):
+            for ev in self.risk.update_equity(equity, self._market_day(now_mkt)):
                 self._alert(ev)
             if before[0] and st.day != before[0]:
                 self._new_day(before, utc)
@@ -325,6 +325,17 @@ class LiveEngine:
         self._heartbeat(now_server, now_mkt, now_utc, equity, positions)
         self.notifier.heartbeat()  # dead-man switch: only healthy loops ping
         self._save_state()
+
+    def _market_day(self, now_mkt: datetime) -> date:
+        """Market date for the day / month bookkeeping: Monday-Friday only (EA: same rule). A Saturday or Sunday
+        market date (a broker clock change that is not confirmed yet around a DST switch, weekend ticks) keeps the
+        current market day: no equity_log row, daily summary or day-stop reference for a weekend day."""
+        day = now_mkt.date()
+        if day.weekday() < 5:
+            return day
+        if self.state.day:
+            return date.fromisoformat(self.state.day)
+        return day - timedelta(days=day.weekday() - 4)  # first run on a weekend: the Friday before
 
     def _isolated(self, name: str, fn, *args) -> None:
         """Run one symbol's work; a failure is logged (full traceback only now and then), notified after 60 loops

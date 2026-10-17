@@ -11,7 +11,7 @@ from greatest_trader.broker.base import OrderResult, Tick
 from greatest_trader.engine import LiveEngine
 from greatest_trader.notify import Notifier
 from greatest_trader.strategies import PositionView
-from test_live_ops import cfg_for, make
+from test_live_ops import cfg_for, eurjpy, make, sent
 
 STOPS_LEVEL = 10  # points
 
@@ -85,3 +85,40 @@ def test_history_gap_never_stops_the_tp_management(tmp_path, caplog):
     assert ("modify", "GBPCAD", pytest.approx(mid)) in br.log
     assert eng.last_bar["GBPCAD"] == datetime(2021, 3, 3, 0, 0)
     assert sum("history gap" in r.message for r in caplog.records) == 1  # logged once for the bar
+
+
+# ------------------------------------------------------------------ D10 / py-clock-ops#4
+def test_no_sunday_market_day_while_a_clock_change_is_unconfirmed(tmp_path):
+    """EET broker in auto mode (verified ny7 = +3 in the summer). EU DST ends Sun 2026-10-25: at the FX open
+    (Sun 21:00:05 UTC) the server is +2, the old clock still maps it to market Sunday 23:00. No Sunday market day,
+    DAILY summary or equity_log row may be booked; the day rolls from Friday straight to Monday."""
+    cfg = cfg_for(tmp_path, preset="stable5", mode="auto")
+    br = FakeBroker({"EURJPY": synthetic_m15(datetime(2026, 10, 5), 25, 160.0, 0.01)})
+    wall = {}
+    eng = LiveEngine(cfg, br, Notifier(cfg.notify), utcnow=lambda: wall["utc"])
+
+    def loop(server, off):
+        br.set_time(server)
+        wall["utc"] = server - timedelta(hours=off)
+        eng.step()
+
+    t = datetime(2026, 10, 23, 23, 58, 0)  # Friday, server +3 (EEST) = NY+7
+    while t <= datetime(2026, 10, 23, 23, 59, 50):
+        loop(t, 3)
+        t += timedelta(seconds=5)
+    assert eng.clock_verified and eng.state.day == "2026-10-23"
+    t = datetime(2026, 10, 25, 23, 0, 5)  # Sunday 21:00:05 UTC; EET is +2 now
+    for k in range(5):
+        loop(t + timedelta(seconds=5 * k), 2)
+        assert eng.state.day in ("2026-10-23", "2026-10-26")
+    assert eng.state.day == "2026-10-26" and sent(eng, "server clock CHANGED")
+    assert not sent(eng, "2026-10-25") and len(sent(eng, "DAILY 2026-10-23 Fri")) == 1
+    log = pd.read_csv(tmp_path / "journal" / "equity_log.csv")
+    assert list(log.market_date) == ["2026-10-23"] and len(eng.state.daily_equity) == 1
+
+
+def test_first_run_on_a_weekend_books_the_friday(tmp_path):
+    eng, br = make(cfg_for(tmp_path), eurjpy())
+    br.set_time(datetime(2021, 3, 6, 10, 0, 5))  # a Saturday tick (ny7: market time)
+    eng.step()
+    assert eng.state.day == "2021-03-05"
