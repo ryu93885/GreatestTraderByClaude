@@ -1,8 +1,9 @@
 """Round-2 live engine rules (decisions D8-D14 and the notification fixes py-clock-ops#3/#5), on the in-memory
 FakeBroker: TP inside the stops level, history gaps only logged, Monday-Friday market days, deferred entry signals,
 closed bars by time, Algo Trading off, reset-halt without --rebase-peak, recovery notices."""
-from datetime import datetime
+from datetime import datetime, timedelta
 
+import pandas as pd
 import pytest
 
 from fakes import FakeBroker, ny7_utc, synthetic_m15
@@ -10,7 +11,7 @@ from greatest_trader.broker.base import OrderResult, Tick
 from greatest_trader.engine import LiveEngine
 from greatest_trader.notify import Notifier
 from greatest_trader.strategies import PositionView
-from test_live_ops import cfg_for
+from test_live_ops import cfg_for, make
 
 STOPS_LEVEL = 10  # points
 
@@ -62,3 +63,25 @@ def test_new_tp_inside_the_stops_level_closes_the_position(tmp_path, points_shor
         assert not [x for x in br.log if x[0] == "modify-rejected"]
     else:
         assert len(br.positions_) == 1 and br.positions_[0].tp == pytest.approx(mid)
+
+
+# ------------------------------------------------------------------ D12 / parity#4
+def test_history_gap_never_stops_the_tp_management(tmp_path, caplog):
+    """One weekday M15 bar is missing in the lookback: the TP of the open NR position still follows the new
+    moving average (it used to be frozen for up to 4 hours while the gap was in the 16-bar window)."""
+    df = synthetic_m15(datetime(2021, 3, 1), 5, 1.75, 0.0001)
+    df = df.drop(pd.Timestamp(datetime(2021, 3, 2, 23, 0)))  # Tue 23:00 market time
+    eng, br = make(cfg_for(tmp_path, syms=("GBPCAD",), preset="stable5"), {"GBPCAD": df}, equity=100_000)
+    t = datetime(2021, 3, 3, 0, 15, 5)
+    br.set_time(t)
+    mid = float(eng.nr.prepare(br.rates("GBPCAD", "M15", 300)).iloc[-1]["mid"])
+    op = mid - 0.0040
+    br.positions_.append(PositionView(501, "NR", "GBPCAD", 1, 1.0, op, datetime(2021, 3, 3, 0, 0, 2), op - 0.006,
+                                      mid + 0.003))
+    for _ in range(3):
+        eng.step()
+        t += timedelta(seconds=5)
+        br.set_time(t)
+    assert ("modify", "GBPCAD", pytest.approx(mid)) in br.log
+    assert eng.last_bar["GBPCAD"] == datetime(2021, 3, 3, 0, 0)
+    assert sum("history gap" in r.message for r in caplog.records) == 1  # logged once for the bar

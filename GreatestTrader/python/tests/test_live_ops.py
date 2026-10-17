@@ -603,13 +603,16 @@ def test_history_gap_check(tmp_path):
     assert not eng._gap_free(df, len(idx) + 1, M15)  # not enough history
 
 
-def test_signal_with_a_history_gap_is_not_traded(tmp_path, caplog):
+def test_signal_with_a_history_gap_is_traded_and_the_gap_logged(tmp_path, caplog):
+    """D12 (parity#4): a missing weekday bar in the lookback is only logged (once per bar); the signal is taken over
+    the bars as they are, as the EA and the backtester do."""
     data = eurjpy(spike_at=SPIKE)
     data["EURJPY"] = data["EURJPY"].drop(pd.Timestamp(SPIKE) - pd.Timedelta(minutes=30))
     eng, br = make(cfg_for(tmp_path), data, equity=1_000_000)
     step_until(eng, br, datetime(2021, 3, 2, 22, 0), datetime(2021, 3, 3, 1, 0))
-    assert not [x for x in br.log if x[0] == "open"]
-    assert any("history gap" in r.message for r in caplog.records)
+    assert [x for x in br.log if x[0] == "open"]
+    gaps = [r.message for r in caplog.records if "history gap" in r.message]
+    assert gaps and len(gaps) == len(set(gaps))  # once per bar
 
 
 # ------------------------------------------------------------------ capacity caps live

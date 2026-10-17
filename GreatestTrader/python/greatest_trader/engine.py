@@ -849,12 +849,18 @@ class LiveEngine:
         if self.last_bar.get(sym) == bar_time:
             return
         c = self.cfg.night_reversion
-        if not self._gap_free(df, max(c.bb_period, c.atr_period + 1) + 1, M15):
+        need = max(c.bb_period, c.atr_period + 1) + 1
+        if len(df) < need:
             if self._gap_logged.get(sym) != bar_time:
                 self._gap_logged[sym] = bar_time
-                log.warning("%s: history gap in the last bars before %s: indicators not computed, retrying", sym,
-                            bar_time)
+                log.warning("%s: only %d M15 bars before %s (%d needed): retrying", sym, len(df), bar_time, need)
             return  # last_bar is not set: checked again on the next loop
+        if not self._gap_free(df, need, M15) and self._gap_logged.get(sym) != bar_time:
+            # logged only (once per bar): the EA and the backtester compute the indicators over the bars as they are,
+            # and the TP management must never stop for a missing bar
+            self._gap_logged[sym] = bar_time
+            log.warning("%s: history gap in the last %d M15 bars before %s (outside the weekend / Dec 25 / Jan 1): "
+                        "indicators computed over the bars as they are", sym, need, bar_time)
         first_time = sym not in self.last_bar
         self.last_bar[sym] = bar_time
         prep = self.nr.prepare(df)
@@ -914,9 +920,12 @@ class LiveEngine:
             return
         spec = self.broker.symbol_spec(c.symbol)
         h1 = self.broker.rates(c.symbol, "H1", c.atr_period_h1 + 30)
-        if not self._gap_free(h1, c.atr_period_h1 + 1, H1):
-            log.warning("ES: history gap in the last H1 bars of %s, retrying", c.symbol)
+        if len(h1) < c.atr_period_h1 + 1:
+            log.warning("ES: only %d H1 bars of %s (%d needed): retrying", len(h1), c.symbol, c.atr_period_h1 + 1)
             return
+        if not self._gap_free(h1, c.atr_period_h1 + 1, H1):  # logged only, as for NR (EA / backtester: no gap check)
+            log.warning("ES: history gap in the last %d H1 bars of %s: ATR computed over the bars as they are",
+                        c.atr_period_h1 + 1, c.symbol)
         a = atr(h1["high"], h1["low"], h1["close"], c.atr_period_h1).iloc[-1]
         spread_pips = (tick.ask - tick.bid) / spec.pip
         req = self.es.entry_signal(now_utc, now_server, float(a), spec.pip, spread_pips)
