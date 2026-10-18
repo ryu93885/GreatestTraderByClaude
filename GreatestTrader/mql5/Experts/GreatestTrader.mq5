@@ -124,6 +124,7 @@ input bool   InpResetHalt   = false; // Clear the max-DD halt once at start (pea
 #define GT_LOCK_BEAT_SEC    10      // instance lock: heartbeat interval
 #define GT_REPEAT_SEC       21600   // repeat a standing alert at most every 6 hours
 #define GT_STALE_FEED_SEC   900     // no new quote for this long while the market is open = stale feed
+#define GT_SESSION_GRACE_SEC 600    // ... the first quote of a session (Monday, after Dec 25 / Jan 1) may come this late
 #define GT_NOTIFY_MAX       30      // push queue length
 #define GT_FAR_FUTURE       D'2100.01.01 00:00:00'
 
@@ -195,6 +196,7 @@ datetime g_primeTry = 0;         // ... last priming attempt (the whole history 
 ENUM_GT_SERVER_TIME g_clockMode = GT_SERVER_NY7; // effective mode (AUTO -> NY7 in the tester)
 long     g_clkOffset = 0;        // AUTO: adopted server - UTC offset in seconds (persisted "clkoff")
 bool     g_clkHave = false;      // AUTO: an adopted offset exists
+bool     g_clkNY7 = false;       // AUTO: the adopted offset matched the NY7 rule: the clock follows US DST ("clkny7")
 bool     g_clkVerified = false;  // a valid observation confirmed the clock since start-up
 bool     g_clkBlocked = false;   // repeated mismatches: new entries blocked
 int      g_clkMismatch = 0;      // consecutive observations that disagree with the clock in use
@@ -223,6 +225,8 @@ datetime g_staleNote = 0;
 datetime g_startLocal = 0;
 string   g_capSym[];             // lot-cap notices: once per market day per symbol
 datetime g_capDay[];
+ulong    g_noSLTk[];             // own positions without a stop loss already notified ...
+datetime g_noSLNote[];           // ... and when (at most every GT_REPEAT_SEC per ticket; pruned in PruneFails)
 
 //--- close back-off (bounded by the open positions, see PruneFails)
 ulong    g_failTk[];
@@ -345,18 +349,31 @@ bool IsUSDST(const datetime utc)
    return (utc >= st && utc < en);
   }
 
-// server time -> UTC with the clock in use. AUTO uses the adopted (measured or persisted) offset and the NY7 rule
-// until one exists; entries stay blocked until a live observation confirms the clock (CheckClock / CanOpen).
-datetime ServerToUTC(const datetime srv)
+// server time -> UTC with the NY7 rule (server time = market time: UTC+3 in US summer, UTC+2 otherwise)
+datetime NY7ServerToUTC(const datetime srv)
   {
-   if(g_clockMode == GT_SERVER_FIXED)
-      return srv - (int)MathRound(InpServerGMTOffset * 3600.0);
-   if(g_clockMode == GT_SERVER_AUTO && g_clkHave)
-      return (datetime)((long)srv - g_clkOffset);
    datetime cand = srv - 3 * 3600;
    if(IsUSDST(cand))
       return cand;
    return srv - 2 * 3600;
+  }
+
+// server - UTC in seconds under the NY7 rule at server time srv
+long NY7Offset(const datetime srv)
+  {
+   return (long)srv - (long)NY7ServerToUTC(srv);
+  }
+
+// server time -> UTC with the clock in use. AUTO: an adopted offset that matched the NY7 rule is kept as the NY7
+// rule (follows US DST, like Python's detect_server_mode); any other adopted offset is a fixed number of seconds;
+// the NY7 rule until one exists. Entries stay blocked until a live observation confirms the clock (CheckClock).
+datetime ServerToUTC(const datetime srv)
+  {
+   if(g_clockMode == GT_SERVER_FIXED)
+      return srv - (int)MathRound(InpServerGMTOffset * 3600.0);
+   if(g_clockMode == GT_SERVER_AUTO && g_clkHave && !g_clkNY7)
+      return (datetime)((long)srv - g_clkOffset);
+   return NY7ServerToUTC(srv);
   }
 
 datetime UTCToMarket(const datetime utc)
@@ -366,9 +383,19 @@ datetime UTCToMarket(const datetime utc)
 
 datetime ServerToMarket(const datetime srv)
   {
-   if(g_clockMode == GT_SERVER_NY7 || (g_clockMode == GT_SERVER_AUTO && !g_clkHave))
+   if(g_clockMode == GT_SERVER_NY7 || (g_clockMode == GT_SERVER_AUTO && (!g_clkHave || g_clkNY7)))
       return srv;
    return UTCToMarket(ServerToUTC(srv));
+  }
+
+// the clock in use, for log and status texts
+string ClockText()
+  {
+   if(g_clockMode == GT_SERVER_FIXED)
+      return StringFormat("fixed UTC%+.1f h", InpServerGMTOffset);
+   if(g_clockMode == GT_SERVER_AUTO && g_clkHave && !g_clkNY7)
+      return StringFormat("UTC%+.1f h (fixed)", g_clkOffset / 3600.0);
+   return "NY7 rule (UTC+3 in US summer, UTC+2 otherwise)";
   }
 
 datetime DayStart(const datetime t)
@@ -481,7 +508,10 @@ void SaveState(const bool force = false)
         }
      }
    if(g_clkHave)
+     {
       GVPut("clkoff", (double)g_clkOffset);
+      GVPut("clkny7", g_clkNY7 ? 1.0 : 0.0);
+     }
    GVPut("ddalert", (double)g_ddAlertDay);
    GVPut("rsthalt", g_resetHaltDone ? 1.0 : 0.0);
    g_gvRefresh = false;
@@ -533,6 +563,7 @@ void ResetStateVars()
    g_primeTry = 0;
    g_clkHave = false;
    g_clkOffset = 0;
+   g_clkNY7 = false;
    g_ddAlertDay = 0;
    g_resetHaltDone = false;
    g_resetDue = false;
@@ -614,6 +645,15 @@ void LoadState()
         {
          g_clkOffset = off;
          g_clkHave = true;
+         if(GlobalVariableCheck(g_gvPrefix + "clkny7"))
+            g_clkNY7 = (GlobalVariableGet(g_gvPrefix + "clkny7") > 0.5);
+         else
+           {
+            // state of an earlier build (a number only): an offset equal to the current NY7 offset is the NY7 rule
+            datetime srv = TimeCurrent();
+            long ny7 = (srv > 0) ? NY7Offset(srv) : (long)(IsUSDST(TimeGMT()) ? 3 : 2) * 3600;
+            g_clkNY7 = (off == ny7);
+           }
         }
      }
    if(GlobalVariableCheck(g_gvPrefix + "ddalert"))
@@ -712,8 +752,19 @@ void UpdateEquityState(const double eq, const datetime nowSrv)
       return;   // an equity reading of 0 (terminal not ready) must never set a halt, a stop or a baseline
    if(eq > g_peak)
       g_peak = eq;
-   datetime mkt = ServerToMarket(nowSrv);
-   datetime mday = DayStart(mkt);
+   datetime mday = DayStart(ServerToMarket(nowSrv));
+   MqlDateTime ms;
+   TimeToStruct(mday, ms);
+   if(ms.day_of_week == 0 || ms.day_of_week == 6)
+     {
+      // market days are Monday to Friday (shared rule with the Python engine): a Saturday / Sunday market date
+      // (an unconfirmed broker clock change around a DST switch, weekend quotes) keeps the current market day and
+      // month - no daily summary, daily equity point or day-stop reference for a weekend day
+      if(g_day != 0)
+         mday = g_day;
+      else
+         mday -= (ms.day_of_week == 6 ? 1 : 2) * 86400;   // first run on a weekend: the Friday before
+     }
    if(mday != g_day)
      {
       if(g_day != 0 && g_lastEq > 0.0)
@@ -748,7 +799,7 @@ void UpdateEquityState(const double eq, const datetime nowSrv)
       g_stateDirty = true;
      }
    g_lastEq = eq;
-   datetime mmon = MonthStart(mkt);
+   datetime mmon = MonthStart(mday);
    if(mmon != g_month)
      {
       g_month = mmon;
@@ -980,37 +1031,87 @@ bool HasESPosition()
    return false;
   }
 
+// own position without a stop loss: pushed per ticket, at most every GT_REPEAT_SEC (Python key nosl-<ticket>)
+void NoSLNotice(const ulong tk, const string sym, const long magic)
+  {
+   datetime now = TimeLocal();
+   int n = ArraySize(g_noSLTk);
+   int idx = -1;
+   for(int i = 0; i < n; i++)
+      if(g_noSLTk[i] == tk)
+         idx = i;
+   if(idx >= 0 && Secs(now, g_noSLNote[idx]) < GT_REPEAT_SEC && Secs(now, g_noSLNote[idx]) >= 0)
+     {
+      if(InpVerbose)
+         Log(StringFormat("%s ticket=%s has no stop loss: open risk treated as unlimited", sym, IntegerToString((long)tk)));
+      return;
+     }
+   if(idx < 0)
+     {
+      idx = n;
+      ArrayResize(g_noSLTk, n + 1);
+      ArrayResize(g_noSLNote, n + 1);
+      g_noSLTk[idx] = tk;
+     }
+   g_noSLNote[idx] = now;
+   Log(StringFormat("%s %s ticket=%s has NO stop loss: open risk counts as unlimited, the total-risk cap blocks new "
+                    "entries until it has a stop or is closed", (magic == InpNRMagic) ? "NR" : "ES", sym,
+                    IntegerToString((long)tk)), true);
+  }
+
+// remaining risk (entry to stop, account currency) of the own positions; fail closed: a position without a stop
+// loss or whose risk cannot be priced counts as unlimited and fills the total-risk cap
 double OpenRiskTotal()
   {
    double total = 0.0;
+   bool unlimited = false;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong tk = PositionGetTicket(i);
       if(tk == 0)
          continue;
-      if(!IsOurMagic(PositionGetInteger(POSITION_MAGIC)))
+      long magic = PositionGetInteger(POSITION_MAGIC);
+      if(!IsOurMagic(magic))
          continue;
+      string sym = PositionGetString(POSITION_SYMBOL);
       int dir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
       double op = PositionGetDouble(POSITION_PRICE_OPEN);
       double sl = PositionGetDouble(POSITION_SL);
+      double vol = PositionGetDouble(POSITION_VOLUME);
       if(sl <= 0.0)
         {
-         // fail closed: an own position without a stop loss has unlimited risk and fills the total-risk cap
-         Log("open position without stop loss on " + PositionGetString(POSITION_SYMBOL) + ": open risk treated as unlimited");
-         return 1e300;
+         NoSLNotice(tk, sym, magic);
+         unlimited = true;
+         continue;
         }
       if((dir > 0 && sl >= op) || (dir < 0 && sl <= op))
          continue;   // stop at or beyond the entry price: no remaining risk
-      double l = LossPerLot(PositionGetString(POSITION_SYMBOL), dir, op, sl);
+      double l = LossPerLot(sym, dir, op, sl);
       if(l <= 0.0)
         {
-         // fail closed: a position whose risk cannot be priced fills the total-risk cap
-         Log("cannot price open risk of " + PositionGetString(POSITION_SYMBOL) + ": treated as unlimited");
-         return 1e300;
+         Log("cannot price open risk of " + sym + ": treated as unlimited");
+         unlimited = true;
+         continue;
         }
-      total += l * PositionGetDouble(POSITION_VOLUME);
+      total += l * vol;
      }
-   return total;
+   return unlimited ? 1e300 : total;
+  }
+
+// an own position without a stop loss while the total-risk cap is on (it blocks every new entry): status texts
+bool NoSLBlocks()
+  {
+   if(InpMaxTotalRisk <= 0.0)
+      return false;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0)
+         continue;
+      if(IsOurMagic(PositionGetInteger(POSITION_MAGIC)) && PositionGetDouble(POSITION_SL) <= 0.0)
+         return true;
+     }
+   return false;
   }
 
 // number of open positions that are long (sign=+1) or short (sign=-1) the currency ccy
@@ -1383,12 +1484,18 @@ void DropFail(const int i)
    ArrayRemove(g_failNote, i, 1);
   }
 
-// once per cycle: forget back-off entries of positions that no longer exist
+// once per cycle: forget back-off entries and no-SL notices of positions that no longer exist
 void PruneFails()
   {
    for(int i = ArraySize(g_failTk) - 1; i >= 0; i--)
       if(!PositionSelectByTicket(g_failTk[i]))
          DropFail(i);
+   for(int i = ArraySize(g_noSLTk) - 1; i >= 0; i--)
+      if(!PositionSelectByTicket(g_noSLTk[i]))
+        {
+         ArrayRemove(g_noSLTk, i, 1);
+         ArrayRemove(g_noSLNote, i, 1);
+        }
   }
 
 // returns true when the position is gone. A failed close is retried with a back-off per ticket (20 s, or 300 s
@@ -2387,23 +2494,27 @@ bool EntryGateOpen(string &why)
    return (why == "");
   }
 
+// AUTO: adopts an observed offset. When it equals the NY7 rule's offset at this moment, the NY7 rule itself is
+// adopted (the clock then follows US DST without a mismatch at each switch, as Python's detect_server_mode);
+// any other offset is kept as a fixed number of seconds
 void AdoptOffset(const long obs, const string how)
   {
    bool had = g_clkHave;
-   long old = g_clkOffset;
+   string old = ClockText();
    g_clkOffset = obs;
    g_clkHave = true;
+   g_clkNY7 = (obs == NY7Offset(TimeCurrent()));
    g_clkVerified = true;
    g_clkBlocked = false;
    g_clkMismatch = 0;
    g_clkCandN = 0;
    g_stateDirty = true;
    if(!had)
-      Log(StringFormat("broker clock measured: server = UTC%+.1f h (AUTO, %s); new entries enabled", obs / 3600.0, how),
-          true);
+      Log(StringFormat("broker clock measured: server = UTC%+.1f h now, clock in use: %s (AUTO, %s); new entries "
+                       "enabled", obs / 3600.0, ClockText(), how), true);
    else
-      Log(StringFormat("broker clock offset changed: UTC%+.1f h -> UTC%+.1f h (AUTO, %s)", old / 3600.0, obs / 3600.0,
-                       how), true);
+      Log(StringFormat("broker clock changed: %s -> %s (server = UTC%+.1f h now; AUTO, %s)", old, ClockText(),
+                       obs / 3600.0, how), true);
   }
 
 void ClockMatch(const long obs)
@@ -2415,10 +2526,12 @@ void ClockMatch(const long obs)
    g_clkMismatch = 0;
    g_clkCandN = 0;
    if(wasBlocked)
-      Log(StringFormat("broker clock matches again (UTC%+.1f h): new entries re-enabled", obs / 3600.0), true);
+      Log(StringFormat("broker clock matches again (UTC%+.1f h, %s): new entries re-enabled", obs / 3600.0,
+                       ClockText()), true);
    else
       if(!wasVerified)
-         Log(StringFormat("broker clock verified: server = UTC%+.1f h (%s)", obs / 3600.0, EnumToString(g_clockMode)));
+         Log(StringFormat("broker clock verified: server = UTC%+.1f h (%s, %s)", obs / 3600.0, EnumToString(g_clockMode),
+                          ClockText()));
   }
 
 // a fresh tick off the half-hour grid is no observation of the broker clock: the PC clock is off. Reported after
@@ -2445,8 +2558,9 @@ void ClockOffGrid(const long diff)
 // one counted observation per minute (the first one at once), only from a fresh tick. Gating of new entries
 // (shared rule with the Python engine, spec section 3):
 //  - AUTO: new entries wait until a valid observation after start-up confirms the clock in use (the adopted /
-//    persisted offset, or the NY7 rule when there is none). A different offset is adopted after GT_CLOCK_CONFIRM
-//    identical observations - the first offset too, unless it matches the NY7 rule.
+//    persisted clock, or the NY7 rule when there is none). A different offset is adopted after GT_CLOCK_CONFIRM
+//    identical observations - the first offset too, unless it matches the NY7 rule. An adopted offset that equals
+//    the NY7 rule's offset at that moment is kept as the NY7 rule (follows US DST), any other as fixed seconds.
 //  - NY7 / Fixed: new entries are allowed from the start.
 //  - every mode: GT_CLOCK_CONFIRM consecutive mismatches that are not adopted block new entries until the clock
 //    matches again.
@@ -2491,8 +2605,8 @@ void CheckClock()
          g_clkCand = obs;
          g_clkCandN = 1;
         }
-      Log(StringFormat("broker clock observation UTC%+.1f h differs from UTC%+.1f h in use (%d/%d identical)",
-                       obs / 3600.0, expected / 3600.0, g_clkCandN, GT_CLOCK_CONFIRM));
+      Log(StringFormat("broker clock observation UTC%+.1f h differs from UTC%+.1f h in use (%s; %d/%d identical)",
+                       obs / 3600.0, expected / 3600.0, ClockText(), g_clkCandN, GT_CLOCK_CONFIRM));
       if(g_clkCandN >= GT_CLOCK_CONFIRM)
         {
          AdoptOffset(obs, IntegerToString(GT_CLOCK_CONFIRM) + " identical observations");
@@ -2605,6 +2719,8 @@ string StatusText()
    string gate;
    if(!EntryGateOpen(gate))
       s += ", entries blocked: " + gate;
+   if(NoSLBlocks())
+      s += ", entries blocked: own position without stop loss";
    if(g_permit == 0)
       s += ", trading blocked";
    if(s == "")
@@ -2695,34 +2811,54 @@ void DailySummary(const double eq)
                     opened, closed, pl, StatusText()), true);
   }
 
-// FX market hours in market time (NY+7): Monday 00:00 to Friday 24:00, without Dec 25 and Jan 1
-bool MarketOpenNow()
+// FX market days in market time (NY+7): Monday to Friday, without Dec 25 and Jan 1
+bool IsMarketDay(const datetime mkt)
   {
-   datetime mkt = UTCToMarket(TimeGMT());
    MqlDateTime s;
    TimeToStruct(mkt, s);
    if(s.day_of_week == 0 || s.day_of_week == 6)
       return false;
-   if((s.mon == 12 && s.day == 25) || (s.mon == 1 && s.day == 1))
-      return false;
-   if(s.day_of_week == 1 && s.hour == 0 && s.min < 30)
-      return false;   // weekly open: some brokers start quoting late
-   return true;
+   return !((s.mon == 12 && s.day == 25) || (s.mon == 1 && s.day == 1));
   }
 
+bool MarketOpenNow()
+  {
+   return IsMarketDay(UTCToMarket(TimeGMT()));
+  }
+
+// local time of 00:00 market time of the current market day when the market was closed the day before (Monday
+// after the weekend, the day after Dec 25 / Jan 1), else 0 (Python _session_open_utc)
+datetime SessionOpenLocal()
+  {
+   datetime mkt = UTCToMarket(TimeGMT());
+   if(IsMarketDay(mkt - 86400))
+      return 0;
+   return (datetime)((long)TimeLocal() - ((long)mkt - (long)DayStart(mkt)));
+  }
+
+// stale-feed watchdog (shared rule with the Python engine): no new quote for GT_STALE_FEED_SEC on a market day,
+// counted from the last advance of the server time (or the start) - but on the first market day after a closed day
+// never from before that day's 00:00 market time, plus GT_SESSION_GRACE_SEC for a late first quote
 void CheckStaleFeed()
   {
    if(g_tester || TerminalInfoInteger(TERMINAL_CONNECTED) == 0)
       return;
    datetime now = TimeLocal();
-   datetime ref = (g_srvAdvAt > g_startLocal) ? g_srvAdvAt : g_startLocal;
+   datetime since = (g_srvAdvAt > g_startLocal) ? g_srvAdvAt : g_startLocal;
+   datetime ref = since;
+   datetime opened = SessionOpenLocal();
+   if(opened != 0 && since < opened)
+     {
+      since = opened;
+      ref = (datetime)((long)opened + GT_SESSION_GRACE_SEC);
+     }
    bool stale = (Secs(now, ref) > GT_STALE_FEED_SEC && MarketOpenNow());
    if(stale)
      {
       if(!g_staleNotified || Secs(now, g_staleNote) >= GT_REPEAT_SEC)
         {
          Log(StringFormat("STALE FEED: no new quote for %d min while the market should be open (last server time %s)",
-                          (int)(Secs(now, ref) / 60), TimeToString(g_lastSrvSeen, TIME_DATE | TIME_MINUTES)), true);
+                          (int)(Secs(now, since) / 60), TimeToString(g_lastSrvSeen, TIME_DATE | TIME_MINUTES)), true);
          g_staleNotified = true;
          g_staleNote = now;
         }
@@ -2920,8 +3056,8 @@ bool EnsureState()
      {
       string clk = "none";
       if(g_clkHave)
-         clk = "UTC" + DoubleToString(g_clkOffset / 3600.0, 1) + " h";
-      Log(StringFormat("state loaded (%s*): peak %.2f, DD %.1f%%, halted=%s, month stop=%s, persisted clock offset=%s",
+         clk = g_clkNY7 ? "NY7 rule" : "UTC" + DoubleToString(g_clkOffset / 3600.0, 1) + " h";
+      Log(StringFormat("state loaded (%s*): peak %.2f, DD %.1f%%, halted=%s, month stop=%s, persisted broker clock=%s",
                        g_gvPrefix, g_peak, Drawdown(eq) * 100.0, g_halted ? "yes" : "no", g_monthHalted ? "yes" : "no",
                        clk));
      }
