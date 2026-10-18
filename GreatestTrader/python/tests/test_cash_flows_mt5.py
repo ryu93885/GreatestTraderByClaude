@@ -276,13 +276,14 @@ def test_failing_deal_history_never_stops_time_stops(monkeypatch, tmp_path, cloc
     real = fake_mt5.history_deals_get
     monkeypatch.setattr(fake_mt5, "history_deals_get", lambda *a, **k: None)
     monkeypatch.setattr(fake_mt5, "last_error", lambda: (-10005, "IPC timeout"))
-    book(-1)  # forces a history read
+    book(-1)  # an account fee: with the history unreadable the change is pending (D7), no stop decision on it
     advance(clock)
     eng.step()
     assert S.positions == [] and eng.entry_block().startswith("deal history cannot be read")
-    assert sent(eng, "cash-flow check failed")
+    assert sent(eng, "cash-flow check failed") and eng._flow_pending
     monkeypatch.setattr(fake_mt5, "history_deals_get", real)
     monkeypatch.setattr(fake_mt5, "last_error", lambda: (1, "Success"))
+    deal(-1.0, "account fee", type_=4)  # DEAL_TYPE_CHARGE: profit/loss, not a cash flow
     advance(clock)
     eng.step()
-    assert eng.entry_block() == ""
+    assert eng.entry_block() == "" and eng.state.cash_flow_total == 0  # the fee and the close deal explain it

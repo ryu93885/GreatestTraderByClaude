@@ -193,23 +193,25 @@ def test_cash_flows_and_closed_trade_from_history(b, clock):
     assert [(f.ticket, f.amount, f.type) for f in flows] == [(1, 10_000.0, 2)]
     S.deals.append(dict(ticket=2, time=S.now, time_msc=0, type=2, entry=0, magic=0, position_id=0, symbol="",
                         volume=0, price=0, profit=-500.0, commission=0, swap=0, fee=0, reason=0, comment="withdrawal"))
-    n = S.calls["history_deals_get"]
-    assert len(b.cash_flows()) == 1 and S.calls["history_deals_get"] == n  # balance unchanged: no re-scan
-    S.balance -= 500
-    assert len(b.cash_flows()) == 2  # balance changed: history re-read
-    S.balance -= 100  # a withdrawal whose deal reaches the history one call later
-    assert len(b.cash_flows()) == 2
-    S.deals.append(dict(ticket=3, time=S.now, time_msc=0, type=2, entry=0, magic=0, position_id=0, symbol="",
-                        volume=0, price=0, profit=-100.0, commission=0, swap=0, fee=0, reason=0, comment=""))
-    clock.t += 5
-    assert len(b.cash_flows()) == 3  # re-read on every call during the minute after the change
-    clock.t += 61
-    n = S.calls["history_deals_get"]
-    b.cash_flows()
-    assert S.calls["history_deals_get"] == n  # then cached again (until the next change / 10 minutes)
-    clock.t += 600
-    b.cash_flows()
-    assert S.calls["history_deals_get"] == n + 1
+    S.deals.append(dict(ticket=3, time=S.now + 5, time_msc=0, type=1, entry=1, magic=7101, position_id=9,
+                        symbol="EURJPY", volume=1, price=130.0, profit=40.0, commission=-3.0, swap=-1.0, fee=0,
+                        reason=5, comment=""))
+    S.balance += -500 + 36
+    scan = b.cash_scan(after=1, since=mt5_broker._ts(S.now - 86400))  # every deal type newer than the reference
+    assert [(d.ticket, d.effect, d.cash) for d in scan.deals] == [(2, -500.0, True), (3, 36.0, False)]
+    assert [f.ticket for f in scan.flows] == [2] and scan.newest_deal == 3
+    assert scan.money == scan.scan_money == S.balance and scan.equity == S.equity
+    assert b.cash_scan(after=3, since=mt5_broker._ts(S.now)).deals == []  # nothing newer: no deals, no error
+    S.filter_deal_times = True  # like MT5: only the window is returned (from the reference deal - 1 day)
+    S.deals.append(dict(ticket=4, time=S.now - 40 * 86400, time_msc=0, type=2, entry=0, magic=0, position_id=0,
+                        symbol="", volume=0, price=0, profit=-1.0, commission=0, swap=0, fee=0, reason=0, comment=""))
+    b.tick("EURJPY")  # the server time: the window's 'now'
+    assert [d.ticket for d in b.cash_scan(after=1, since=mt5_broker._ts(S.now - 39 * 86400)).deals] == [4, 2, 3]
+    assert [d.ticket for d in b.cash_scan(after=1, since=mt5_broker._ts(S.now)).deals] == [2, 3]  # last 2 days
+    assert [f.ticket for f in b.cash_flows()] == [2]  # 30 days
+    S.filter_deal_times = False
+    hc = b.history_check()
+    assert hc.newest_deal == 4 and hc.money == S.balance and hc.newest_time == mt5_broker._ts(S.now - 40 * 86400)
     r = b.open_position("EURJPY", 1, 0.1, 129.5, 130.5, 7101, "GT_NR")
     assert b.closed_trade(r.ticket) is None  # still open
     S.ticks["EURJPY"].update(bid=130.10, ask=130.11)
