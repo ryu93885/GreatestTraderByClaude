@@ -114,7 +114,10 @@ input bool   InpResetHalt   = false; // Clear the max-DD halt once at start (pea
 #define GT_CLOCK_ADV_SEC    30      // clock observations only while the server time advanced within this many seconds
 #define GT_CLOCK_OBS_SEC    60      // spacing of counted clock observations
 #define GT_CLOCK_CONFIRM    3       // identical observations to adopt / mismatches to block / off-grid PC clock to alert
-#define GT_FLOW_PENDING_SEC 60      // a balance change without a new deal in the history waits at most this long
+#define GT_FLOW_PENDING_SEC 60      // a balance / credit change the new deals do not explain waits at most this long
+#define GT_FLOW_START_SEC   300     // ... at the first reconciliation after a start / re-init (history may still sync)
+#define GT_ABSORB_MAX       5       // changes counted as profit / loss at the limit, kept to recognise a late cash deal
+#define GT_ABSORB_KEEP_SEC  604800  // ... for 7 days
 #define GT_PRIME_STABLE_SEC 60      // first run: the cash-flow deals of the history unchanged this long = complete
 #define GT_PRIME_MAX_SEC    600     // first run: start the cash-flow tracking after this long anyway (warning)
 #define GT_LOCK_STALE_SEC   60      // instance lock: heartbeat older than this = holder gone
@@ -165,12 +168,19 @@ double   g_gvVal[];
 bool     g_resetHaltDone = false; // InpResetHalt already applied (persisted; re-armed when InpResetHalt=false)
 bool     g_resetDue = false;     // InpResetHalt is evaluated after the first cash-flow scan of the session
 
-//--- cash flows (deposits / withdrawals / credit / bonus)
-ulong    g_flowTicket = 0;       // newest cash-flow deal ticket already applied (persisted "flowtk")
-datetime g_flowScan = 0;         // server time of the last history scan (persisted "flowtm")
-ulong    g_allTicket = 0;        // newest deal ticket of any type seen (in memory)
-double   g_lastBalCred = 0.0;    // balance + credit at the last explained change (0 = scan at the next cycle)
-datetime g_pendingSince = 0;     // balance changed but no new deal in the history yet
+//--- cash flows (deposits / withdrawals / credit / bonus): amount-based reconciliation (shared rule with Python)
+ulong    g_flowTicket = 0;       // newest cash-flow deal ticket applied or marked as seen (persisted "flowtk")
+datetime g_flowScan = 0;         // server time of the last successful history read (persisted "flowtm")
+bool     g_refKnown = false;     // a reconciliation reference exists (persisted "flowmref" / "flowdref" / "flowdtm")
+double   g_moneyRef = 0.0;       // balance + credit at the last reconciliation
+ulong    g_dealRef = 0;          // newest deal (any type) included in the last reconciliation
+datetime g_dealRefTime = 0;      // ... its time (start of the history window)
+double   g_absAmt[];             // changes counted as profit / loss at the pending limit (persisted "absa<i>")
+datetime g_absTime[];            // ... server time when they were counted (persisted "abst<i>"), oldest first
+datetime g_pendingSince = 0;     // local time when the current unexplained change was first seen
+int      g_pendingWin = 0;       // ... its limit: GT_FLOW_PENDING_SEC, or GT_FLOW_START_SEC after a start
+bool     g_firstRecon = true;    // the first reconciliation after a start / re-init has not happened yet
+bool     g_histBad = false;      // this cycle: the deal history cannot be read (no new entry)
 bool     g_flowPending = false;  // this cycle: balance change not explained yet (no guard decision, no entry)
 bool     g_flowPrimed = true;    // false on a first run until the existing deals are marked as seen
 datetime g_primeStart = 0;       // first run: local time of the first priming attempt
@@ -455,6 +465,20 @@ void SaveState(const bool force = false)
       // only a primed cursor is persisted: a restart before the first-run priming primes again
       GVPut("flowtk", (double)g_flowTicket);   // deal tickets are far below 2^53: exact in a double
       GVPut("flowtm", (double)g_flowScan);
+      if(g_refKnown)
+        {
+         // the reconciliation reference: a restart reconciles against it like a running cycle
+         GVPut("flowmref", g_moneyRef);
+         GVPut("flowdref", (double)g_dealRef);
+         GVPut("flowdtm", (double)g_dealRefTime);
+        }
+      int na = ArraySize(g_absAmt);
+      GVPut("absn", (double)na);
+      for(int i = 0; i < na; i++)
+        {
+         GVPut("absa" + IntegerToString(i), g_absAmt[i]);
+         GVPut("abst" + IntegerToString(i), (double)g_absTime[i]);
+        }
      }
    if(g_clkHave)
       GVPut("clkoff", (double)g_clkOffset);
@@ -488,9 +512,16 @@ void ResetStateVars()
    g_adaptMult = 1.0;
    g_flowTicket = 0;
    g_flowScan = 0;
-   g_allTicket = 0;
-   g_lastBalCred = 0.0;
+   g_refKnown = false;
+   g_moneyRef = 0.0;
+   g_dealRef = 0;
+   g_dealRefTime = 0;
+   ArrayResize(g_absAmt, 0);
+   ArrayResize(g_absTime, 0);
    g_pendingSince = 0;
+   g_pendingWin = 0;
+   g_firstRecon = true;
+   g_histBad = false;
    g_flowPending = false;
    g_flowPrimed = true;
    g_primeStart = 0;
@@ -549,6 +580,33 @@ void LoadState()
       g_flowTicket = (ulong)GlobalVariableGet(g_gvPrefix + "flowtk");
    if(GlobalVariableCheck(g_gvPrefix + "flowtm"))
       g_flowScan = (datetime)GlobalVariableGet(g_gvPrefix + "flowtm");
+   // reconciliation reference (missing in a state of an earlier 1.2 build: taken from the first read, no priming)
+   if(GlobalVariableCheck(g_gvPrefix + "flowmref") && GlobalVariableCheck(g_gvPrefix + "flowdref"))
+     {
+      g_moneyRef = GlobalVariableGet(g_gvPrefix + "flowmref");
+      g_dealRef = (ulong)GlobalVariableGet(g_gvPrefix + "flowdref");
+      if(GlobalVariableCheck(g_gvPrefix + "flowdtm"))
+         g_dealRefTime = (datetime)GlobalVariableGet(g_gvPrefix + "flowdtm");
+      g_refKnown = true;
+     }
+   if(GlobalVariableCheck(g_gvPrefix + "absn"))
+     {
+      int na = (int)GlobalVariableGet(g_gvPrefix + "absn");
+      if(na > GT_ABSORB_MAX)
+         na = GT_ABSORB_MAX;
+      for(int i = 0; i < na; i++)
+        {
+         string an = g_gvPrefix + "absa" + IntegerToString(i);
+         string tn = g_gvPrefix + "abst" + IntegerToString(i);
+         if(!GlobalVariableCheck(an) || !GlobalVariableCheck(tn))
+            break;
+         int k = ArraySize(g_absAmt);
+         ArrayResize(g_absAmt, k + 1);
+         ArrayResize(g_absTime, k + 1);
+         g_absAmt[k] = GlobalVariableGet(an);
+         g_absTime[k] = (datetime)GlobalVariableGet(tn);
+        }
+     }
    if(GlobalVariableCheck(g_gvPrefix + "clkoff"))
      {
       long off = (long)MathRound(GlobalVariableGet(g_gvPrefix + "clkoff"));
@@ -1773,9 +1831,11 @@ bool IsCashFlow(const long dealType)
 
 // first run (no persisted cursor): every deal already in the history counts as seen and is NOT applied - but
 // only once the history looks complete: the deals sum to the balance (credit deals to the credit) within
-// max(1, 0.1%), or the set of cash-flow deals stayed the same for GT_PRIME_STABLE_SEC. After GT_PRIME_MAX_SEC
-// the cursor is primed anyway (warning). Until then new entries wait; closes, stops and the guards keep working.
-// Returns true when the cursor is primed. Live only (shared contract with the Python engine).
+// max(1, 0.1%), or the set of cash-flow deals stayed the same for GT_PRIME_STABLE_SEC (an empty set while balance
+// or credit is not zero never counts). After GT_PRIME_MAX_SEC the cursor is primed anyway. Priming without matching
+// sums is notified (warning). Until then new entries wait; closes, stops and the guards keep working. The read
+// becomes the reconciliation reference (balance + credit, newest deal). Returns true when the cursor is primed.
+// Live only (shared contract with the Python engine).
 bool TryPrimeFlowCursor()
   {
    if(g_flowPrimed)
@@ -1787,6 +1847,7 @@ bool TryPrimeFlowCursor()
       return false;
    g_primeTry = now;
    bool late = (Secs(now, g_primeStart) >= GT_PRIME_MAX_SEC);
+   double bc0 = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT);
    if(!HistorySelect(0, GT_FAR_FUTURE))
      {
       if(late && (g_primeNote == 0 || Secs(now, g_primeNote) >= GT_REPEAT_SEC || Secs(now, g_primeNote) < 0))
@@ -1798,6 +1859,7 @@ bool TryPrimeFlowCursor()
      }
    int n = HistoryDealsTotal();
    ulong mx = 0;
+   datetime mxTime = 0;
    double sumBal = 0.0;
    double sumCred = 0.0;
    int nCash = 0;
@@ -1809,7 +1871,10 @@ bool TryPrimeFlowCursor()
       if(tk == 0)
          continue;
       if(tk > mx)
+        {
          mx = tk;
+         mxTime = (datetime)HistoryDealGetInteger(tk, DEAL_TIME);
+        }
       long type = HistoryDealGetInteger(tk, DEAL_TYPE);
       double amt = HistoryDealGetDouble(tk, DEAL_PROFIT) + HistoryDealGetDouble(tk, DEAL_COMMISSION) +
                    HistoryDealGetDouble(tk, DEAL_SWAP) + HistoryDealGetDouble(tk, DEAL_FEE);
@@ -1826,6 +1891,8 @@ bool TryPrimeFlowCursor()
      }
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
    double cred = AccountInfoDouble(ACCOUNT_CREDIT);
+   if(MathAbs(bal + cred - bc0) >= 0.005)
+      return false;   // a deal was booked during the read: tried again (the read and the balance must agree)
    bool sums = (MathAbs(sumBal - bal) <= MathMax(1.0, 0.001 * MathAbs(bal)) &&
                 MathAbs(sumCred - cred) <= MathMax(1.0, 0.001 * MathAbs(cred)));
    bool same = (g_primeRefAt != 0 && nCash == g_primeRefN && cashSum == g_primeRefSum && cashXor == g_primeRefXor);
@@ -1837,14 +1904,19 @@ bool TryPrimeFlowCursor()
       g_primeRefSum = cashSum;
       g_primeRefXor = cashXor;
      }
-   bool stable = (same && Secs(now, g_primeRefAt) >= GT_PRIME_STABLE_SEC);
+   // an EMPTY set of cash deals while balance or credit is non-zero is never a complete history (no 'stable')
+   bool emptyCash = (nCash == 0 && (MathAbs(bal) >= 0.005 || MathAbs(cred) >= 0.005));
+   bool stable = (same && !emptyCash && Secs(now, g_primeRefAt) >= GT_PRIME_STABLE_SEC);
    if(!sums && !stable && !late)
       return false;
    g_flowTicket = mx;
-   g_allTicket = mx;
    g_flowScan = TimeCurrent();
    g_flowPrimed = true;
-   g_lastBalCred = 0.0;   // the first scan (same cycle) takes balance + credit as the reference
+   // the reconciliation reference: this read (balance + credit read after it, newest deal of any type)
+   g_moneyRef = bal + cred;
+   g_dealRef = mx;
+   g_dealRefTime = (mx > 0 && mxTime > 0) ? mxTime : TimeCurrent();
+   g_refKnown = true;
    g_pendingSince = 0;
    g_stateDirty = true;
    string how = "NOT confirmed";
@@ -1855,70 +1927,220 @@ bool TryPrimeFlowCursor()
          how = StringFormat("cash-flow deals unchanged for %d s", GT_PRIME_STABLE_SEC);
    Log(StringFormat("cash-flow tracking started: %d existing deals marked as seen (cursor #%s, %s)", n,
                     IntegerToString((long)mx), how));
-   if(!sums && !stable)
-      Log(StringFormat("WARNING: the deal history was not confirmed complete within %d min (deals sum to %.2f, "
-                       "balance %.2f; credit deals %.2f, credit %.2f). Existing deals are marked as seen anyway: a "
-                       "deposit or withdrawal that reaches the history later is treated as a new cash flow.",
-                       GT_PRIME_MAX_SEC / 60, sumBal, bal, sumCred, cred), true);
+   if(!sums)
+      Log(StringFormat("WARNING: the deal history was not confirmed complete (%s; deals sum to %.2f, balance %.2f; "
+                       "credit deals %.2f, credit %.2f). Existing deals are marked as seen anyway: a deposit or "
+                       "withdrawal that reaches the history later is checked against the balance like any new deal.",
+                       stable ? StringFormat("cash-flow deals unchanged for %d s", GT_PRIME_STABLE_SEC) :
+                       StringFormat("not within %d min", GT_PRIME_MAX_SEC / 60), sumBal, bal, sumCred, cred), true);
    return true;
   }
 
-// sums new cash-flow deals (ticket > cursor). Returns true when the history holds any deal newer than the
-// newest one seen before (the balance change is explained).
-bool ScanDeals(double &flow, int &count)
+// effect of a deal on balance + credit (a CREDIT deal moves the credit)
+double DealEffect(const ulong tk)
   {
-   flow = 0.0;
-   count = 0;
-   datetime base = (g_flowScan > 0) ? g_flowScan : TimeCurrent();
-   long fromL = (long)base - 2 * 86400;          // overlap; de-duplicated by ticket
+   return HistoryDealGetDouble(tk, DEAL_PROFIT) + HistoryDealGetDouble(tk, DEAL_COMMISSION) +
+          HistoryDealGetDouble(tk, DEAL_SWAP) + HistoryDealGetDouble(tk, DEAL_FEE);
+  }
+
+// the deals (any type) newer than the reconciliation reference deal, oldest first (time, then ticket). The window
+// starts 1 day before the reference deal's time (at least the last 2 days); without a reference (state of an
+// earlier 1.2 build) 2 days before the last read. Returns false when the deal history cannot be read.
+bool ReadNewDeals(ulong &tk[], long &type[], double &eff[], datetime &tm[])
+  {
+   ArrayResize(tk, 0);
+   ArrayResize(type, 0);
+   ArrayResize(eff, 0);
+   ArrayResize(tm, 0);
+   long fromL = (long)TimeCurrent() - 2 * 86400;
+   if(g_refKnown)
+     {
+      if((long)g_dealRefTime - 86400 < fromL)
+         fromL = (long)g_dealRefTime - 86400;
+     }
+   else
+      if(g_flowScan > 0 && (long)g_flowScan - 2 * 86400 < fromL)
+         fromL = (long)g_flowScan - 2 * 86400;
    if(fromL < 0)
       fromL = 0;
    if(!HistorySelect((datetime)fromL, GT_FAR_FUTURE))
       return false;
-   bool fresh = false;
-   ulong maxFlow = g_flowTicket;
    int n = HistoryDealsTotal();
+   int m = 0;
    for(int i = 0; i < n; i++)
      {
-      ulong tk = HistoryDealGetTicket(i);
-      if(tk == 0)
+      ulong t = HistoryDealGetTicket(i);
+      if(t == 0 || (g_refKnown && t <= g_dealRef))
          continue;
-      if(tk > g_allTicket)
+      datetime dt = (datetime)HistoryDealGetInteger(t, DEAL_TIME);
+      ArrayResize(tk, m + 1);
+      ArrayResize(type, m + 1);
+      ArrayResize(eff, m + 1);
+      ArrayResize(tm, m + 1);
+      int j = m;
+      while(j > 0 && (tm[j - 1] > dt || (tm[j - 1] == dt && tk[j - 1] > t)))
         {
-         g_allTicket = tk;
-         fresh = true;
+         tk[j] = tk[j - 1];
+         type[j] = type[j - 1];
+         eff[j] = eff[j - 1];
+         tm[j] = tm[j - 1];
+         j--;
         }
-      if(tk <= g_flowTicket)
-         continue;
-      if(!IsCashFlow(HistoryDealGetInteger(tk, DEAL_TYPE)))
-         continue;
-      flow += HistoryDealGetDouble(tk, DEAL_PROFIT);
-      count++;
-      if(tk > maxFlow)
-         maxFlow = tk;
+      tk[j] = t;
+      type[j] = HistoryDealGetInteger(t, DEAL_TYPE);
+      eff[j] = DealEffect(t);
+      tm[j] = dt;
+      m++;
      }
-   g_flowTicket = maxFlow;
-   g_flowScan = TimeCurrent();
-   return fresh;
+   return true;
   }
 
-// keeps the newest deal ticket of any type current while the balance does not change, so that "a new deal" in
-// HandleCashFlows means one booked since the previous cycle (an entry deal booked an hour ago, which does not
-// change the balance, must not explain a later deposit or withdrawal)
-void TrackNewestDeal()
+// absorbed records (changes counted as profit / loss at the pending limit) are kept GT_ABSORB_KEEP_SEC
+void PruneAbsorbed()
   {
-   long fromL = (long)TimeCurrent() - 2 * 86400;
-   if(fromL < 0)
-      fromL = 0;
-   if(!HistorySelect((datetime)fromL, GT_FAR_FUTURE))
-      return;
-   int n = HistoryDealsTotal();
-   for(int i = 0; i < n; i++)
+   long nowL = (long)TimeCurrent();
+   for(int i = ArraySize(g_absAmt) - 1; i >= 0; i--)
+      if(nowL - (long)g_absTime[i] > GT_ABSORB_KEEP_SEC)
+        {
+         ArrayRemove(g_absAmt, i, 1);
+         ArrayRemove(g_absTime, i, 1);
+         g_stateDirty = true;
+        }
+  }
+
+void AddAbsorbed(const double amt)
+  {
+   PruneAbsorbed();
+   if(ArraySize(g_absAmt) >= GT_ABSORB_MAX)
      {
-      ulong tk = HistoryDealGetTicket(i);
-      if(tk > g_allTicket)
-         g_allTicket = tk;
+      ArrayRemove(g_absAmt, 0, 1);
+      ArrayRemove(g_absTime, 0, 1);
      }
+   int n = ArraySize(g_absAmt);
+   ArrayResize(g_absAmt, n + 1);
+   ArrayResize(g_absTime, n + 1);
+   g_absAmt[n] = amt;
+   g_absTime[n] = TimeCurrent();
+   g_stateDirty = true;
+  }
+
+// new cash deals that each match an absorbed record (within tol) and, left out of the sum, make the new deals
+// explain the change are LATE deals of a change already counted as profit / loss: late[] = 1 for them, the
+// matched records are removed (notified). Smallest such set first. Returns false when there is none.
+bool MatchLateDeals(const ulong &tk[], const long &type[], const double &eff[], const datetime &tm[],
+                    const double delta, const double sum, const double tol, int &late[])
+  {
+   int na = ArraySize(g_absAmt);
+   int cand[];
+   int nc = 0;
+   for(int i = 0; i < ArraySize(tk) && nc < 10; i++)
+      if(IsCashFlow(type[i]) && tk[i] > g_flowTicket)
+        {
+         ArrayResize(cand, nc + 1);
+         cand[nc] = i;
+         nc++;
+        }
+   if(na == 0 || nc == 0)
+      return false;
+   int maxSize = (nc < na) ? nc : na;
+   int pick[];
+   ArrayResize(pick, nc);
+   for(int size = 1; size <= maxSize; size++)
+      for(int mask = 1; mask < (1 << nc); mask++)
+        {
+         int bits = 0;
+         for(int b = 0; b < nc; b++)
+            if((mask & (1 << b)) != 0)
+               bits++;
+         if(bits != size)
+            continue;
+         bool ok = true;
+         double sx = 0.0;
+         for(int b = 0; b < nc; b++)
+           {
+            pick[b] = -1;
+            if((mask & (1 << b)) == 0 || !ok)
+               continue;
+            for(int r = 0; r < na && pick[b] < 0; r++)
+              {
+               bool taken = false;
+               for(int q = 0; q < b; q++)
+                  if(pick[q] == r)
+                     taken = true;
+               if(!taken && MathAbs(eff[cand[b]] - g_absAmt[r]) <= tol)
+                  pick[b] = r;
+              }
+            if(pick[b] < 0)
+               ok = false;
+            else
+               sx += eff[cand[b]];
+           }
+         if(!ok || MathAbs(delta - (sum - sx)) > tol)
+            continue;
+         int rm[];
+         ArrayResize(rm, na);
+         ArrayInitialize(rm, 0);
+         for(int b = 0; b < nc; b++)
+           {
+            if(pick[b] < 0)
+               continue;
+            late[cand[b]] = 1;
+            rm[pick[b]] = 1;
+            Log(StringFormat("late cash deal #%s %+.2f (booked %s): already counted as profit/loss on %s - not applied "
+                             "again", IntegerToString((long)tk[cand[b]]), eff[cand[b]],
+                             TimeToString(tm[cand[b]], TIME_DATE | TIME_MINUTES),
+                             TimeToString(g_absTime[pick[b]], TIME_DATE | TIME_MINUTES)), true);
+           }
+         for(int r = na - 1; r >= 0; r--)
+            if(rm[r] != 0)
+              {
+               ArrayRemove(g_absAmt, r, 1);
+               ArrayRemove(g_absTime, r, 1);
+              }
+         g_stateDirty = true;
+         return true;
+        }
+   return false;
+  }
+
+// applies the new cash deals newer than the cursor that are not late (one cash flow); the cursor moves past every
+// new cash deal
+void ApplyNewCash(const ulong &tk[], const long &type[], const double &eff[], const int &late[], const double eq)
+  {
+   double flow = 0.0;
+   int count = 0;
+   ulong mx = g_flowTicket;
+   for(int i = 0; i < ArraySize(tk); i++)
+     {
+      if(!IsCashFlow(type[i]) || tk[i] <= g_flowTicket)
+         continue;
+      if(tk[i] > mx)
+         mx = tk[i];
+      if(late[i] != 0)
+         continue;
+      flow += eff[i];
+      count++;
+     }
+   if(count > 0)
+      ApplyCashFlow(flow, count, eq);
+   if(mx != g_flowTicket)
+     {
+      g_flowTicket = mx;
+      g_stateDirty = true;
+     }
+  }
+
+// the reconciliation reference moves to balance + credit 'money' and the newest deal of this read
+void SetFlowReference(const double money, const ulong newest, const datetime newestTime)
+  {
+   g_moneyRef = money;
+   if(!g_refKnown || newest > g_dealRef)
+     {
+      if(newest > g_dealRef)
+         g_dealRef = newest;
+      g_dealRefTime = (newestTime > 0) ? newestTime : TimeCurrent();
+     }
+   g_refKnown = true;
   }
 
 // rescale every equity baseline by k = E / (E - F) so that the percentage guards (DD scaling, max-DD halt,
@@ -1959,65 +2181,118 @@ void ApplyCashFlow(const double flow, const int count, const double eq)
    Log(StringFormat("CASH FLOW %+.2f detected, guards rebased (%s)", flow, how), true);
   }
 
-// Returns false ("pending") while a balance / credit change is not yet explained by any new deal (trade or cash,
-// newer than the newest deal seen in the previous cycle) in the history: in that cycle the peak is not raised, no
-// halt / month / day stop is evaluated and nothing is
-// opened; closes, time stops and TP management continue. Pending lasts at most GT_FLOW_PENDING_SEC, then the
-// change counts as profit / loss. eq is read again AFTER the deal scan, so that k and this cycle's guards use an
-// equity that contains every flow the scan found. Live only (shared contract with the Python engine).
+// Amount-based reconciliation (shared rule with the Python engine). Every cycle (live only):
+//  1. the deals newer than the reference deal are read (any type); balance + credit M is read before and after
+//     the read: when it moved meanwhile the cycle is pending and decided on the next one
+//  2. reconciled when M - reference money equals the sum of their effects (profit + commission + swap + fee)
+//     within max(0.02, 1e-6 x M): the new cash deals (balance / credit / bonus) are applied as cash flows (k =
+//     E / (E - F), E read after the deal read), trade deals are profit / loss; the reference moves to M and the
+//     newest deal
+//  3. else new cash deals that match a change counted as profit / loss earlier (absorbed record) and, left out,
+//     make the sums agree are late deals of that change: marked as seen, not applied again (notified)
+//  4. else pending (returns false): no peak raise, no halt / month / day stop, no DD alert / day roll, no new
+//     entry; closes, time stops, TP management and stops in force continue. After GT_FLOW_PENDING_SEC (the first
+//     reconciliation after a start: GT_FLOW_START_SEC) the new cash deals are applied and the rest of the change
+//     counts as profit / loss (an absorbed record is kept 7 days, at most GT_ABSORB_MAX)
+// A deal history that cannot be read shows no deal: a changed M is pending with the same limit, an unchanged M
+// needs nothing (new entries wait while the history cannot be read). eq is read again after the deal read.
 bool HandleCashFlows(double &eq)
   {
+   g_histBad = false;
    if(g_tester)
       return true;
    double bc = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT);
-   if(g_lastBalCred != 0.0 && MathAbs(bc - g_lastBalCred) < 0.005)
-     {
-      g_pendingSince = 0;
-      ulong allTk = g_allTicket;
-      TrackNewestDeal();
-      if(MathAbs(AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT) - bc) >= 0.005)
-         g_allTicket = allTk;   // a deal was booked during the read: it explains the change on the next cycle
-      return true;
-     }
-   double flow = 0.0;
-   int count = 0;
-   ulong flowTk0 = g_flowTicket;
-   ulong allTk0 = g_allTicket;
-   datetime scan0 = g_flowScan;
-   bool fresh = ScanDeals(flow, count);
+   ulong tk[];
+   long type[];
+   double eff[];
+   datetime tm[];
+   bool readable = ReadNewDeals(tk, type, eff, tm);
    double eqNow = AccountInfoDouble(ACCOUNT_EQUITY);
-   double bcNow = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT);
-   if(MathAbs(bcNow - bc) >= 0.005)
-     {
-      // a deal was booked while the history was scanned (eq may contain a flow the scan missed): nothing is
-      // applied, the same scan is repeated on the next cycle
-      g_flowTicket = flowTk0;
-      g_allTicket = allTk0;
-      g_flowScan = scan0;
-      return false;
-     }
+   double money = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT);
+   if(MathAbs(money - bc) >= 0.005)
+      return false;   // a deal was booked during the read: nothing is decided, the read is repeated next cycle
    if(eqNow > 0.0)
       eq = eqNow;
-   if(count > 0)
-      ApplyCashFlow(flow, count, eq);
-   if(fresh || count > 0 || g_lastBalCred == 0.0)
+   if(readable)
+      g_flowScan = TimeCurrent();
+   else
      {
-      g_lastBalCred = bc;
+      g_histBad = true;
+      if(!g_refKnown)
+         return true;   // no reference yet: taken from the first readable read (new entries wait meanwhile)
+     }
+   int n = ArraySize(tk);
+   ulong newest = 0;
+   datetime newestTime = 0;
+   double sum = 0.0;
+   for(int i = 0; i < n; i++)
+     {
+      sum += eff[i];
+      if(tk[i] > newest)
+        {
+         newest = tk[i];
+         newestTime = tm[i];
+        }
+     }
+   int late[];
+   ArrayResize(late, n);
+   if(n > 0)
+      ArrayInitialize(late, 0);
+   if(!g_refKnown)
+     {
+      // state of an earlier 1.2 build (cursor, no reference): the cash deals newer than the cursor are applied
+      // as before and this read becomes the reference (no priming again)
+      ApplyNewCash(tk, type, eff, late, eq);
+      if(newest > g_flowTicket)
+         SetFlowReference(money, newest, newestTime);
+      else
+         SetFlowReference(money, g_flowTicket, 0);
       g_pendingSince = 0;
+      g_firstRecon = false;
+      g_stateDirty = true;
+      Log(StringFormat("cash-flow reference taken: balance + credit %.2f, deal #%s", money,
+                       IntegerToString((long)g_dealRef)));
       return true;
      }
+   PruneAbsorbed();
+   double delta = money - g_moneyRef;
+   double tol = MathMax(0.02, 1e-6 * MathAbs(money));
+   bool ok = (MathAbs(delta - sum) <= tol);
+   if(!ok && readable)
+      ok = MatchLateDeals(tk, type, eff, tm, delta, sum, tol, late);
    datetime now = TimeLocal();
-   if(g_pendingSince == 0)
-      g_pendingSince = now;
-   if(Secs(now, g_pendingSince) > GT_FLOW_PENDING_SEC || Secs(now, g_pendingSince) < 0)
+   if(ok)
      {
-      Log(StringFormat("balance changed by %+.2f without a matching deal in the history: treated as profit/loss",
-                       bc - g_lastBalCred), true);
-      g_lastBalCred = bc;
+      if(g_pendingSince != 0)
+         Log(StringFormat("balance/credit change %+.2f explained by the deal history after %d s", delta,
+                          (int)Secs(now, g_pendingSince)));
+      ApplyNewCash(tk, type, eff, late, eq);
+      SetFlowReference(money, newest, newestTime);
       g_pendingSince = 0;
+      if(readable)
+         g_firstRecon = false;
       return true;
      }
-   return false;
+   if(g_pendingSince == 0 || Secs(now, g_pendingSince) < 0)
+     {
+      g_pendingSince = now;
+      g_pendingWin = g_firstRecon ? GT_FLOW_START_SEC : GT_FLOW_PENDING_SEC;
+      Log(StringFormat("balance/credit changed by %+.2f, the new deals explain %+.2f%s: waiting up to %d s for the "
+                       "matching deal (no stop decision and no new entry meanwhile)", delta, sum,
+                       readable ? "" : " (the deal history cannot be read)", g_pendingWin));
+     }
+   if(Secs(now, g_pendingSince) <= g_pendingWin)
+      return false;
+   // limit reached: the new cash deals are applied, the rest of the change counts as profit / loss
+   ApplyNewCash(tk, type, eff, late, eq);
+   double unexplained = delta - sum;
+   Log(StringFormat("balance/credit changed by %+.2f without a matching deal in the history: treated as profit/loss",
+                    unexplained), true);
+   AddAbsorbed(unexplained);
+   SetFlowReference(money, newest, newestTime);
+   g_pendingSince = 0;
+   g_firstRecon = false;
+   return true;
   }
 
 //+------------------------------------------------------------------+
@@ -2093,8 +2368,11 @@ bool EntryGateOpen(string &why)
       if(!g_flowPrimed)
          why = "deal history not confirmed complete yet (first run)";
       else
-         if(g_flowPending)
-            why = "balance change not in the deal history yet (cash flow pending)";
+         if(g_histBad)
+            why = "the deal history cannot be read";
+         else
+            if(g_flowPending)
+               why = "balance change not in the deal history yet (cash flow pending)";
    return (why == "");
   }
 
@@ -2737,13 +3015,14 @@ void ProcessAll()
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    if(eq <= 0.0)
       return;
-   // cash flows are detected BEFORE the equity guards of this cycle (eq is read again after the deal scan).
-   // Pending (balance changed, no new deal in the history yet, at most GT_FLOW_PENDING_SEC): no peak raise, no
-   // halt / month / day stop decision and no new entry this cycle; closes, time stops and TP management run.
+   // cash flows are reconciled BEFORE the equity guards of this cycle (eq is read again after the deal read).
+   // Pending (the new deals do not explain the balance / credit change yet, at most GT_FLOW_PENDING_SEC, 300 s
+   // after a start): no peak raise, no halt / month / day stop decision and no new entry this cycle; closes, time
+   // stops and TP management run.
    if(!g_flowPrimed)
       TryPrimeFlowCursor();
    g_flowPending = (g_flowPrimed && !HandleCashFlows(eq));
-   if(g_resetDue && g_flowPrimed && !g_flowPending)
+   if(g_resetDue && g_flowPrimed && !g_flowPending && !g_histBad)
      {
       g_resetDue = false;
       ApplyResetHalt(eq);   // after the first cash-flow scan of the session
