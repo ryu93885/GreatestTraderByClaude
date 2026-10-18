@@ -19,7 +19,6 @@ keep working with the last known clock.
 """
 from __future__ import annotations
 
-import itertools
 import json
 import logging
 import math
@@ -610,13 +609,16 @@ class LiveEngine:
         than that deal (any type) with their effect (profit + commission + swap + fee), then M = balance + credit:
           * |(M - M_ref) - sum(effects)| <= max(0.02, 1e-6 |M|): reconciled. Every cash deal (balance / credit /
             bonus) not seen before is applied in time order; trade deals are just profit/loss. The reference moves.
-          * otherwise, new cash deals that each match a change absorbed earlier as profit/loss (see below) and
-            without which the rest reconciles are LATE deals of that change: marked seen, not applied again.
+          * otherwise, new deals (any type) booked at or before the newest change absorbed earlier as profit/loss
+            (see below; server-time watermark) are LATE deals: their effect was already in the balance + credit
+            taken as the reference then, so they are left out of the sum and their cash deals are marked seen,
+            not applied again; if the rest reconciles, the loop is reconciled.
           * otherwise _flow_pending: no peak raise, no halt / month / day stop decision, no DD alert / day roll and
             no entry this loop; closes, time stops, TP management and stops already in force continue. At most
             FLOW_PENDING_SECONDS (FLOW_FIRST_SECONDS in the first reconciliation after a start / terminal re-init,
-            while the history may still be syncing); then the unseen cash deals are applied, the remainder counts as
-            profit/loss (notified) and is kept as an absorbed record (ABSORBED_MAX, ABSORBED_DAYS).
+            while the history may still be syncing); then the unseen cash deals that are not late are applied, the
+            remainder counts as profit/loss (notified) and is kept as an absorbed record with the server time as
+            its watermark (ABSORBED_MAX, ABSORBED_DAYS).
           * balance + credit moved during the read (a deal booked meanwhile): pending, decided on the next loop.
         _cash_problem: the deal history cannot be read: new entries wait; a changed balance + credit is pending
         with the same timer (never a stop decision on an unexplained change). First run (no cash_init): _try_prime.
@@ -671,27 +673,29 @@ class LiveEngine:
         total = sum(d.effect for d in scan.deals)
         tol = max(0.02, 1e-6 * abs(money))
         late: list = []
-        if abs(delta - total) > tol:
-            late = self._match_absorbed(unseen, delta - total, tol)
-            if late is None:
-                window = self._flow_window()
-                if self._pending_since is None or now - self._pending_since <= window:
-                    return self._pending(now, equity, f"balance + credit {st.cash_money_ref:.2f} -> {money:.2f}, "
-                                                      f"the {len(scan.deals)} new deals explain {total:+.2f}")
-                rest = delta - total
-                self._alert(f"balance / credit changed by {rest:+,.2f} without a matching deal in the history for "
-                            f"{window:.0f} s: treated as profit/loss")
-                self._absorb(rest)
-                late = []
-        if late:
-            for f, rec in late:
-                when = datetime.fromtimestamp(rec[1], timezone.utc)
-                self._alert(f"late cash deal {f.amount:+,.2f} [deal {f.ticket}{' ' + f.comment if f.comment else ''}]: "
-                            f"already counted as profit/loss on {when:%Y-%m-%d %H:%M} UTC, not applied again")
-            st.cash_absorbed = [r for r in st.cash_absorbed if not any(r is rec for _, rec in late)]
-            self._mark_seen([f for f, _ in late])
-        done = {int(f.ticket) for f, _ in late}
-        self._apply_flows([f for f in unseen if int(f.ticket) not in done], equity)
+        if abs(delta - total) > tol:  # deals booked before the watermark (or in its second) may be late deals
+            late = self._late_deals(scan.deals, strict=True)
+            wide = self._late_deals(scan.deals, strict=False)
+            if abs(delta - (total - sum(d.effect for d in late))) > tol and \
+                    abs(delta - (total - sum(d.effect for d in wide))) <= tol:
+                late = wide
+        rest = delta - (total - sum(d.effect for d in late))
+        if abs(rest) > tol:
+            window = self._flow_window()
+            if self._pending_since is None or now - self._pending_since <= window:
+                return self._pending(now, equity, f"balance + credit {st.cash_money_ref:.2f} -> {money:.2f}, "
+                                                  f"the {len(scan.deals)} new deals explain {total:+.2f}")
+            self._alert(f"balance / credit changed by {rest:+,.2f} without a matching deal in the history for "
+                        f"{window:.0f} s: treated as profit/loss")
+            self._absorb(rest)
+        late_t = {int(d.ticket) for d in late}
+        late_cash = [f for f in unseen if int(f.ticket) in late_t]
+        for f in late_cash:
+            self._alert(f"late cash deal {f.amount:+,.2f} [deal {f.ticket}{' ' + f.comment if f.comment else ''}] "
+                        f"booked {f.time:%Y-%m-%d %H:%M} (server time): already counted as profit/loss, not applied "
+                        f"again")
+        self._mark_seen(late_cash)
+        self._apply_flows([f for f in unseen if int(f.ticket) not in late_t], equity)
         self._set_ref(money, scan.deals)
         self._pending_since, self._first_recon = None, False
         return equity
@@ -708,28 +712,24 @@ class LiveEngine:
             msg = self.risk.apply_cash_flow(f.amount, equity - rest)
             self._alert(f"{msg} [deal {f.ticket}{' ' + f.comment if f.comment else ''}]")
 
-    def _match_absorbed(self, cash: list, diff: float, tol: float) -> list | None:
-        """Late deals: the smallest set of new cash deals (earliest first) that each match a different absorbed
-        record and without which the remaining deals explain the change (diff + their sum ~ 0). None = no such set."""
-        recs = list(self.state.cash_absorbed)
-        cands = [f for f in cash if any(abs(r[0] - f.amount) <= tol for r in recs)][:12]
-        for n in range(1, len(cands) + 1):
-            for combo in itertools.combinations(cands, n):
-                if abs(diff + sum(f.amount for f in combo)) > tol:
-                    continue
-                used: list = []
-                for f in combo:
-                    r = next((r for r in recs if abs(r[0] - f.amount) <= tol and not any(r is u for u in used)), None)
-                    if r is None:
-                        break
-                    used.append(r)
-                if len(used) == n:
-                    return list(zip(combo, used))
-        return None
+    def _late_deals(self, deals: list, strict: bool = True) -> list:
+        """Deals booked (server time) before the newest change absorbed as profit/loss (strict) or also in its
+        second: that change was taken into the reference balance + credit, so these deals are already counted
+        there. Deal times have whole seconds, so a deal booked in that second may be either; the caller tries both."""
+        marks = [r[2] for r in self.state.cash_absorbed if len(r) > 2]
+        if not marks:
+            return []
+        mark = max(marks)
+        return [d for d in deals if _epoch(d.time) < mark or (not strict and _epoch(d.time) == mark)]
 
     def _absorb(self, amount: float) -> None:
         st = self.state
-        st.cash_absorbed = (st.cash_absorbed + [[round(float(amount), 2), _epoch(self._utcnow())]])[-ABSORBED_MAX:]
+        utc = self._utcnow()
+        mark = _epoch(self.clock.utc_to_server(utc).replace(tzinfo=None))  # server time now (not the last tick:
+        tick = self.broker.server_time()                                    # stale over a weekend)
+        if tick is not None:
+            mark = max(mark, _epoch(tick))
+        st.cash_absorbed = (st.cash_absorbed + [[round(float(amount), 2), _epoch(utc), mark]])[-ABSORBED_MAX:]
 
     def _prune_absorbed(self) -> None:
         st = self.state

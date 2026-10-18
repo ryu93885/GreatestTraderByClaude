@@ -175,15 +175,15 @@ def test_cash_deal_later_than_the_window_is_not_applied_again(monkeypatch, tmp_p
         eng = restart(eng)
         st = eng.state
         assert [r[0] for r in st.cash_absorbed] == [2_000.0]
-    deal(2_000.0, "deposit")
+    deal(2_000.0, "deposit", when=S.booked_at)  # booked before the change was counted as profit/loss
     dep = S.deal_ticket
     if with_close:
         exit_(555, 27.0)  # the same loop: change +27, new deals +2,027
     advance(clock)
     eng.step()
-    assert not eng._flow_pending and st.cash_absorbed == [] and st.cash_flow_total == 0
+    assert not eng._flow_pending and st.cash_flow_total == 0
     assert dep in {t for t, _ in st.cash_tickets}  # seen: never applied later
-    assert sent(eng, "late cash deal +2,000.00") and sent(eng, "already counted as profit/loss on")
+    assert sent(eng, "late cash deal +2,000.00") and sent(eng, "already counted as profit/loss, not applied again")
     assert not sent(eng, "CASH FLOW")
     later_trade(eng, clock)
     assert st.peak_equity == pytest.approx(S.equity) and eng.risk.drawdown(S.equity) == 0 and not st.halted
@@ -201,7 +201,7 @@ def test_an_absorbed_record_matches_only_when_the_rest_reconciles(monkeypatch, t
         advance(clock)
         eng.step()
     assert [r[0] for r in eng.state.cash_absorbed] == [2_000.0]
-    deal(2_000.0, "deposit")
+    deal(2_000.0, "deposit", when=S.booked_at)
     book(-500)  # a withdrawal, its deal one loop late
     advance(clock)
     eng.step()
@@ -210,7 +210,7 @@ def test_an_absorbed_record_matches_only_when_the_rest_reconciles(monkeypatch, t
     advance(clock)
     eng.step()
     st = eng.state
-    assert not eng._flow_pending and st.cash_absorbed == [] and st.cash_flow_total == pytest.approx(-500)
+    assert not eng._flow_pending and st.cash_flow_total == pytest.approx(-500)
     assert st.peak_equity == pytest.approx(11_500) and len(sent(eng, "late cash deal")) == 1
 
 
@@ -273,11 +273,11 @@ def test_unreadable_history_while_the_balance_changes_is_pending_then_expires(mo
                      "be read): treated as profit/loss")
     assert st.month_halted and S.positions == [] and [r[0] for r in st.cash_absorbed] == [-400.0]
     month_start = st.month_start_equity
-    deal(-400.0, "withdrawal")
+    deal(-400.0, "withdrawal", when=S.booked_at)
     fail["on"] = False
     advance(clock)
     eng.step()
-    assert not eng._flow_pending and st.cash_absorbed == [] and st.cash_flow_total == 0
+    assert not eng._flow_pending and st.cash_flow_total == 0
     assert st.month_start_equity == month_start and sent(eng, "late cash deal -400.00")
 
 
@@ -481,3 +481,32 @@ def test_broker_reads_from_the_reference_deal_time_minus_one_day(monkeypatch, tm
     eng.step()
     ref = mt5_broker._ts(S.now - 5 - 7 * 86400)  # the initial deposit 9001 = the reference deal
     assert windows[-1][0] == ref - timedelta(days=1) and windows[-1][1] >= mt5_broker._ts(S.now) + timedelta(days=2)
+
+
+# ------------------------------------------------------------------ review5 py-cash#1: late change of several deals
+@pytest.mark.parametrize("parts", [[(5_000.0, 2), (-50.0, 2)], [(5_000.0, 2), (27.0, 1)], [(3_000.0, 2), (1_500.0, 6)]])
+def test_late_change_made_of_several_deals_is_not_applied_again(monkeypatch, tmp_path, clock, parts):
+    """A deposit with a separate fee deal, a deposit and a trade close, or a deposit and a bonus reach the history
+    after the 60 s window, so their change was counted as profit/loss. Every deal booked before that moment is
+    already in the reference balance (server-time watermark): none is applied again - no phantom drawdown, no
+    false HALT (it used to apply the deposit a second time: 'HALT: max drawdown 33%')."""
+    eng = make(monkeypatch, tmp_path)
+    eng.step()
+    book(sum(a for a, _ in parts))
+    for _ in range(14):
+        advance(clock)
+        eng.step()
+    st = eng.state
+    assert sent(eng, "without a matching deal in the history for 60 s") and st.peak_equity == pytest.approx(S.equity)
+    for amount, type_ in parts:
+        deal(amount, "late", when=S.booked_at, type_=type_)
+    advance(clock)
+    eng.step()
+    assert not eng._flow_pending and st.cash_flow_total == 0 and not sent(eng, "CASH FLOW")
+    assert st.peak_equity == pytest.approx(S.equity) and eng.risk.drawdown(S.equity) == 0 and not st.halted
+    assert st.cash_money_ref == pytest.approx(S.balance) and st.cash_deal_ref == S.deal_ticket
+    deal(1_000.0, "a new deposit later")  # booked after the watermark: a normal cash flow
+    book(1_000)
+    advance(clock)
+    eng.step()
+    assert st.cash_flow_total == pytest.approx(1_000) and len(sent(eng, "CASH FLOW +1,000.00")) == 1

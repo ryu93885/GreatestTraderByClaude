@@ -61,6 +61,7 @@ def book(amount):
     """The account shows a deposit (+) / withdrawal (-) at once; its deal is added separately (deal())."""
     S.balance += amount
     S.equity += amount
+    S.booked_at = S.now  # server time of the booking: a deal that reaches the history later carries this time
 
 
 def advance(clock, seconds=5):

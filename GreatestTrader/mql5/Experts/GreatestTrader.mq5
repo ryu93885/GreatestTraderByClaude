@@ -635,7 +635,7 @@ bool RestoreStateFile(const long login)
          fileLogin = StringToInteger(v);
          continue;
         }
-      if(!IsStateKey(k) || !IsStateNumber(v) || n >= 200)
+      if(!IsStateKey(k) || !IsStateNumber(v) || n >= 2000)
          continue;
       ArrayResize(keys, n + 1);
       ArrayResize(vals, n + 1);
@@ -2431,97 +2431,64 @@ void AddAbsorbed(const double amt)
    ArrayResize(g_absAmt, n + 1);
    ArrayResize(g_absTime, n + 1);
    g_absAmt[n] = amt;
-   g_absTime[n] = TimeCurrent();
+   datetime srvNow = TimeTradeServer();   // server time now; TimeCurrent() is the last tick (stale over a weekend)
+   g_absTime[n] = (srvNow > TimeCurrent()) ? srvNow : TimeCurrent();
    g_stateDirty = true;
   }
 
-// new cash deals that each match a different absorbed record (within tol) and, left out of the sum, make the new
-// deals explain the change (within tol per deal left out) are LATE deals of a change already counted as profit /
-// loss: late[] = 1 for them, the matched records are removed (notified). Smallest such set first, earliest deals
-// first; at most 10 candidates (oldest first). Returns false when there is none.
-bool MatchLateDeals(const ulong &tk[], const long &type[], const double &eff[], const datetime &tm[],
-                    const double delta, const double sum, const double tol, int &late[])
+// deals booked (server time) before the newest change counted as profit / loss (strict), or also in its second
+// (!strict), are LATE deals: that change was taken into the reference balance + credit, so they are already counted
+// there (Python _late_deals). Sets late[] = 1 for them and returns the sum of their effects (count in nl).
+double MarkLateDeals(const datetime &tm[], const double &eff[], const bool strict, int &late[], int &nl)
   {
-   int na = ArraySize(g_absAmt);
-   if(na == 0)
-      return false;
-   int cand[];
-   int nc = 0;
-   for(int i = 0; i < ArraySize(tk) && nc < 10; i++)
+   nl = 0;
+   double sx = 0.0;
+   int na = ArraySize(g_absTime);
+   datetime wm = 0;
+   for(int r = 0; r < na; r++)
+      if(g_absTime[r] > wm)
+         wm = g_absTime[r];
+   for(int i = 0; i < ArraySize(tm); i++)
      {
-      if(!IsCashFlow(type[i]) || tk[i] <= g_flowTicket)
+      late[i] = 0;
+      if(na == 0 || !(tm[i] < wm || (!strict && tm[i] == wm)))
          continue;
-      bool fits = false;
-      for(int r = 0; r < na && !fits; r++)
-         if(MathAbs(eff[i] - g_absAmt[r]) <= tol)
-            fits = true;
-      if(!fits)
-         continue;
-      ArrayResize(cand, nc + 1);
-      cand[nc] = i;
-      nc++;
+      late[i] = 1;
+      sx += eff[i];
+      nl++;
      }
-   if(nc == 0)
-      return false;
-   int maxSize = (nc < na) ? nc : na;
-   int pick[];
-   ArrayResize(pick, nc);
-   for(int size = 1; size <= maxSize; size++)
-      for(int mask = 1; mask < (1 << nc); mask++)
-        {
-         int bits = 0;
-         for(int b = 0; b < nc; b++)
-            if((mask & (1 << b)) != 0)
-               bits++;
-         if(bits != size)
-            continue;
-         bool ok = true;
-         double sx = 0.0;
-         for(int b = 0; b < nc; b++)
-           {
-            pick[b] = -1;
-            if((mask & (1 << b)) == 0 || !ok)
-               continue;
-            for(int r = 0; r < na && pick[b] < 0; r++)
-              {
-               bool taken = false;
-               for(int q = 0; q < b; q++)
-                  if(pick[q] == r)
-                     taken = true;
-               if(!taken && MathAbs(eff[cand[b]] - g_absAmt[r]) <= tol)
-                  pick[b] = r;
-              }
-            if(pick[b] < 0)
-               ok = false;
-            else
-               sx += eff[cand[b]];
-           }
-         if(!ok || MathAbs(delta - (sum - sx)) > tol)
-            continue;
-         int rm[];
-         ArrayResize(rm, na);
-         ArrayInitialize(rm, 0);
-         for(int b = 0; b < nc; b++)
-           {
-            if(pick[b] < 0)
-               continue;
-            late[cand[b]] = 1;
-            rm[pick[b]] = 1;
-            Log(StringFormat("late cash deal #%s %+.2f (booked %s): already counted as profit/loss on %s - not applied "
-                             "again", IntegerToString((long)tk[cand[b]]), eff[cand[b]],
-                             TimeToString(tm[cand[b]], TIME_DATE | TIME_MINUTES),
-                             TimeToString(g_absTime[pick[b]], TIME_DATE | TIME_MINUTES)), true);
-           }
-         for(int r = na - 1; r >= 0; r--)
-            if(rm[r] != 0)
-              {
-               ArrayRemove(g_absAmt, r, 1);
-               ArrayRemove(g_absTime, r, 1);
-              }
-         g_stateDirty = true;
-         return true;
-        }
+   return sx;
+  }
+
+// late deals of a change already counted as profit / loss: with them left out, do the new deals explain the change?
+// Tries the strict watermark first, then its second (deal times have whole seconds). late[] = 1 for the late deals
+// of the chosen reading (strict when neither explains it: used at the pending limit).
+bool MatchLateDeals(const datetime &tm[], const double &eff[], const double delta, const double sum,
+                    const double tol, int &late[])
+  {
+   int nl = 0;
+   double sx = MarkLateDeals(tm, eff, false, late, nl);
+   bool wideOk = (nl > 0 && MathAbs(delta - (sum - sx)) <= tol);
+   sx = MarkLateDeals(tm, eff, true, late, nl);
+   if(nl > 0 && MathAbs(delta - (sum - sx)) <= tol)
+      return true;
+   if(wideOk)
+     {
+      MarkLateDeals(tm, eff, false, late, nl);
+      return true;
+     }
    return false;
+  }
+
+// notifies the late cash deals (newer than the cash cursor) that are left out: not applied again
+void NoteLateDeals(const ulong &tk[], const long &type[], const double &eff[], const datetime &tm[],
+                   const int &late[])
+  {
+   for(int i = 0; i < ArraySize(tk); i++)
+      if(late[i] != 0 && IsCashFlow(type[i]) && tk[i] > g_flowTicket)
+         Log(StringFormat("late cash deal #%s %+.2f booked %s (server time): already counted as profit/loss - not "
+                          "applied again", IntegerToString((long)tk[i]), eff[i],
+                          TimeToString(tm[i], TIME_DATE | TIME_SECONDS)), true);
   }
 
 // applies the new cash deals newer than the cursor that are not late (one cash flow); the cursor moves past every
@@ -2680,13 +2647,14 @@ bool HandleCashFlows(double &eq)
    double tol = MathMax(0.02, 1e-6 * MathAbs(money));
    bool ok = (MathAbs(delta - sum) <= tol);
    if(!ok && readable)
-      ok = MatchLateDeals(tk, type, eff, tm, delta, sum, tol, late);
+      ok = MatchLateDeals(tm, eff, delta, sum, tol, late);
    datetime now = TimeLocal();
    if(ok)
      {
       if(g_pendingSince != 0)
          Log(StringFormat("balance/credit change %+.2f explained by the deal history after %d s", delta,
                           (int)Secs(now, g_pendingSince)));
+      NoteLateDeals(tk, type, eff, tm, late);
       ApplyNewCash(tk, type, eff, late, eq);
       SetFlowReference(money, newest, newestTime);
       g_pendingSince = 0;
@@ -2704,16 +2672,21 @@ bool HandleCashFlows(double &eq)
      }
    if(Secs(now, g_pendingSince) <= g_pendingWin)
       return false;
-   // limit reached: the new cash deals are applied, the rest of the change counts as profit / loss
+   // limit reached: late deals (booked before an earlier absorbed change) are left out, the other new cash deals
+   // are applied, the rest of the change counts as profit / loss
+   int nl = 0;
+   double sx = 0.0;
+   if(n > 0)
+      sx = MarkLateDeals(tm, eff, true, late, nl);
+   NoteLateDeals(tk, type, eff, tm, late);
    ApplyNewCash(tk, type, eff, late, eq);
-   double unexplained = delta - sum;
+   double unexplained = delta - (sum - sx);
    Log(StringFormat("balance/credit changed by %+.2f without a matching deal in the history: treated as profit/loss",
                     unexplained), true);
    AddAbsorbed(unexplained);
    SetFlowReference(money, newest, newestTime);
    g_pendingSince = 0;
-   if(readable)
-      g_firstRecon = false;   // (an unreadable history keeps the start-up window, as in the Python engine)
+   g_firstRecon = false;   // the start-up window ends at the first limit, readable history or not (Python: same)
    return true;
   }
 
