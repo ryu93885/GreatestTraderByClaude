@@ -336,6 +336,10 @@ class LiveEngine:
                 self._month_end(before[1])
             self._dd_alert(equity)
         positions = self.broker.positions(self.magics)
+        try:  # journal rows held back while a CSV was locked (e.g. open in Excel): written as soon as possible
+            self.journal.flush_pending()
+        except Exception as exc:  # noqa: BLE001 - the journal never stops the loop
+            log.error("journal flush failed: %s", exc)
         self._sync_trades(positions, utc)
         if self._orders_off:
             # Algo Trading off (or the account allows no expert trading): the guards above ran and latched (EA: same
@@ -1156,6 +1160,8 @@ class LiveEngine:
             return
         if any(p.strategy == "ES" for p in positions):
             return
+        if now_server - now_server.replace(minute=0, second=0, microsecond=0) < BAR_SETTLE:
+            return  # the last H1 bar counts as closed only BAR_SETTLE after the hour (EA: same rule)
         block = self.entry_block()
         if block:  # not marked as decided: tried again while the entry window lasts
             self._alert(f"ES entry waiting: {block}", key="es-block", every=900, level=logging.INFO)

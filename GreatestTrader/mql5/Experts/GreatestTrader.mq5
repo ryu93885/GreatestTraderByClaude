@@ -124,7 +124,7 @@ input bool   InpResetHalt   = false; // Clear the max-DD halt once at start (pea
 #define GT_LOCK_STALE_SEC   60      // instance lock: heartbeat older than this = holder gone
 #define GT_LOCK_BEAT_SEC    10      // instance lock: heartbeat interval
 #define GT_REPEAT_SEC       21600   // repeat a standing alert at most every 6 hours
-#define GT_STALE_FEED_SEC   900     // no new quote for this long while the market is open = stale feed
+#define GT_STALE_FEED_SEC   600     // no new quote for this long while the market is open = stale feed (Python monitor.stale_feed_minutes 10)
 #define GT_SESSION_GRACE_SEC 600    // ... the first quote of a session (Monday, after Dec 25 / Jan 1) may come this late
 #define GT_NOTIFY_MAX       30      // push queue length
 #define GT_FAR_FUTURE       D'2100.01.01 00:00:00'
@@ -2496,7 +2496,7 @@ bool MatchLateDeals(const ulong &tk[], const long &type[], const double &eff[], 
             else
                sx += eff[cand[b]];
            }
-         if(!ok || MathAbs(delta - (sum - sx)) > tol * size)
+         if(!ok || MathAbs(delta - (sum - sx)) > tol)
             continue;
          int rm[];
          ArrayResize(rm, na);

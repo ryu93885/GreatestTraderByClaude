@@ -389,3 +389,22 @@ def test_deferred_signals_are_retried_alphabetically(tmp_path):
     one = eng.risk.risk_fraction("NR", 1_000_000) * 1.5  # room for one trade only
     eng2, opened2 = gated_run(tmp_path / "b", until, syms=("GBPJPY", "EURJPY"), data=data, max_total_risk=one)
     assert opened2 == [(t, "EURJPY")]
+
+
+# ------------------------------------------------------------------ ES decision waits for the H1 bar to close (D11)
+def test_es_decision_waits_until_the_last_h1_bar_counts_as_closed(tmp_path):
+    """The previous H1 bar counts as closed only BAR_SETTLE (2 s) after the hour, so the ES decision at 07:00 UTC
+    waits until then (EA: same rule); otherwise its ATR would end one hour earlier than in the backtester."""
+    cfg = cfg_for(tmp_path, syms=["EURJPY"], es=True)
+    data = {"EURJPY": synthetic_m15(datetime(2021, 3, 1), 10, 130.0, 0.01),
+            "EURUSD": synthetic_m15(datetime(2021, 3, 1), 10, 1.20, 0.0001, seed=3)}
+    eng, br = make(cfg, data)
+    br.set_time(datetime(2021, 3, 9, 8, 59, 55))  # NY7 server time = UTC+2 in March before the US DST switch
+    eng.start()
+    eng.step()
+    br.set_time(datetime(2021, 3, 9, 9, 0, 1))  # 07:00:01 UTC: inside the ES window, H1 bar not settled yet
+    eng.step()
+    assert eng.state.last_es_entry_day != "2021-03-09"
+    br.set_time(datetime(2021, 3, 9, 9, 0, 6))
+    eng.step()
+    assert eng.state.last_es_entry_day == "2021-03-09"
