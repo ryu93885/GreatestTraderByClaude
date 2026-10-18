@@ -59,7 +59,7 @@ GreatestTrader/
 │   ├── config/config.yaml     ← 設定ファイル（preset: stable5）
 │   ├── main.py
 │   ├── greatest_trader/       ← プログラム本体（presets/ にプリセット）
-│   └── tests/                 ← 自動テスト（pytest、283 件）
+│   └── tests/                 ← 自動テスト（pytest、286 件）
 └── mql5/
     ├── Experts/GreatestTrader.mq5   ← MT5 用 EA（v1.20、既定値 = stable5）
     └── Presets/*.set                ← プリセット（Stable5_Default / Stable4_Robust / Safe2_WorstMonth2pct / Classic_*）
