@@ -171,14 +171,20 @@ datetime g_lastFlush = 0;
 bool     g_gvWritten = false;    // a global variable was written since the last flush
 bool     g_gvRefresh = false;    // rewrite every value this time (manual deletion / 4-week expiry)
 datetime g_gvRefreshAt = 0;
-string   g_gvName[];             // cache of the values last written, to write only on change
+string   g_gvName[];             // every persisted value: global variable name, key, current value and whether
+string   g_gvKey[];              // ... the global variable holds it (written only on change or a full refresh)
 double   g_gvVal[];
+bool     g_gvOk[];
+long     g_stateLogin = 0;       // account of the loaded state (state file name)
+bool     g_fileDirty = false;    // a persisted value changed since the state file was last written
+datetime g_fileNote = 0;         // last 'state file cannot be written' notice
 bool     g_resetHaltDone = false; // InpResetHalt already applied (persisted; re-armed when InpResetHalt=false)
 bool     g_resetDue = false;     // InpResetHalt is evaluated after the first cash-flow scan of the session
 
 //--- cash flows (deposits / withdrawals / credit / bonus): amount-based reconciliation (shared rule with Python)
 ulong    g_flowTicket = 0;       // newest cash-flow deal ticket applied or marked as seen (persisted "flowtk")
-datetime g_flowScan = 0;         // server time of the last successful history read (persisted "flowtm")
+datetime g_flowScan = 0;         // server time the reconciliation reference last moved (persisted "flowtm"; the
+                                 // history window of a state of an earlier 1.2 build without a reference)
 bool     g_refKnown = false;     // a reconciliation reference exists (persisted "flowmref" / "flowdref" / "flowdtm")
 double   g_moneyRef = 0.0;       // balance + credit at the last reconciliation
 ulong    g_dealRef = 0;          // newest deal (any type) included in the last reconciliation
@@ -442,7 +448,8 @@ double SymPip(const string sym)
 //+------------------------------------------------------------------+
 //| Risk state (persisted in terminal global variables GT_<login>_*)  |
 //+------------------------------------------------------------------+
-// writes one value only when it differs from the value last written (or on a full refresh)
+// records a persisted value (state file mirror) and writes its global variable only when it differs from the value
+// last written successfully (or on a full refresh)
 void GVPut(const string key, const double v)
   {
    string name = g_gvPrefix + key;
@@ -454,22 +461,204 @@ void GVPut(const string key, const double v)
          idx = i;
          break;
         }
-   if(idx >= 0 && g_gvVal[idx] == v && !g_gvRefresh)
-      return;
-   if(GlobalVariableSet(name, v) == 0)
-     {
-      Print("[GT] could not write global variable ", name, " (error ", GetLastError(), ")");
-      return;
-     }
-   g_gvWritten = true;
    if(idx < 0)
      {
       idx = n;
       ArrayResize(g_gvName, n + 1);
+      ArrayResize(g_gvKey, n + 1);
       ArrayResize(g_gvVal, n + 1);
+      ArrayResize(g_gvOk, n + 1);
       g_gvName[idx] = name;
+      g_gvKey[idx] = key;
+      g_gvVal[idx] = v;
+      g_gvOk[idx] = false;
+      g_fileDirty = true;
      }
-   g_gvVal[idx] = v;
+   else
+      if(g_gvVal[idx] != v)
+        {
+         g_gvVal[idx] = v;
+         g_gvOk[idx] = false;
+         g_fileDirty = true;
+        }
+      else
+         if(g_gvOk[idx] && !g_gvRefresh)
+            return;
+   if(GlobalVariableSet(name, v) == 0)
+     {
+      Print("[GT] could not write global variable ", name, " (error ", GetLastError(), ")");
+      return;   // tried again at the next save
+     }
+   g_gvOk[idx] = true;
+   g_gvWritten = true;
+  }
+
+//+------------------------------------------------------------------+
+//| State file: mirror of the global variables (4-week expiry)        |
+//+------------------------------------------------------------------+
+// MT5 deletes a terminal global variable 4 weeks after its last access. Every persisted value is mirrored to
+// MQL5\Files\GreatestTrader_<login>.state (ASCII key=value lines, written atomically: a temporary file, then
+// FileMove with FILE_REWRITE) whenever the state is flushed after a change, and at the hourly full refresh. When
+// the global variables of the account are missing at a start, the file of the same login restores them (notified).
+// Never in the Strategy Tester.
+string StateFileName(const long login)
+  {
+   return "GreatestTrader_" + IntegerToString(login) + ".state";
+  }
+
+void StateFileProblem(const string msg)
+  {
+   datetime now = TimeLocal();
+   if(g_fileNote != 0 && Secs(now, g_fileNote) < GT_REPEAT_SEC && Secs(now, g_fileNote) >= 0)
+     {
+      if(InpVerbose)
+         Log(msg);
+      return;   // logged and notified at most every GT_REPEAT_SEC; tried again at every flush
+     }
+   g_fileNote = now;
+   Log(msg + " - the state is still kept in the terminal global variables", true);
+  }
+
+bool WriteStateFile()
+  {
+   if(g_tester || g_stateLogin <= 0)
+      return false;
+   string fn = StateFileName(g_stateLogin);
+   string tmp = fn + ".tmp";
+   string s = "# GreatestTrader EA state: mirror of the terminal global variables " + g_gvPrefix + "*\r\n";
+   s += "# saved " + TimeToString(TimeLocal(), TIME_DATE | TIME_SECONDS) + " (local time)\r\n";
+   s += "login=" + IntegerToString(g_stateLogin) + "\r\n";
+   for(int i = 0; i < ArraySize(g_gvKey); i++)
+      s += g_gvKey[i] + "=" + DoubleToString(g_gvVal[i], 8) + "\r\n";
+   ResetLastError();
+   int h = FileOpen(tmp, FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE)
+     {
+      StateFileProblem(StringFormat("state file %s cannot be written (error %d)", tmp, GetLastError()));
+      return false;
+     }
+   uint written = FileWriteString(h, s);
+   FileClose(h);
+   if(written == 0)
+     {
+      StateFileProblem(StringFormat("state file %s cannot be written (error %d)", tmp, GetLastError()));
+      FileDelete(tmp);
+      return false;
+     }
+   ResetLastError();
+   if(!FileMove(tmp, 0, fn, FILE_REWRITE))
+     {
+      StateFileProblem(StringFormat("state file %s cannot be replaced (error %d)", fn, GetLastError()));
+      FileDelete(tmp);
+      return false;
+     }
+   g_fileDirty = false;
+   return true;
+  }
+
+// a key of the state file: lower-case letters and digits only
+bool IsStateKey(const string k)
+  {
+   int n = StringLen(k);
+   if(n < 1 || n > 20)
+      return false;
+   for(int i = 0; i < n; i++)
+     {
+      ushort c = StringGetCharacter(k, i);
+      if(!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
+         return false;
+     }
+   return true;
+  }
+
+// a value of the state file: optional '-', digits, at most one '.'
+bool IsStateNumber(const string v)
+  {
+   int n = StringLen(v);
+   int start = (n > 0 && StringGetCharacter(v, 0) == '-') ? 1 : 0;
+   int digits = 0, dots = 0;
+   for(int i = start; i < n; i++)
+     {
+      ushort c = StringGetCharacter(v, i);
+      if(c >= '0' && c <= '9')
+         digits++;
+      else
+         if(c == '.')
+            dots++;
+         else
+            return false;
+     }
+   return (digits > 0 && dots <= 1);
+  }
+
+// the global variables of the account are missing (4-week expiry or deleted): restores them from the state file of
+// the same login, before LoadState. Returns true when restored.
+bool RestoreStateFile(const long login)
+  {
+   string fn = StateFileName(login);
+   if(!FileIsExist(fn))
+      return false;
+   ResetLastError();
+   int h = FileOpen(fn, FILE_READ | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE)
+     {
+      Log(StringFormat("the terminal global variables %s* are missing and the state file %s cannot be read (error "
+                       "%d): the EA starts with a fresh state", g_gvPrefix, fn, GetLastError()), true);
+      return false;
+     }
+   string keys[];
+   double vals[];
+   int n = 0;
+   long fileLogin = -1;
+   bool hasPeak = false;
+   string saved = "?";
+   while(!FileIsEnding(h))
+     {
+      string line = FileReadString(h);
+      StringTrimLeft(line);
+      StringTrimRight(line);
+      if(StringLen(line) == 0)
+         continue;
+      if(StringGetCharacter(line, 0) == '#')
+        {
+         if(StringFind(line, "# saved ") == 0)
+            saved = StringSubstr(line, 8);
+         continue;
+        }
+      int p = StringFind(line, "=");
+      if(p <= 0)
+         continue;
+      string k = StringSubstr(line, 0, p);
+      string v = StringSubstr(line, p + 1);
+      if(k == "login")
+        {
+         fileLogin = StringToInteger(v);
+         continue;
+        }
+      if(!IsStateKey(k) || !IsStateNumber(v) || n >= 200)
+         continue;
+      ArrayResize(keys, n + 1);
+      ArrayResize(vals, n + 1);
+      keys[n] = k;
+      vals[n] = StringToDouble(v);
+      if(k == "peak")
+         hasPeak = true;
+      n++;
+     }
+   FileClose(h);
+   if(fileLogin != login || !hasPeak)
+     {
+      Log(StringFormat("state file %s ignored (account %s, peak %s): the EA starts with a fresh state", fn,
+                       IntegerToString(fileLogin), hasPeak ? "present" : "missing"), true);
+      return false;
+     }
+   for(int i = 0; i < n; i++)
+      GlobalVariableSet(g_gvPrefix + keys[i], vals[i]);
+   GlobalVariablesFlush();
+   Log(StringFormat("state RESTORED from MQL5\\Files\\%s (saved %s, %d values): the terminal global variables %s* "
+                    "were missing (MT5 deletes them 4 weeks after their last access, or they were deleted). To start "
+                    "with a fresh state, delete this file as well.", fn, saved, n, g_gvPrefix), true);
+   return true;
   }
 
 void SaveState(const bool force = false)
@@ -479,7 +668,10 @@ void SaveState(const bool force = false)
    datetime now = TimeLocal();
    g_gvRefresh = (force || now >= g_gvRefreshAt);
    if(g_gvRefresh)
+     {
       g_gvRefreshAt = now + 3600;
+      g_fileDirty = true;   // the state file is rewritten at the full refresh too (deleted by hand meanwhile?)
+     }
    GVPut("peak", g_peak);
    GVPut("day", (double)g_day);
    GVPut("dayeq", g_dayStartEq);
@@ -530,6 +722,8 @@ void SaveState(const bool force = false)
       g_lastFlush = now;
       g_stateDirty = false;
       g_gvWritten = false;
+      if(g_fileDirty)
+         WriteStateFile();   // the 4-week-expiry mirror, at most as often as the global variables are flushed
      }
   }
 
@@ -2360,6 +2554,8 @@ void ApplyNewCash(const ulong &tk[], const long &type[], const double &eff[], co
 // the reconciliation reference moves to balance + credit 'money' and the newest deal of this read
 void SetFlowReference(const double money, const ulong newest, const datetime newestTime)
   {
+   if(!g_refKnown || money != g_moneyRef || newest > g_dealRef)
+      g_flowScan = TimeCurrent();   // only when the reference moves (no persisted change while nothing happens)
    g_moneyRef = money;
    if(!g_refKnown || newest > g_dealRef)
      {
@@ -2440,9 +2636,7 @@ bool HandleCashFlows(double &eq)
       return false;   // a deal was booked during the read: nothing is decided, the read is repeated next cycle
    if(eqNow > 0.0)
       eq = eqNow;
-   if(readable)
-      g_flowScan = TimeCurrent();
-   else
+   if(!readable)
      {
       g_histBad = true;
       if(!g_refKnown)
@@ -3146,12 +3340,19 @@ bool EnsureState()
      }
    g_gvPrefix = "GT_" + IntegerToString(login) + "_";
    ArrayResize(g_gvName, 0);
+   ArrayResize(g_gvKey, 0);
    ArrayResize(g_gvVal, 0);
+   ArrayResize(g_gvOk, 0);
    g_gvRefreshAt = 0;
+   g_fileDirty = false;
    ResetStateVars();
    bool flowKnown = false;
    if(!g_tester)
      {
+      g_stateLogin = login;
+      // the global variables of this account are gone (4-week expiry, deleted): the state file restores them
+      if(!GlobalVariableCheck(g_gvPrefix + "peak"))
+         RestoreStateFile(login);
       flowKnown = GlobalVariableCheck(g_gvPrefix + "flowtk");
       LoadState();
      }
