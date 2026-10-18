@@ -66,15 +66,31 @@ class CashFlow:
 
 
 @dataclass
+class Deal:
+    """A deal of the account history (any type) with its effect on balance + credit."""
+    ticket: int
+    time: datetime  # server time
+    effect: float  # profit + commission + swap + fee (a CREDIT deal moves the credit: also part of balance + credit)
+    type: int  # MT5 DEAL_TYPE_*: 0/1 trades, 2 balance, 3 credit, 6 bonus, others (charge, commission, ...)
+    comment: str = ""
+
+    @property
+    def cash(self) -> bool:
+        """A deposit / withdrawal / credit / bonus (not trading profit or loss)."""
+        return int(self.type) in CASH_DEAL_TYPES
+
+
+@dataclass
 class CashScan:
-    """One cash-flow check: the cash deals of the scan window plus ONE account read taken AFTER the history read
-    (so that k = E / (E - F) uses an equity that contains every flow the scan found)."""
+    """One cash-flow check: the deals newer than the engine's reconciliation reference plus ONE account read taken
+    AFTER the history read (so that k = E / (E - F) uses an equity that contains every flow the scan found)."""
     flows: list[CashFlow]
     equity: float
-    newest_deal: int | None = None  # newest deal ticket of ANY type (trade or cash) in the history; None = unknown
-    money: float | None = None  # balance + credit at the account read; None = unknown (no cash-flow lag guard)
-    scan_money: float | None = None  # balance + credit when the history was read (differs: booked meanwhile)
+    newest_deal: int | None = None  # newest deal ticket of ANY type among `deals`; None = none / unknown
+    money: float | None = None  # balance + credit at the account read; None = unknown (no reconciliation)
+    scan_money: float | None = None  # balance + credit read just before the history (differs: booked meanwhile)
     balance: float | None = None
+    deals: list[Deal] | None = None  # every deal (any type) newer than the reference, in time order; None = unknown
 
 
 @dataclass
@@ -83,6 +99,9 @@ class HistoryCheck:
     flows: list[CashFlow]  # every balance / credit / bonus deal
     complete: bool | None  # the deals add up to the balance (and the credit); None = cannot be checked
     detail: str = ""
+    money: float | None = None  # balance + credit read after the deals (the reconciliation reference); None = unknown
+    newest_deal: int | None = None  # newest deal ticket of any type in the history (None = no deal)
+    newest_time: datetime | None = None  # its server time
 
 
 @dataclass
@@ -143,10 +162,15 @@ class Broker(ABC):
         """Recent deposits / withdrawals / credit / bonus deals (the engine de-duplicates by ticket)."""
         return []
 
-    def cash_scan(self, fresh: bool = False) -> CashScan:
-        """The engine's cash-flow check: cash_flows() first, then the account (equity, balance + credit).
-        fresh=True: the engine waits for a deal that explains a balance change, read the history again.
-        This default knows neither the balance nor the deal tickets: no cash-flow lag guard."""
+    def account_money(self) -> float | None:
+        """Balance + credit (None = unknown: no cash-flow reconciliation)."""
+        return None
+
+    def cash_scan(self, fresh: bool = False, after: int = 0, since: datetime | None = None) -> CashScan:
+        """The engine's cash-flow check: the deals with ticket > `after` (all types, with their balance effect;
+        `since` = server time of that reference deal, the history window starts a day before it; None = no
+        reference yet), then the account (equity, balance + credit). This default knows neither the balance nor the
+        deals: cash_flows() are applied by ticket at once (no reconciliation, no lag guard)."""
         flows = self.cash_flows()
         return CashScan(flows, self.account_equity())
 

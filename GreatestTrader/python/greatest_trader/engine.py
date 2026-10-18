@@ -13,11 +13,13 @@ One loop every engine.poll_seconds:
 New entries need a verified server clock (auto mode: measured from fresh ticks after every start) and are
 blocked after 3 observations that disagree with the clock in use; they also wait while the first-run deal history
 is not confirmed complete, while the deal history cannot be read and while a balance change is not yet explained
-by the deal history (cash flow pending, at most 60 s). Closes, time stops, TP management and hard stops keep
-working with the last known clock.
+by the amounts of the new deals in the history (cash flow pending, at most 60 s, 300 s right after a start); an NR
+signal blocked that way is retried while its bar is fresh (150 s). Closes, time stops, TP management and hard stops
+keep working with the last known clock.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import math
@@ -55,7 +57,9 @@ SYMBOL_RETRY_SECONDS = 3600.0  # unavailable symbols are tried again this often
 SYMBOL_FAIL_ALERT = 60  # loops in a row before a failing symbol is notified (then every 6 hours)
 STATE_SAVE_SECONDS = 60.0  # equity-only changes are written at most this often (everything else at once)
 CLOSED_LOOKUP_TRIES = 120  # loops to wait for the deal history of a closed position before journaling it
-FLOW_PENDING_SECONDS = 60.0  # a balance change without a new deal in the history waits at most this long
+FLOW_PENDING_SECONDS = 60.0  # a balance change the deal history does not explain waits at most this long
+FLOW_FIRST_SECONDS = 300.0  # ... in the first reconciliation after a start / terminal re-init (history syncing)
+ABSORBED_MAX, ABSORBED_DAYS = 5, 7  # unexplained changes counted as profit/loss: records kept for late deals
 PRIME_STABLE_SECONDS = 60.0  # first run: cash deals of the history unchanged this long = the history is complete
 PRIME_MAX_SECONDS = 600.0  # first run: the cash-flow tracking starts after this long anyway (warning)
 FX_HOLIDAYS = {(12, 25), (1, 1)}  # market dates without trading
@@ -108,8 +112,10 @@ class LiveEngine:
         self._balance: float | None = None  # account balance at the last cash-flow check (equity log)
         self._flow_pending = False  # this loop: balance change not explained by the deal history yet
         self._pending_since: float | None = None  # monotonic time when the unexplained change was first seen
-        self._money_ref: float | None = None  # balance + credit at the last explained change (None: take the next)
-        self._deal_ref: int | None = None  # newest deal ticket at that time
+        # the reconciliation reference itself is persisted in the state (cash_money_ref, cash_deal_ref, ...)
+        self._first_recon = True  # no reconciliation since this start / terminal re-init: longer pending window
+        self._sessions = None  # broker.sessions at the last check (a change = the terminal was re-initialised)
+        self._primed_now = False  # the priming of this loop set the reference: reconciled from the next loop on
         self._cash_problem = ""  # the deal history cannot be read
         self._prime_start: float | None = None  # first run: when priming was first tried
         self._prime_ref: tuple | None = None  # first run: (cash deal tickets, since when unchanged)
@@ -306,7 +312,8 @@ class LiveEngine:
         equity = self._cash_check()  # BEFORE the guards: a withdrawal is no loss, a deposit no profit
         st = self.state
         if self._flow_pending:
-            # balance changed, no deal explains it yet (at most FLOW_PENDING_SECONDS): no peak raise, no halt /
+            # balance changed, the new deals do not explain it yet (at most FLOW_PENDING_SECONDS / FLOW_FIRST_SECONDS
+            # after a start): no peak raise, no halt /
             # month / day stop decision, no entry this loop; closes, time stops, TP management and stops in force run
             self.risk.flatten_reason = ""
         else:
@@ -590,21 +597,34 @@ class LiveEngine:
 
     # ------------------------------------------------------------------ cash flows
     def _cash_check(self) -> float:
-        """Deposits / withdrawals / credit / bonus since the last loop, de-duplicated by deal ticket, applied
-        BEFORE the guards (shared rule with the EA, spec section 5). Returns the equity this loop's guards use:
-        read ONCE after the deal scan, so k = E / (E - F) and the guards see an equity that contains every flow
-        found. Sets:
-          _flow_pending: balance + credit changed since the last explained change and no new deal of any type
-                         (trade or cash) explains it yet: no peak raise, no halt / month / day stop decision and no
-                         entry in this loop; closes, time stops and TP management continue. At most
-                         FLOW_PENDING_SECONDS, then the change counts as profit / loss (notified).
-          _cash_problem: the deal history cannot be read: new entries wait; closes, time stops and the hard stops
-                         continue with the account equity.
-        First run (no cash_init): see _try_prime."""
+        """Deposits / withdrawals / credit / bonus, applied BEFORE the guards and decided by AMOUNTS (shared rule
+        with the EA, spec section 5). Returns the equity this loop's guards use: read ONCE after the deal scan, so
+        k = E / (E - F) and the guards see an equity that contains every flow found.
+
+        Reference (persisted in the state, so a restart reconciles like any other loop): balance + credit M_ref at
+        the last reconciliation and the newest deal included in it. Every loop the broker returns the deals newer
+        than that deal (any type) with their effect (profit + commission + swap + fee), then M = balance + credit:
+          * |(M - M_ref) - sum(effects)| <= max(0.02, 1e-6 |M|): reconciled. Every cash deal (balance / credit /
+            bonus) not seen before is applied in time order; trade deals are just profit/loss. The reference moves.
+          * otherwise, new cash deals that each match a change absorbed earlier as profit/loss (see below) and
+            without which the rest reconciles are LATE deals of that change: marked seen, not applied again.
+          * otherwise _flow_pending: no peak raise, no halt / month / day stop decision, no DD alert / day roll and
+            no entry this loop; closes, time stops, TP management and stops already in force continue. At most
+            FLOW_PENDING_SECONDS (FLOW_FIRST_SECONDS in the first reconciliation after a start / terminal re-init,
+            while the history may still be syncing); then the unseen cash deals are applied, the remainder counts as
+            profit/loss (notified) and is kept as an absorbed record (ABSORBED_MAX, ABSORBED_DAYS).
+          * balance + credit moved during the read (a deal booked meanwhile): pending, decided on the next loop.
+        _cash_problem: the deal history cannot be read: new entries wait; a changed balance + credit is pending
+        with the same timer (never a stop decision on an unexplained change). First run (no cash_init): _try_prime.
+        A broker that knows neither balance nor deals (no scan.deals) applies new cash deals by ticket at once."""
         self._flow_pending = False
         st = self.state
+        sessions = getattr(self.broker, "sessions", None)
+        if sessions != self._sessions:  # a new terminal session: its deal history may still be syncing
+            self._sessions, self._first_recon = sessions, True
         try:
-            scan = self.broker.cash_scan(fresh=self._pending_since is not None)
+            scan = self.broker.cash_scan(fresh=self._pending_since is not None, after=int(st.cash_deal_ref or 0),
+                                         since=self._ref_time())
             primed = st.cash_init or self._try_prime(scan)
         except Exception as exc:  # noqa: BLE001 - isolated: never stops closes, time stops or hard stops
             if not self._cash_problem:
@@ -612,55 +632,164 @@ class LiveEngine:
             self._cash_problem = f"deal history cannot be read ({exc})"
             self._alert(f"cash-flow check failed: {exc} -> new entries wait; closes, time stops and hard stops "
                         f"continue", key="cash-check", every=1800, level=logging.ERROR)
-            return self.broker.account_equity()
+            return self._history_unreadable()
         if self._cash_problem:
             self._cash_problem = ""
             log.warning("cash-flow check works again")
         self._balance = scan.balance
         equity = scan.equity
-        if not primed:
+        if not primed or self._primed_now:  # priming took this loop's reference: reconciled from the next loop on
+            self._primed_now = False
             return equity
         seen = {int(t) for t, _ in st.cash_tickets}
-        new = sorted((f for f in scan.flows if int(f.ticket) not in seen), key=lambda f: (f.time, f.ticket))
+        unseen = sorted((f for f in scan.flows if int(f.ticket) not in seen), key=lambda f: (f.time, f.ticket))
+        if scan.money is None or scan.deals is None:  # no balance / deal list from this broker: by ticket at once
+            self._apply_flows(unseen, equity)
+            return equity
+        now = time.monotonic()
+        if scan.scan_money is not None and abs(scan.money - scan.scan_money) >= 0.005:
+            return self._pending(now, equity, f"balance + credit {scan.scan_money:.2f} -> {scan.money:.2f} during "
+                                              f"the history read")
+        if st.cash_money_ref is None:  # state of an older version: this read is the reference (no priming again)
+            self._apply_flows(unseen, equity)
+            self._set_ref(scan.money, scan.deals)
+            self._pending_since, self._first_recon = None, False
+            log.info("cash-flow reconciliation reference taken: balance + credit %.2f, newest deal %s", scan.money,
+                     st.cash_deal_ref or "-")
+            return equity
+        return self._reconcile(scan, unseen, equity, now)
+
+    def _reconcile(self, scan, unseen: list, equity: float, now: float) -> float:
+        st = self.state
         money = scan.money
-        if money is not None:  # the broker knows balance + credit and the deal tickets: lag guard
-            now = time.monotonic()
-            expired = self._pending_since is not None and now - self._pending_since > FLOW_PENDING_SECONDS
-            if scan.scan_money is not None and abs(money - scan.scan_money) >= 0.005 and not expired:
-                # a deal was booked between the history read and the account read: the equity may contain a flow
-                # the scan missed -> nothing is applied, decided on the next loop
-                return self._pending(now, money, equity)
-            if self._money_ref is not None and abs(money - self._money_ref) < 0.005:
-                self._pending_since = None
-                return equity  # nothing changed: a cash deal seen before its balance change waits for it
-            fresh = scan.newest_deal is not None and (self._deal_ref is None or scan.newest_deal > self._deal_ref)
-            if not (new or fresh or self._money_ref is None or expired):
-                return self._pending(now, money, equity)
-            if not (new or fresh or self._money_ref is None):
-                self._alert(f"balance / credit changed by {money - self._money_ref:+,.2f} without a matching deal in "
-                            f"the history for {FLOW_PENDING_SECONDS:.0f} s: treated as profit/loss",
-                            key="flow-unexplained", every=600)
-            self._money_ref, self._deal_ref, self._pending_since = money, scan.newest_deal, None
-        if new:
-            self._mark_seen(new)
-            rest = sum(f.amount for f in new)
-            for f in new:  # in time order; E_i = equity without the flows booked after this one
-                rest -= f.amount
-                msg = self.risk.apply_cash_flow(f.amount, equity - rest)
-                self._alert(f"{msg} [deal {f.ticket}{' ' + f.comment if f.comment else ''}]")
+        self._prune_absorbed()
+        delta = money - st.cash_money_ref
+        total = sum(d.effect for d in scan.deals)
+        tol = max(0.02, 1e-6 * abs(money))
+        late: list = []
+        if abs(delta - total) > tol:
+            late = self._match_absorbed(unseen, delta - total, tol)
+            if late is None:
+                window = self._flow_window()
+                if self._pending_since is None or now - self._pending_since <= window:
+                    return self._pending(now, equity, f"balance + credit {st.cash_money_ref:.2f} -> {money:.2f}, "
+                                                      f"the {len(scan.deals)} new deals explain {total:+.2f}")
+                rest = delta - total
+                self._alert(f"balance / credit changed by {rest:+,.2f} without a matching deal in the history for "
+                            f"{window:.0f} s: treated as profit/loss")
+                self._absorb(rest)
+                late = []
+        if late:
+            for f, rec in late:
+                when = datetime.fromtimestamp(rec[1], timezone.utc)
+                self._alert(f"late cash deal {f.amount:+,.2f} [deal {f.ticket}{' ' + f.comment if f.comment else ''}]: "
+                            f"already counted as profit/loss on {when:%Y-%m-%d %H:%M} UTC, not applied again")
+            st.cash_absorbed = [r for r in st.cash_absorbed if not any(r is rec for _, rec in late)]
+            self._mark_seen([f for f, _ in late])
+        done = {int(f.ticket) for f, _ in late}
+        self._apply_flows([f for f in unseen if int(f.ticket) not in done], equity)
+        self._set_ref(money, scan.deals)
+        self._pending_since, self._first_recon = None, False
         return equity
 
-    def _pending(self, now: float, money: float, equity: float) -> float:
+    def _apply_flows(self, flows: list, equity: float) -> None:
+        """Apply cash flows (in time order) to the equity baselines: E_i = equity without the flows booked after
+        this one, so the product of the k_i equals E / (E - sum F)."""
+        if not flows:
+            return
+        self._mark_seen(flows)
+        rest = sum(f.amount for f in flows)
+        for f in flows:
+            rest -= f.amount
+            msg = self.risk.apply_cash_flow(f.amount, equity - rest)
+            self._alert(f"{msg} [deal {f.ticket}{' ' + f.comment if f.comment else ''}]")
+
+    def _match_absorbed(self, cash: list, diff: float, tol: float) -> list | None:
+        """Late deals: the smallest set of new cash deals (earliest first) that each match a different absorbed
+        record and without which the remaining deals explain the change (diff + their sum ~ 0). None = no such set."""
+        recs = list(self.state.cash_absorbed)
+        cands = [f for f in cash if any(abs(r[0] - f.amount) <= tol for r in recs)][:12]
+        for n in range(1, len(cands) + 1):
+            for combo in itertools.combinations(cands, n):
+                if abs(diff + sum(f.amount for f in combo)) > tol:
+                    continue
+                used: list = []
+                for f in combo:
+                    r = next((r for r in recs if abs(r[0] - f.amount) <= tol and not any(r is u for u in used)), None)
+                    if r is None:
+                        break
+                    used.append(r)
+                if len(used) == n:
+                    return list(zip(combo, used))
+        return None
+
+    def _absorb(self, amount: float) -> None:
+        st = self.state
+        st.cash_absorbed = (st.cash_absorbed + [[round(float(amount), 2), _epoch(self._utcnow())]])[-ABSORBED_MAX:]
+
+    def _prune_absorbed(self) -> None:
+        st = self.state
+        if st.cash_absorbed:
+            keep = [r for r in st.cash_absorbed if r[1] >= _epoch(self._utcnow()) - ABSORBED_DAYS * 86400]
+            if keep != st.cash_absorbed:
+                st.cash_absorbed = keep
+
+    def _set_ref(self, money: float, deals: list) -> None:
+        st = self.state
+        st.cash_money_ref = float(money)
+        if deals:
+            d = max(deals, key=lambda d: d.ticket)
+            st.cash_deal_ref, st.cash_deal_ref_time = int(d.ticket), _epoch(d.time)
+        elif not st.cash_deal_ref_time:  # no deal at all yet: later deals are newer than this reconciliation
+            now = self.broker.server_time()
+            st.cash_deal_ref_time = _epoch(now) if now is not None else 0.0
+
+    def _ref_time(self) -> datetime | None:
+        """Server time of the reference deal (the broker reads the history from a day before it); None = no
+        reference yet (the broker reads the last 30 days)."""
+        st = self.state
+        if st.cash_money_ref is None or not st.cash_deal_ref_time:
+            return None
+        return datetime.fromtimestamp(st.cash_deal_ref_time, timezone.utc).replace(tzinfo=None)
+
+    def _flow_window(self) -> float:
+        return FLOW_FIRST_SECONDS if self._first_recon else FLOW_PENDING_SECONDS
+
+    def _history_unreadable(self) -> float:
+        """The deal history cannot be read: no deal is visible, so a changed balance + credit is pending with the
+        usual timer (no peak raise, no stop decision on an unexplained change; closes and stops in force run). On
+        expiry the change counts as profit/loss and is kept as an absorbed record (its deal, once readable, is then
+        a late deal: not applied again). Unchanged: nothing to decide (new entries wait via _cash_problem)."""
+        equity = self.broker.account_equity()
+        st = self.state
+        money = self.broker.account_money()
+        if money is None or st.cash_money_ref is None or not st.cash_init:
+            return equity
+        if abs(money - st.cash_money_ref) <= max(0.02, 1e-6 * abs(money)):
+            self._pending_since = None
+            return equity
+        now, window = time.monotonic(), self._flow_window()
+        if self._pending_since is None or now - self._pending_since <= window:
+            return self._pending(now, equity, f"balance + credit {st.cash_money_ref:.2f} -> {money:.2f} while the "
+                                              f"deal history cannot be read")
+        rest = money - st.cash_money_ref
+        self._alert(f"balance / credit changed by {rest:+,.2f} without a matching deal in the history for "
+                    f"{window:.0f} s (the deal history cannot be read): treated as profit/loss")
+        self._absorb(rest)
+        st.cash_money_ref = float(money)
+        self._pending_since, self._first_recon = None, False
+        return equity
+
+    def _pending(self, now: float, equity: float, why: str) -> float:
         if self._pending_since is None:
             self._pending_since = now
-            log.warning("balance + credit %s -> %.2f but no new deal in the history yet: cash flow pending (no peak "
-                        "raise, no stop decision, no entry; at most %.0f s)",
-                        "?" if self._money_ref is None else f"{self._money_ref:.2f}", money, FLOW_PENDING_SECONDS)
+            log.warning("cash flow pending: %s, not explained by the deal history yet (no peak raise, no stop "
+                        "decision, no entry; at most %.0f s)", why, self._flow_window())
         self._flow_pending = True
         return equity
 
     def _mark_seen(self, flows: list) -> None:
-        """Remember cash deal tickets (60 days: the broker scan looks back 30)."""
+        """Remember cash deal tickets (60 days)."""
         st = self.state
         seen = {int(t) for t, _ in st.cash_tickets}
         add = []
@@ -682,8 +811,10 @@ class LiveEngine:
         """First run (no cash-flow cursor yet): the deals already in the history are history, not new flows - but
         they are marked as seen only once the history looks complete (shared rule with the EA): the whole history
         adds up to the balance (credit deals to the credit), or the set of cash deals stayed the same for
-        PRIME_STABLE_SECONDS. After PRIME_MAX_SECONDS it is primed anyway, with a warning. Until then new entries
-        wait (closes, time stops and the guards keep working). A broker that cannot check it primes at once."""
+        PRIME_STABLE_SECONDS - never an EMPTY set while balance or credit is not zero (that cannot be the whole
+        history). After PRIME_MAX_SECONDS it is primed anyway. Priming without matching sums is always notified.
+        Until then new entries wait (closes, time stops and the guards keep working). A broker that cannot check it
+        primes at once. The priming read is the reconciliation reference (balance + credit, newest deal)."""
         now = time.monotonic()
         if self._prime_start is None:
             self._prime_start = now
@@ -691,7 +822,8 @@ class LiveEngine:
         tickets = frozenset(int(f.ticket) for f in hc.flows)
         if self._prime_ref is None or self._prime_ref[0] != tickets:
             self._prime_ref = (tickets, now)
-        stable = now - self._prime_ref[1] >= PRIME_STABLE_SECONDS
+        empty = not tickets and hc.money is not None and abs(hc.money) >= 0.005
+        stable = not empty and now - self._prime_ref[1] >= PRIME_STABLE_SECONDS
         late = now - self._prime_start >= PRIME_MAX_SECONDS
         if hc.complete is False and not stable and not late:
             if not self._prime_note:
@@ -706,11 +838,23 @@ class LiveEngine:
             hc.complete, "the cash deals were unchanged for 60 s" if stable else "NOT confirmed")
         log.info("cash-flow tracking started: %d existing balance/credit/bonus deals marked as seen, not applied (%s)",
                  len(tickets), how)
-        if hc.complete is False and not stable:
-            self._alert(f"WARNING: the deal history was not confirmed complete within {PRIME_MAX_SECONDS / 60:.0f} min "
-                        f"({hc.detail}). Its {len(tickets)} cash deals are marked as seen anyway: a deposit or "
-                        f"withdrawal that reaches the history later is treated as a new cash flow", level=logging.ERROR)
-        self._money_ref = self._deal_ref = None  # the check of this loop takes balance + credit as the reference
+        if hc.complete is False:  # notified on both paths (the deals do not add up to the balance)
+            when = (f"(its cash deals were unchanged for {PRIME_STABLE_SECONDS:.0f} s)" if stable else
+                    f"within {PRIME_MAX_SECONDS / 60:.0f} min")
+            self._alert(f"WARNING: the deal history was not confirmed complete {when} ({hc.detail}). Its "
+                        f"{len(tickets)} cash deals are marked as seen anyway: a deposit or withdrawal that reaches the "
+                        f"history later is treated as a new cash flow - check the account history", level=logging.ERROR)
+        if hc.money is not None:  # the reconciliation reference: this priming read
+            st.cash_money_ref = float(hc.money)
+            st.cash_deal_ref = int(hc.newest_deal or 0)
+            srv = self.broker.server_time()
+            st.cash_deal_ref_time = (_epoch(hc.newest_time) if hc.newest_time is not None else
+                                     _epoch(srv) if srv is not None else 0.0)
+        else:
+            st.cash_money_ref = None
+        st.cash_absorbed = []
+        self._primed_now = True
+        self._pending_since, self._first_recon = None, False
         self._prime_start = self._prime_ref = None
         return True
 

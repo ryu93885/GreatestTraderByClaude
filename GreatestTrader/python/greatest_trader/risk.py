@@ -68,6 +68,15 @@ class RiskState:
     # `reset-halt` request ("clear" | "rebase"), applied by the engine at its next start AFTER the first cash-flow
     # check (a deposit made while it was stopped must reach the old peak before the peak is rebased)
     reset_request: str = ""
+    # cash-flow reconciliation reference (persisted, so that a restart reconciles like any other loop):
+    # balance + credit at the last reconciliation (None = not taken yet, e.g. a state of an older version), the
+    # newest deal (any type) included in it and its server epoch (or the reconciliation's when there was no deal),
+    # and the balance changes absorbed as profit/loss without a matching deal: [[amount, UTC epoch], ...] (max 5,
+    # 7 days) - a cash deal of that amount that shows up later is marked seen without being applied again
+    cash_money_ref: float | None = None
+    cash_deal_ref: int = 0
+    cash_deal_ref_time: float = 0.0
+    cash_absorbed: list = field(default_factory=list)
 
     # ------------------------------------------------------------- persistence
     @classmethod

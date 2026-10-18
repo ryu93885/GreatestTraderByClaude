@@ -1,5 +1,6 @@
 """Cash flows with the real MT5 adapter and the fake MetaTrader5 module (shared rule with the EA, spec section 5):
-the lag guard (a balance change without a deal that explains it is 'pending' for at most 60 s), k computed from an
+the lag guard (a balance change that the amounts of the new deals do not explain is 'pending' for at most 60 s;
+see also test_cash_reconcile_mt5.py), k computed from an
 equity read after the deal scan, the first-run priming of the cash-flow cursor and the isolation of a failing deal
 history."""
 import calendar
@@ -173,7 +174,7 @@ def test_cash_deal_seen_before_its_balance_change_waits_for_it(monkeypatch, tmp_
     eng = make(monkeypatch, tmp_path)
     eng.step()
     deal(-400.0, "withdrawal")
-    clock.t += 700  # the broker's periodic re-scan sees the deal
+    clock.t += 700  # (the history is read in every loop)
     advance(clock)
     eng.step()
     assert eng.state.peak_equity == 10_000 and eng.state.cash_flow_total == 0
@@ -199,7 +200,7 @@ def test_flow_booked_while_the_history_is_read_is_decided_next_loop(monkeypatch,
         return out
 
     monkeypatch.setattr(fake_mt5, "history_deals_get", racing)
-    clock.t += 700  # periodic re-scan
+    clock.t += 700
     advance(clock)
     eng.step()
     assert eng.state.peak_equity == 10_000 and not eng.state.halted and eng.entry_block().startswith("balance")
@@ -276,13 +277,14 @@ def test_failing_deal_history_never_stops_time_stops(monkeypatch, tmp_path, cloc
     real = fake_mt5.history_deals_get
     monkeypatch.setattr(fake_mt5, "history_deals_get", lambda *a, **k: None)
     monkeypatch.setattr(fake_mt5, "last_error", lambda: (-10005, "IPC timeout"))
-    book(-1)  # forces a history read
+    book(-1)  # an account fee: with the history unreadable the change is pending (D7), no stop decision on it
     advance(clock)
     eng.step()
     assert S.positions == [] and eng.entry_block().startswith("deal history cannot be read")
-    assert sent(eng, "cash-flow check failed")
+    assert sent(eng, "cash-flow check failed") and eng._flow_pending
     monkeypatch.setattr(fake_mt5, "history_deals_get", real)
     monkeypatch.setattr(fake_mt5, "last_error", lambda: (1, "Success"))
+    deal(-1.0, "account fee", type_=4)  # DEAL_TYPE_CHARGE: profit/loss, not a cash flow
     advance(clock)
     eng.step()
-    assert eng.entry_block() == ""
+    assert eng.entry_block() == "" and eng.state.cash_flow_total == 0  # the fee and the close deal explain it
