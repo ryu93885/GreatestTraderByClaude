@@ -22,7 +22,9 @@ broker:
   server_time_mode: auto     # auto=稼働中に最新ティックから常時計測（起動後に確認できるまで新規エントリーしない。
                              #      週末の再起動でも古いティックで判定しない。変化は3回連続で確認してから採用し通知）
                              # ny7=GMT+2(冬)/+3(夏) / fixed=固定オフセット（どちらも常時検証し、3回連続で食い違うと新規停止＋通知）
-  server_gmt_offset: 2.0     # fixed のときのサーバー時間の GMT オフセット(時間)
+                             # Python バックテスト (5_backtest.bat) は auto を NY+7 (ny7) とみなします（警告を表示）。
+                             # 1_check.bat で別のオフセットが出るブローカーのデータなら fixed + server_gmt_offset を設定
+  server_gmt_offset: 2.0     # fixed のときのサーバー時間の GMT オフセット(時間、数値 -12〜14。例 2 / 2.0 / 0)
   commission_per_lot: 0.0    # 1ロット往復の手数料(口座通貨)。ECN口座は必ず設定 例: 7.0(USD口座) / 1000(JPY口座)
   deviation_points: 20       # 成行注文の許容スリッページ(ポイント)
 
@@ -77,6 +79,8 @@ night_reversion:
   enabled: true
   symbols: [EURJPY, GBPJPY, USDJPY, GBPUSD, EURGBP, USDCHF, EURUSD,
             GBPCAD, EURCAD, AUDCAD, GBPCHF, EURAUD, CHFJPY, GBPAUD]
+                             # 必ず [ ] のリストで書く (1ペアだけでも [GBPCAD])。名前は 6 文字の基本名
+                             # (接尾辞は broker.symbol_suffix / symbol_map で指定)
   bb_period: 15              # ボリンジャーバンド期間 (M15)
   bb_deviation: 1.8          # ボリンジャーバンド σ
   atr_period: 14             # ATR 期間 (M15)

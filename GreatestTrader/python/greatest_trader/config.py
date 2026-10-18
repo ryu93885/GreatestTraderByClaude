@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -262,17 +263,41 @@ class Config:
         b.account_currency = b.account_currency.strip().upper()
         if bool(r.blackout_start) != bool(r.blackout_end):
             raise ValueError("risk.blackout_start and blackout_end must both be set or both empty")
-        if self.broker.server_time_mode not in ("auto", "ny7", "fixed"):
+        bk = self.broker
+        if bk.server_time_mode not in ("auto", "ny7", "fixed"):
             raise ValueError("broker.server_time_mode must be auto, ny7 or fixed")
+        if not _is_num(bk.server_gmt_offset) or not -12 <= bk.server_gmt_offset <= 14:
+            raise ValueError(f"broker.server_gmt_offset must be a number of hours between -12 and 14, e.g. 2 or 2.0 "
+                             f"(got {bk.server_gmt_offset!r})")
+        if bk.symbol_suffix is None:  # an empty `symbol_suffix:` in YAML
+            bk.symbol_suffix = ""
+        if not isinstance(bk.symbol_suffix, str):
+            raise ValueError(f"broker.symbol_suffix must be text such as \".raw\" (got {bk.symbol_suffix!r})")
+        if bk.symbol_map is None:  # an empty `symbol_map:` in YAML
+            bk.symbol_map = {}
+        if not isinstance(bk.symbol_map, dict) or not all(isinstance(k, str) and isinstance(v, str) and v.strip()
+                                                          for k, v in bk.symbol_map.items()):
+            raise ValueError(f"broker.symbol_map must be a mapping such as {{EURUSD: EURUSDmicro}} "
+                             f"(got {bk.symbol_map!r})")
+        # keys are pair names like the symbols lists below (looked up with the same normalized name)
+        bk.symbol_map = {_symbol(k, "broker.symbol_map"): v.strip() for k, v in bk.symbol_map.items()}
         nr = self.night_reversion
+        if not isinstance(nr.symbols, (list, tuple)):  # `symbols: GBPCAD` would be split into G, B, P, ...
+            raise ValueError(f"night_reversion.symbols must be a list such as [GBPCAD, EURCAD] (one pair: [GBPCAD]), "
+                             f"got {nr.symbols!r}")
+        nr.symbols = [_symbol(s, "night_reversion.symbols") for s in nr.symbols]
+        if nr.enabled and not nr.symbols:
+            raise ValueError("night_reversion.symbols is empty: list at least one pair, or set "
+                             "night_reversion.enabled: false")
         if nr.bb_period < 2 or nr.atr_period < 2:
             raise ValueError("indicator periods must be >= 2")
-        if any(h < 0 or h > 23 for h in nr.entry_hours):
-            raise ValueError("night_reversion.entry_hours must be 0..23")
+        nr.entry_hours = _int_list(nr.entry_hours, "night_reversion.entry_hours", 0, 23)
         if not (_is_num(nr.max_band_z) and _is_num(nr.max_bar_range_atr)) or nr.max_band_z < 0 \
                 or nr.max_bar_range_atr < 0:
             raise ValueError("night_reversion.max_band_z / max_bar_range_atr must be >= 0 (0 = off)")
         es = self.euro_session
+        es.symbol = _symbol(es.symbol, "euro_session.symbol")
+        es.weekdays = _int_list(es.weekdays, "euro_session.weekdays", 0, 6)
         if not (0 <= es.entry_utc_hour < es.exit_utc_hour <= 23):
             raise ValueError("euro_session: need 0 <= entry_utc_hour < exit_utc_hour <= 23")
         if es.direction not in (-1, 1):
@@ -281,6 +306,25 @@ class Config:
 
 def _is_num(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+_SYMBOL = re.compile(r"[A-Za-z]{6}[^\s,;]*")
+
+
+def _symbol(v: Any, key: str) -> str:
+    """A pair's base name: text that starts with the 6 letters of the two currencies (EURUSD). The 6 letters are
+    upper-cased (the broker's name comes from broker.symbol_suffix / symbol_map)."""
+    if not isinstance(v, str) or not _SYMBOL.fullmatch(v.strip()):
+        raise ValueError(f"{key}: each pair must be a name of 6 letters such as EURUSD (got {v!r})")
+    v = v.strip()
+    return v[:6].upper() + v[6:]
+
+
+def _int_list(v: Any, key: str, lo: int, hi: int) -> list[int]:
+    if not isinstance(v, (list, tuple)) or not all(isinstance(x, int) and not isinstance(x, bool) and lo <= x <= hi
+                                                   for x in v):
+        raise ValueError(f"{key} must be a list of whole numbers {lo}..{hi} such as [{lo}, {lo + 1}] (got {v!r})")
+    return list(v)
 
 
 def _valid_mmdd(v: str) -> bool:

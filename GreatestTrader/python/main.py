@@ -7,12 +7,15 @@ commands:
   python main.py backtest  -c config/config.yaml   # Python backtest on CSV data in backtest.data_dir
   python main.py report    -c config/config.yaml [--from 2026-01]   # live monthly returns / P/L / R monitor
   python main.py reset-halt [--rebase-peak]        # clear a drawdown halt (stop the engine first; the engine
-                                                   # applies it at its next start, after the cash-flow check)
+                                                   # applies it at its next start, after the cash-flow check);
+                                                   # --rebase-peak (7_reset_halt.bat) also resets the peak to the
+                                                   # current equity: needed while DD >= max_drawdown_halt
   python main.py backtest --preset safe2           # any command: use a bundled risk preset instead of `preset:`
 
 exit codes:
   0   done (every command except `live`)
-  1   failed; `live`: an unexpected error at start-up (3_run_live.bat restarts after 30 s)
+  1   failed; `live`: an unexpected error at start-up, or config.yaml could not be read for a moment (held by
+      another program) (3_run_live.bat restarts after 30 s)
   3   `live`: MT5 failing for 30 minutes (3_run_live.bat restarts the process)
   10  stopped on purpose or by a problem a restart cannot fix: Ctrl+C, another instance running, netting
       account, an error in config.yaml, the MetaTrader5 package missing (3_run_live.bat does NOT restart)
@@ -22,6 +25,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -109,7 +113,10 @@ def cmd_live(cfg) -> int:
         return EXIT_STOP  # the other instance keeps running: this wrapper must not loop
     notifier = Notifier(cfg.notify)
     try:
-        return LiveEngine(cfg, MT5Broker(cfg), notifier).run_forever()
+        engine = LiveEngine(cfg, MT5Broker(cfg), notifier)
+        if getattr(engine.journal, "alert", None) is None:  # 'journal file locked (open in Excel?) - N rows
+            engine.journal.alert = notifier.send           # pending' (the journal rate-limits it: 1 per hour)
+        return engine.run_forever()
     except FatalError as exc:
         log.critical("%s", exc)
         print(f"\nFATAL: {exc}")
@@ -133,7 +140,7 @@ def cmd_download(cfg, years: float) -> int:
 
 
 def cmd_backtest(cfg, out: str | None) -> int:
-    from greatest_trader.backtest import Backtester, conversion_pairs, load_data_dir
+    from greatest_trader.backtest import Backtester, clock_note, conversion_pairs, load_data_dir
     from greatest_trader.report import annual_table, format_stats, save_report, yearly_table
 
     syms = list(dict.fromkeys(cfg.night_reversion.symbols + [cfg.euro_session.symbol]))
@@ -149,7 +156,9 @@ def cmd_backtest(cfg, out: str | None) -> int:
     if len(res.trades) == 0:
         print("no trades")
         return 1
+    clock, warning = clock_note(cfg)
     print(f"preset: {cfg.preset_label()}")
+    print(f"server clock: {clock}")
     r = cfg.risk
     print(f"capacity caps: max_lots_per_order={r.max_lots_per_order:g} max_risk_amount={r.max_risk_amount:g} "
           f"({cfg.backtest.account_currency}); capped trades: {int((res.trades.lots < res.trades.lots_uncapped - 1e-9).sum())}")
@@ -158,9 +167,16 @@ def cmd_backtest(cfg, out: str | None) -> int:
     print(annual_table(res).to_string())
     print("\n[月利（%）]")
     print(yearly_table(res).to_string())
-    path = save_report(res, out or cfg.backtest.output_dir,
-                       title=f"GreatestTrader {__version__} backtest (preset: {cfg.preset_label()})")
+    title = f"GreatestTrader {__version__} backtest (preset: {cfg.preset_label()})"
+    path = save_report(res, out or cfg.backtest.output_dir, title=title)
+    summary = Path(path) / "summary.txt"  # the clock it assumed goes right under the title
+    head = f"# {title}\n\n"
+    text = summary.read_text(encoding="utf-8")
+    note = f"server clock: {clock}\n" + (f"\n{warning}\n" if warning else "") + "\n"
+    summary.write_text(head + note + text[len(head):] if text.startswith(head) else note + text, encoding="utf-8")
     print(f"\nreport saved to {path}")
+    if warning:  # last, so that it is not scrolled away by the tables
+        print(f"\n{warning}")
     return 0
 
 
@@ -227,23 +243,43 @@ def cmd_reset_halt(cfg, rebase_peak: bool) -> int:
     return 0
 
 
+CONFIG_READ_RETRIES = 5  # a config file that cannot be read (but exists) is read again this many times ...
+CONFIG_READ_PAUSE = 0.2  # ... this many seconds apart, like RiskState.load does for a locked state file
+
+
 def _load(args):
-    """Config with paths relative to this folder (python/). Raises ConfigError for anything wrong in it."""
+    """Config with paths relative to this folder (python/). Raises ConfigError for anything wrong in it (exit 10:
+    a restart cannot fix it): file or folder not found, not UTF-8, invalid YAML, unknown keys, invalid values.
+    Any other OSError (PermissionError while a backup / sync tool or an editor holds the file, a network share
+    that does not answer) is retried and, when it persists, raised as it is: exit 1, 3_run_live.bat restarts."""
     import yaml
 
     from greatest_trader.config import ConfigError
 
-    try:
-        cfg = load_config(args.config, preset=args.preset)
-    except ConfigError:
-        raise
-    except FileNotFoundError as exc:
-        raise ConfigError(f"config file not found: {exc.filename or args.config}") from None
-    except yaml.YAMLError as exc:
-        raise ConfigError(f"{args.config} is not valid YAML (indent with spaces, not tabs): {exc}") from None
-    except (KeyError, ValueError, TypeError, AttributeError, OSError) as exc:
-        text = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
-        raise ConfigError(f"{args.config}: {text}") from None
+    for attempt in range(CONFIG_READ_RETRIES + 1):
+        try:
+            cfg = load_config(args.config, preset=args.preset)
+            break
+        except ConfigError:
+            raise
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            raise ConfigError(f"config file not found: {exc.filename or args.config}") from None
+        except IsADirectoryError as exc:
+            raise ConfigError(f"{exc.filename or args.config} is a folder, not a config file") from None
+        except UnicodeDecodeError as exc:
+            raise ConfigError(f"{args.config} is not UTF-8 text (save it as UTF-8): {exc}") from None
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"{args.config} is not valid YAML (indent with spaces, not tabs): {exc}") from None
+        except OSError as exc:
+            name = exc.filename or args.config
+            if Path(name).is_dir():  # Windows raises PermissionError (not IsADirectoryError) for a folder
+                raise ConfigError(f"{name} is a folder, not a config file") from None
+            if attempt >= CONFIG_READ_RETRIES:
+                raise  # still unreadable: not a configuration error, a restart may fix it (exit 1)
+            time.sleep(CONFIG_READ_PAUSE)
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:
+            text = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
+            raise ConfigError(f"{args.config}: {text}") from None
     for obj, attr in ((cfg.engine, "state_file"), (cfg.engine, "log_dir"), (cfg.engine, "journal_dir"),
                       (cfg.backtest, "data_dir"), (cfg.backtest, "output_dir")):
         p = Path(getattr(obj, attr))
@@ -291,6 +327,10 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:  # a restart cannot fix it: exit 10 stops 3_run_live.bat
         print(f"\nCONFIG ERROR: {exc}\nFix config.yaml, then start again (exit code {EXIT_STOP}: not restarted).")
         return EXIT_STOP
+    except OSError as exc:  # still unreadable after the retries (held by another program?): a restart may fix it
+        print(f"\nERROR: cannot read the config file {args.config}: {exc}\nIt may be held by another program "
+              f"(backup / sync tool, editor). Exit code 1: 3_run_live.bat restarts after 30 s.")
+        return 1
     if args.live_orders:
         cfg.engine.dry_run = False
     if args.dry_run:

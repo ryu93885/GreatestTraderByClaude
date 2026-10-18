@@ -279,7 +279,9 @@ class _FxConverter:
     AUD = EURUSD / EURAUD, ...). With the 14 default NR symbols every currency is covered for a USD or a
     JPY account. A rate older than 7 days counts as missing and the next candidate is tried; a direct pair
     older than 1 day (a data gap, or its data ended) gives way to the route through USD and is used again only
-    where that route has no price either."""
+    where that route has no price either. The same order holds for the USD leg itself (usd()): the direct USD
+    pair when it is at most 1 day old, else a cross, else the direct USD pair up to 7 days old - so a stale
+    direct pair also gives way for a USD account (where the account pair IS the USD leg)."""
 
     def __init__(self, data: dict[str, pd.DataFrame]):
         self.px = {}
@@ -298,19 +300,20 @@ class _FxConverter:
         out[stale] = np.nan
         return out
 
-    def _direct(self, ccy: str, t: np.ndarray) -> np.ndarray | None:
+    def _direct(self, ccy: str, t: np.ndarray, limit: np.timedelta64 = _STALE) -> np.ndarray | None:
         if ccy == "USD":
             return np.ones(len(t))
         if ccy + "USD" in self.px:
-            return self._asof(ccy + "USD", t)
+            return self._asof(ccy + "USD", t, limit)
         if "USD" + ccy in self.px:
-            return 1.0 / self._asof("USD" + ccy, t)
+            return 1.0 / self._asof("USD" + ccy, t, limit)
         return None
 
     def usd(self, ccy: str, t: np.ndarray) -> np.ndarray:
-        """Value of 1 unit of ccy in USD (NaN where no candidate is available)."""
-        out = self._direct(ccy, t)
-        out = np.full(len(t), np.nan) if out is None else out
+        """Value of 1 unit of ccy in USD (NaN where no candidate is available): the direct USD pair when it is at
+        most 1 day old, else a cross whose other leg has a USD pair, else the direct USD pair up to 7 days old."""
+        direct = self._direct(ccy, t, _STALE_DIRECT)
+        out = np.full(len(t), np.nan) if direct is None else direct
         for sym in sorted(self.px):
             if not np.isnan(out).any():
                 break
@@ -324,6 +327,8 @@ class _FxConverter:
             p = self._asof(sym, t)
             cand = o * p if b == ccy else o / p
             out = np.where(np.isfinite(out), out, cand)
+        if direct is not None and np.isnan(out).any():  # no cross either: the direct USD pair up to 7 days old
+            out = np.where(np.isfinite(out), out, self._direct(ccy, t))
         return out
 
     def rate(self, ccy: str, acct: str, t: np.ndarray) -> np.ndarray:
@@ -345,6 +350,26 @@ class _FxConverter:
         if direct is not None and np.isnan(out).any():  # nothing fresher: the direct pair up to 7 days old
             out = np.where(np.isfinite(out), out, direct(_STALE))
         return out
+
+
+def clock_note(cfg: Config) -> tuple[str, str]:
+    """(server clock the backtest uses, warning or ''). The bars are stored in broker server time and the backtest
+    cannot measure the clock as live trading does: `auto` (the shipped default) is read as NY+7. On data from a
+    broker with another server time every NR entry hour, the ES 07:00 UTC entry and every day / month boundary
+    would be shifted without a word, so `auto` always prints (and writes into summary.txt) this warning."""
+    b = cfg.broker
+    if b.server_time_mode == "fixed":
+        return f"fixed GMT{b.server_gmt_offset:+g}", ""
+    if b.server_time_mode == "ny7":
+        return "NY+7 (GMT+2 winter / GMT+3 US summer time)", ""
+    return ("NY+7 (GMT+2 winter / GMT+3 US summer time), assumed for server_time_mode: auto",
+            "WARNING: broker.server_time_mode is auto: the backtest assumes NY+7 server time (GMT+2 winter / GMT+3 "
+            "US summer time, the usual MT5 clock). If 1_check.bat shows another offset for your broker, the entry "
+            "hours, the ES 07:00 UTC entry and the day / month boundaries of this backtest are shifted: set "
+            "broker.server_time_mode: fixed and broker.server_gmt_offset to that offset and run the backtest again.\n"
+            "注意: server_time_mode が auto のため、バックテストはサーバー時間を NY+7 (冬 GMT+2 / 夏 GMT+3) とみなして"
+            "います。1_check.bat で別のオフセットが表示されるブローカーのデータでは結果がずれるので、"
+            "broker.server_time_mode: fixed と server_gmt_offset を設定してから再実行してください。")
 
 
 # ---------------------------------------------------------------- engine
