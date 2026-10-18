@@ -526,8 +526,8 @@ def test_trade_journal_open_and_close_with_r(tmp_path):
     o, c = opens.iloc[0], closes.iloc[0]
     assert o.ticket == c.ticket and o.base_risk == pytest.approx(0.01) and o.risk_amount > 0
     assert o.risk_pct == pytest.approx(o.risk_amount / 1_000_000)
-    assert c.R == pytest.approx(c.pnl / o.risk_amount) and c.close_reason in ("TP", "SL", "time stop",
-                                                                               "price already beyond moving average")
+    assert c.R == pytest.approx(c.pnl / o.risk_amount) and c.close_reason in (
+        "TP", "SL", "time stop", "price already beyond moving average", "price at moving average")
     closes_df = TradeJournal(tmp_path / "journal").closed_trades()
     assert len(closes_df) == len(closes)
 
@@ -603,13 +603,16 @@ def test_history_gap_check(tmp_path):
     assert not eng._gap_free(df, len(idx) + 1, M15)  # not enough history
 
 
-def test_signal_with_a_history_gap_is_not_traded(tmp_path, caplog):
+def test_signal_with_a_history_gap_is_traded_and_the_gap_logged(tmp_path, caplog):
+    """D12 (parity#4): a missing weekday bar in the lookback is only logged (once per bar); the signal is taken over
+    the bars as they are, as the EA and the backtester do."""
     data = eurjpy(spike_at=SPIKE)
     data["EURJPY"] = data["EURJPY"].drop(pd.Timestamp(SPIKE) - pd.Timedelta(minutes=30))
     eng, br = make(cfg_for(tmp_path), data, equity=1_000_000)
     step_until(eng, br, datetime(2021, 3, 2, 22, 0), datetime(2021, 3, 3, 1, 0))
-    assert not [x for x in br.log if x[0] == "open"]
-    assert any("history gap" in r.message for r in caplog.records)
+    assert [x for x in br.log if x[0] == "open"]
+    gaps = [r.message for r in caplog.records if "history gap" in r.message]
+    assert gaps and len(gaps) == len(set(gaps))  # once per bar
 
 
 # ------------------------------------------------------------------ capacity caps live

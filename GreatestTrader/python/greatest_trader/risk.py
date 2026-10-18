@@ -8,7 +8,8 @@
 * Drawdown scaling: risk x max(floor, 1 - DD / dd_scale_full)   (DD measured from equity peak).
 * Daily / monthly loss limits: no new entries for the rest of the market day / month.
 * Daily / monthly hard stops: close everything and stay flat for the rest of the day / month.
-* Max drawdown halt: no new entries at all once DD >= max_drawdown_halt (reset: `python main.py reset-halt`).
+* Max drawdown halt: no new entries at all once DD >= max_drawdown_halt (resume: `python main.py reset-halt
+  --rebase-peak` = 7_reset_halt.bat; a plain clear is halted again at once while DD is still >= the level).
 * Position limits: total open positions, positions per currency, one position per symbol,
   same-direction positions per currency and total open risk.
 * Year-end blackout: no new entries between blackout_start and blackout_end (market dates).
@@ -67,6 +68,15 @@ class RiskState:
     # `reset-halt` request ("clear" | "rebase"), applied by the engine at its next start AFTER the first cash-flow
     # check (a deposit made while it was stopped must reach the old peak before the peak is rebased)
     reset_request: str = ""
+    # cash-flow reconciliation reference (persisted, so that a restart reconciles like any other loop):
+    # balance + credit at the last reconciliation (None = not taken yet, e.g. a state of an older version), the
+    # newest deal (any type) included in it and its server epoch (or the reconciliation's when there was no deal),
+    # and the balance changes absorbed as profit/loss without a matching deal: [[amount, UTC epoch], ...] (max 5,
+    # 7 days) - a cash deal of that amount that shows up later is marked seen without being applied again
+    cash_money_ref: float | None = None
+    cash_deal_ref: int = 0
+    cash_deal_ref_time: float = 0.0
+    cash_absorbed: list = field(default_factory=list)
 
     # ------------------------------------------------------------- persistence
     @classmethod
@@ -133,7 +143,8 @@ class RiskState:
         st.restored_from = ""
         if errors:
             st.halted = True
-            st.halt_reason = "state file corrupt and no readable backup: check the account, then run reset-halt"
+            st.halt_reason = ("state file corrupt and no readable backup: check the account, then run 7_reset_halt.bat "
+                              "(reset-halt --rebase-peak)")
             st.restored_from = "none (" + "; ".join(errors) + ")"
             log.error("no readable state file (%s): starting HALTED", "; ".join(errors))
         return st

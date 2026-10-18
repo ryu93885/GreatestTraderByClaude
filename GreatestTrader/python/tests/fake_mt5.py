@@ -4,6 +4,7 @@ Models the IPC link of the real package: after the terminal restarts (terminal_r
 None and last_error() is (-10004, 'No IPC connection') until initialize() is called again. Tests patch it in
 with `monkeypatch.setattr(mt5_broker, "mt5", fake_mt5)` and reset it with reset().
 """
+import calendar
 from types import SimpleNamespace as NS
 
 __version__ = "5.0.fake"
@@ -26,7 +27,7 @@ def reset():
         positions=[], deals=[], ticket=1000, deal_ticket=9000, selected=set(), specs={}, ticks={}, rates={},
         equity=10000.0, balance=10000.0, credit=0.0, login=111, server="Demo", margin_mode=2,
         order_send_none_once=False, order_send_none_no_exec=False, positions_get_none=False, init_count=0,
-        retcodes=[])
+        retcodes=[], account_trade_allowed=True, trade_expert=True, filter_deal_times=False)
 
 
 reset()
@@ -68,7 +69,8 @@ def account_info():
     if not _ok():
         return None
     return NS(login=S.login, server=S.server, currency="USD", leverage=100, equity=S.equity, balance=S.balance,
-              credit=S.credit, margin_free=S.equity, margin_mode=S.margin_mode)
+              credit=S.credit, margin_free=S.equity, margin_mode=S.margin_mode, trade_allowed=S.account_trade_allowed,
+              trade_expert=S.trade_expert)
 
 
 def terminal_info():
@@ -102,9 +104,17 @@ def symbol_info_tick(name):
 
 
 def copy_rates_from_pos(name, tf, pos, count):
+    """Like MT5: a symbol's bar exists only after its first tick, so bar 0 is the bar of the symbol's latest tick
+    (S.ticks[name]['time'], else S.now); `pos` counts back from it, at most `count` bars."""
     if not _ok():
         return None
-    return S.rates.get((name, tf))
+    arr = S.rates.get((name, tf))
+    if arr is None or len(arr) == 0:
+        return arr
+    t = S.ticks[name]["time"] if S.ticks.get(name) else S.now
+    upto = arr[arr["time"] <= t]
+    end = len(upto) - pos
+    return upto[max(0, end - count):max(0, end)]
 
 
 def positions_get(symbol=None, ticket=None):
@@ -136,6 +146,12 @@ def _deal(**kw):
     return d
 
 
+def _book(amount):
+    """A deal of the fake server moves the balance (and the equity: floating P/L is not modelled) at once."""
+    S.balance += amount
+    S.equity += amount
+
+
 def order_send(req):
     _count("order_send")
     if not _ok():
@@ -153,6 +169,7 @@ def order_send(req):
                                 price_open=req.get("price", 1.0), time=S.now, sl=req["sl"], tp=req["tp"]))
         _deal(type=req["type"], entry=DEAL_ENTRY_IN, magic=req["magic"], position_id=S.ticket, symbol=req["symbol"],
               volume=req["volume"], price=req.get("price", 1.0), commission=-3.0)
+        _book(-3.0)
         if S.order_send_none_once:  # executed on the server but the reply is lost (timeout / IPC hiccup)
             S.order_send_none_once = False
             return None
@@ -162,9 +179,11 @@ def order_send(req):
         S.positions = [p for p in S.positions if p["ticket"] != req["position"]]
         for p in pos:
             sign = 1 if p["type"] == POSITION_TYPE_BUY else -1
+            profit = sign * (req.get("price", 1.0) - p["price_open"]) * 100000 * p["volume"]
             _deal(type=req["type"], entry=DEAL_ENTRY_OUT, magic=p["magic"], position_id=p["ticket"],
                   symbol=p["symbol"], volume=p["volume"], price=req.get("price", 1.0), commission=-3.0,
-                  profit=sign * (req.get("price", 1.0) - p["price_open"]) * 100000 * p["volume"], reason=3)
+                  profit=profit, reason=3)
+            _book(profit - 3.0)
         if S.order_send_none_once:
             S.order_send_none_once = False
             return None
@@ -173,7 +192,15 @@ def order_send(req):
 
 
 def history_deals_get(date_from=None, date_to=None, position=None):
+    """By position, or every deal; with S.filter_deal_times only those whose time (server-time epoch) lies in
+    [date_from, date_to] (naive datetimes), like MT5."""
     _count("history_deals_get")
     if not _ok():
         return None
-    return tuple(NS(**d) for d in S.deals if position is None or d["position_id"] == position)
+    if position is not None:
+        return tuple(NS(**d) for d in S.deals if d["position_id"] == position)
+    if not S.filter_deal_times:
+        return tuple(NS(**d) for d in S.deals)
+    a = calendar.timegm(date_from.timetuple()) if date_from is not None else -1e18
+    b = calendar.timegm(date_to.timetuple()) if date_to is not None else 1e18
+    return tuple(NS(**d) for d in S.deals if a <= d["time"] <= b)

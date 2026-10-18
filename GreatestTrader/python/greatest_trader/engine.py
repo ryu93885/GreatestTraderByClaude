@@ -1,7 +1,8 @@
 """Live trading engine (production).
 
 One loop every engine.poll_seconds:
-  1. broker health (a lost MT5 link is re-initialised) and account binding (no trading on another account);
+  1. broker health (a lost MT5 link is re-initialised; while only order sending is off - Algo Trading switched off -
+     steps 2-4 keep running but no order is sent) and account binding (no trading on another account);
   2. ticks of every symbol, server-clock verification, stale-feed watchdog;
   3. cash flows (deposits / withdrawals / credit / bonus) rebase the equity baselines BEFORE the guards;
   4. risk guards; at a market-day change the equity log + daily summary, at a month end the R monitor;
@@ -12,17 +13,19 @@ One loop every engine.poll_seconds:
 New entries need a verified server clock (auto mode: measured from fresh ticks after every start) and are
 blocked after 3 observations that disagree with the clock in use; they also wait while the first-run deal history
 is not confirmed complete, while the deal history cannot be read and while a balance change is not yet explained
-by the deal history (cash flow pending, at most 60 s). Closes, time stops, TP management and hard stops keep
-working with the last known clock.
+by the amounts of the new deals in the history (cash flow pending, at most 60 s, 300 s right after a start); an NR
+signal blocked that way is retried while its bar is fresh (150 s). Closes, time stops, TP management and hard stops
+keep working with the last known clock.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import math
 import time
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -41,6 +44,7 @@ log = logging.getLogger(__name__)
 M15 = timedelta(minutes=15)
 H1 = timedelta(hours=1)
 FRESH_SIGNAL = timedelta(seconds=150)  # act on a closed bar only if it closed within this time
+BAR_SETTLE = timedelta(seconds=2)  # a bar counts as closed this long after its end (late ticks of the old bar)
 MARGIN_USE_MAX = 0.8  # a new position may use at most 80% of the current free margin
 CLOCK_TOL = 120.0  # s: a fresh tick lies within this distance of a whole half-hour offset from real UTC
 TICK_FRESH = 30.0  # s: a clock observation needs a symbol's own tick time to have advanced within this time
@@ -53,10 +57,15 @@ SYMBOL_RETRY_SECONDS = 3600.0  # unavailable symbols are tried again this often
 SYMBOL_FAIL_ALERT = 60  # loops in a row before a failing symbol is notified (then every 6 hours)
 STATE_SAVE_SECONDS = 60.0  # equity-only changes are written at most this often (everything else at once)
 CLOSED_LOOKUP_TRIES = 120  # loops to wait for the deal history of a closed position before journaling it
-FLOW_PENDING_SECONDS = 60.0  # a balance change without a new deal in the history waits at most this long
+FLOW_PENDING_SECONDS = 60.0  # a balance change the deal history does not explain waits at most this long
+FLOW_FIRST_SECONDS = 300.0  # ... in the first reconciliation after a start / terminal re-init (history syncing)
+ABSORBED_MAX, ABSORBED_DAYS = 5, 7  # unexplained changes counted as profit/loss: records kept for late deals
 PRIME_STABLE_SECONDS = 60.0  # first run: cash deals of the history unchanged this long = the history is complete
 PRIME_MAX_SECONDS = 600.0  # first run: the cash-flow tracking starts after this long anyway (warning)
 FX_HOLIDAYS = {(12, 25), (1, 1)}  # market dates without trading
+# after a max-drawdown halt only a reset WITH the peak rebase resumes trading (a plain clear is halted again at once
+# while the drawdown is still at or above the halt level); 7_reset_halt.bat passes --rebase-peak (EA: InpResetHalt)
+RESUME_HINT = "to resume: stop the engine, run 7_reset_halt.bat (python main.py reset-halt --rebase-peak), start it"
 
 
 class FatalError(RuntimeError):
@@ -103,8 +112,10 @@ class LiveEngine:
         self._balance: float | None = None  # account balance at the last cash-flow check (equity log)
         self._flow_pending = False  # this loop: balance change not explained by the deal history yet
         self._pending_since: float | None = None  # monotonic time when the unexplained change was first seen
-        self._money_ref: float | None = None  # balance + credit at the last explained change (None: take the next)
-        self._deal_ref: int | None = None  # newest deal ticket at that time
+        # the reconciliation reference itself is persisted in the state (cash_money_ref, cash_deal_ref, ...)
+        self._first_recon = True  # no reconciliation since this start / terminal re-init: longer pending window
+        self._sessions = None  # broker.sessions at the last check (a change = the terminal was re-initialised)
+        self._primed_now = False  # the priming of this loop set the reference: reconciled from the next loop on
         self._cash_problem = ""  # the deal history cannot be read
         self._prime_start: float | None = None  # first run: when priming was first tried
         self._prime_ref: tuple | None = None  # first run: (cash deal tickets, since when unchanged)
@@ -112,6 +123,11 @@ class LiveEngine:
         self._lot_cap_day: dict[str, str] = {}
         self._closing: dict[int, str] = {}  # ticket -> reason of a close sent by the engine (journal)
         self._gap_logged: dict[str, datetime] = {}
+        # NR symbol -> (bar values, bar open server time, bar open market time) of a fresh signal an entry gate blocked
+        self._deferred: dict[str, tuple[dict, datetime, datetime]] = {}
+        self._orders_off = ""  # this loop: only sending orders is off (Algo Trading): guards run, no orders
+        self._health_told = ""  # a 'trading paused' notice was sent for this reason: tell the recovery too
+        self._stale_told = False  # a stale-feed notice was sent: tell when prices move again
         self._last_heartbeat = -1e18
         self._last_sym_retry = time.monotonic()
         self._last_save = -1e18
@@ -196,8 +212,7 @@ class LiveEngine:
         if self.state.reset_request:
             log.warning("reset-halt requested (%s): applied after the first cash-flow check", self.state.reset_request)
         elif self.state.halted:
-            self._alert(f"HALTED: {self.state.halt_reason} (no new entries; `python main.py reset-halt` to resume)",
-                        level=logging.ERROR)
+            self._alert(f"HALTED: {self.state.halt_reason} (no new entries; {RESUME_HINT})", level=logging.ERROR)
         self._started = True
 
     # ------------------------------------------------------------------ loop
@@ -215,7 +230,9 @@ class LiveEngine:
                     if self._started:
                         self.step()
                         if fails and told:  # the operator got an ERROR for this failure: tell the recovery too
-                            self._alert(f"recovered after {fails} failed loops", key="loop-recovered", every=1800)
+                            # never rate limited: `told` already is (one per notified ERROR), and a swallowed notice
+                            # would leave an ERROR as the operator's last message while the engine is healthy
+                            self._alert(f"recovered after {fails} failed loops")
                         elif fails:
                             log.info("recovered after %d failed loops", fails)
                         fails, first_fail, told = 0, None, False
@@ -261,8 +278,19 @@ class LiveEngine:
 
     def step(self) -> None:
         why = self.broker.health()
+        orders_only = bool(why) and bool(getattr(why, "orders_only", False))
         if why:
-            self._alert(f"trading paused: {why}", key="health", every=1800)
+            text = f"trading paused: {why}" + (
+                " (no orders; the cash-flow check and the guards keep running: a stop reached meanwhile is applied "
+                "when trading is possible again)" if orders_only else "")
+            if self._alert(text, key="health", every=1800):
+                self._health_told = str(why)
+        elif self._health_told:  # tell the recovery, and report a new incident at once
+            self.notifier.reset("health")
+            self._alert(f"trading resumed ({self._health_told}: cleared)")
+            self._health_told = ""
+        self._orders_off = str(why) if orders_only else ""
+        if why and not orders_only:
             return
         if not self._check_account():
             return
@@ -284,16 +312,24 @@ class LiveEngine:
         equity = self._cash_check()  # BEFORE the guards: a withdrawal is no loss, a deposit no profit
         st = self.state
         if self._flow_pending:
-            # balance changed, no deal explains it yet (at most FLOW_PENDING_SECONDS): no peak raise, no halt /
+            # balance changed, the new deals do not explain it yet (at most FLOW_PENDING_SECONDS / FLOW_FIRST_SECONDS
+            # after a start): no peak raise, no halt /
             # month / day stop decision, no entry this loop; closes, time stops, TP management and stops in force run
             self.risk.flatten_reason = ""
         else:
+            reset = ""
             if st.cash_init and not self._cash_problem:
-                self._apply_reset_request(equity)  # after this start's first cash-flow check
+                reset = self._apply_reset_request(equity)  # after this start's first cash-flow check
             before = (st.day, st.month, st.last_equity, st.peak_equity, st.month_start_equity, st.day_opens,
                       st.day_closes)
-            for ev in self.risk.update_equity(equity, now_mkt.date()):
-                self._alert(ev)
+            for ev in self.risk.update_equity(equity, self._market_day(now_mkt)):
+                self._alert(ev + (f" -> no new entries; {RESUME_HINT}" if ev.startswith("HALT:") and not reset else ""))
+            if reset == "clear" and st.halted:  # D8: a clear without the peak rebase cannot resume trading here
+                self._alert(f"RESET HALT had no effect: the drawdown {self.risk.drawdown(equity):.1%} from the peak "
+                            f"{st.peak_equity:,.2f} is still at or above the halt level "
+                            f"{self.cfg.risk.max_drawdown_halt:.0%}, so the halt was set again at once. A plain "
+                            f"`reset-halt` (without --rebase-peak) only helps once the drawdown is below the halt level; "
+                            f"{RESUME_HINT}", level=logging.ERROR)
             if before[0] and st.day != before[0]:
                 self._new_day(before, utc)
             if before[1] and st.month != before[1]:
@@ -301,6 +337,12 @@ class LiveEngine:
             self._dd_alert(equity)
         positions = self.broker.positions(self.magics)
         self._sync_trades(positions, utc)
+        if self._orders_off:
+            # Algo Trading off (or the account allows no expert trading): the guards above ran and latched (EA: same
+            # rule); no close, modify or entry is sent - a hard stop reached meanwhile flattens once trading is on
+            self._heartbeat(now_server, now_mkt, now_utc, equity, positions)
+            self._save_state()
+            return
         stop_reason = self.risk.flatten_reason or self.risk.hard_stop_active()
         if stop_reason and positions:  # also retries closes that failed on the first attempt
             for p in positions:
@@ -313,7 +355,10 @@ class LiveEngine:
                 if self.nr.time_stop_due(p, now_server):
                     self._close(CloseRequest(p.ticket, p.symbol, "time stop"))
             # same order as the backtester (alphabetical): when several pairs signal on the same bar and a
-            # portfolio guard can only admit some of them, live trading must pick the same ones
+            # portfolio guard can only admit some of them, live trading must pick the same ones; signals deferred
+            # by an entry gate (older bars' signals of the same window) go first, also alphabetically
+            for sym in sorted(self._deferred):
+                self._isolated(f"{sym} deferred", self._retry_deferred, sym, now_server, equity)
             for sym in sorted(self.cfg.night_reversion.symbols):
                 if sym not in self.disabled:
                     self._isolated(sym, self._nr_symbol, sym, now_server, equity)
@@ -325,6 +370,17 @@ class LiveEngine:
         self._heartbeat(now_server, now_mkt, now_utc, equity, positions)
         self.notifier.heartbeat()  # dead-man switch: only healthy loops ping
         self._save_state()
+
+    def _market_day(self, now_mkt: datetime) -> date:
+        """Market date for the day / month bookkeeping: Monday-Friday only (EA: same rule). A Saturday or Sunday
+        market date (a broker clock change that is not confirmed yet around a DST switch, weekend ticks) keeps the
+        current market day: no equity_log row, daily summary or day-stop reference for a weekend day."""
+        day = now_mkt.date()
+        if day.weekday() < 5:
+            return day
+        if self.state.day:
+            return date.fromisoformat(self.state.day)
+        return day - timedelta(days=day.weekday() - 4)  # first run on a weekend: the Friday before
 
     def _isolated(self, name: str, fn, *args) -> None:
         """Run one symbol's work; a failure is logged (full traceback only now and then), notified after 60 loops
@@ -449,6 +505,10 @@ class LiveEngine:
             self._watch_from_utc = utc
         if moved:
             self._st_moved_utc = self._watch_from_utc = utc
+            if self._stale_told:  # EA: same notice; a new freeze is reported again at once
+                self._stale_told = False
+                self.notifier.reset("stale-feed")
+                self._alert("prices are updating again (quotes are coming in)")
         if self._market_open(utc):
             since = self._watch_from_utc
             opened = self._session_open_utc(utc)
@@ -457,8 +517,9 @@ class LiveEngine:
             else:
                 ref = since
             if utc - ref > timedelta(minutes=self.cfg.monitor.stale_feed_minutes):
-                self._alert(f"no price updates for {(utc - since).total_seconds() / 60:.0f} min on a market day "
-                            f"(terminal disconnected? feed stopped?)", key="stale-feed", every=3600)
+                if self._alert(f"no price updates for {(utc - since).total_seconds() / 60:.0f} min on a market day "
+                               f"(terminal disconnected? feed stopped?)", key="stale-feed", every=3600):
+                    self._stale_told = True
         if fresh is None or not self._market_open(utc):
             return  # no fresh tick: no observation (weekend, holiday, frozen feed, stale tick)
         auto = self.cfg.broker.server_time_mode == "auto"
@@ -518,6 +579,8 @@ class LiveEngine:
 
     def entry_block(self) -> str:
         """Why new entries are not allowed right now ('' = allowed)."""
+        if self._orders_off:
+            return f"trading paused: {self._orders_off}"
         if self.cfg.broker.server_time_mode == "auto" and not self.clock_verified:
             if self._drift_n >= CLOCK_CONFIRM:
                 return "server clock not verified yet (PC clock off - check the Windows time synchronisation)"
@@ -534,21 +597,34 @@ class LiveEngine:
 
     # ------------------------------------------------------------------ cash flows
     def _cash_check(self) -> float:
-        """Deposits / withdrawals / credit / bonus since the last loop, de-duplicated by deal ticket, applied
-        BEFORE the guards (shared rule with the EA, spec section 5). Returns the equity this loop's guards use:
-        read ONCE after the deal scan, so k = E / (E - F) and the guards see an equity that contains every flow
-        found. Sets:
-          _flow_pending: balance + credit changed since the last explained change and no new deal of any type
-                         (trade or cash) explains it yet: no peak raise, no halt / month / day stop decision and no
-                         entry in this loop; closes, time stops and TP management continue. At most
-                         FLOW_PENDING_SECONDS, then the change counts as profit / loss (notified).
-          _cash_problem: the deal history cannot be read: new entries wait; closes, time stops and the hard stops
-                         continue with the account equity.
-        First run (no cash_init): see _try_prime."""
+        """Deposits / withdrawals / credit / bonus, applied BEFORE the guards and decided by AMOUNTS (shared rule
+        with the EA, spec section 5). Returns the equity this loop's guards use: read ONCE after the deal scan, so
+        k = E / (E - F) and the guards see an equity that contains every flow found.
+
+        Reference (persisted in the state, so a restart reconciles like any other loop): balance + credit M_ref at
+        the last reconciliation and the newest deal included in it. Every loop the broker returns the deals newer
+        than that deal (any type) with their effect (profit + commission + swap + fee), then M = balance + credit:
+          * |(M - M_ref) - sum(effects)| <= max(0.02, 1e-6 |M|): reconciled. Every cash deal (balance / credit /
+            bonus) not seen before is applied in time order; trade deals are just profit/loss. The reference moves.
+          * otherwise, new cash deals that each match a change absorbed earlier as profit/loss (see below) and
+            without which the rest reconciles are LATE deals of that change: marked seen, not applied again.
+          * otherwise _flow_pending: no peak raise, no halt / month / day stop decision, no DD alert / day roll and
+            no entry this loop; closes, time stops, TP management and stops already in force continue. At most
+            FLOW_PENDING_SECONDS (FLOW_FIRST_SECONDS in the first reconciliation after a start / terminal re-init,
+            while the history may still be syncing); then the unseen cash deals are applied, the remainder counts as
+            profit/loss (notified) and is kept as an absorbed record (ABSORBED_MAX, ABSORBED_DAYS).
+          * balance + credit moved during the read (a deal booked meanwhile): pending, decided on the next loop.
+        _cash_problem: the deal history cannot be read: new entries wait; a changed balance + credit is pending
+        with the same timer (never a stop decision on an unexplained change). First run (no cash_init): _try_prime.
+        A broker that knows neither balance nor deals (no scan.deals) applies new cash deals by ticket at once."""
         self._flow_pending = False
         st = self.state
+        sessions = getattr(self.broker, "sessions", None)
+        if sessions != self._sessions:  # a new terminal session: its deal history may still be syncing
+            self._sessions, self._first_recon = sessions, True
         try:
-            scan = self.broker.cash_scan(fresh=self._pending_since is not None)
+            scan = self.broker.cash_scan(fresh=self._pending_since is not None, after=int(st.cash_deal_ref or 0),
+                                         since=self._ref_time())
             primed = st.cash_init or self._try_prime(scan)
         except Exception as exc:  # noqa: BLE001 - isolated: never stops closes, time stops or hard stops
             if not self._cash_problem:
@@ -556,55 +632,164 @@ class LiveEngine:
             self._cash_problem = f"deal history cannot be read ({exc})"
             self._alert(f"cash-flow check failed: {exc} -> new entries wait; closes, time stops and hard stops "
                         f"continue", key="cash-check", every=1800, level=logging.ERROR)
-            return self.broker.account_equity()
+            return self._history_unreadable()
         if self._cash_problem:
             self._cash_problem = ""
             log.warning("cash-flow check works again")
         self._balance = scan.balance
         equity = scan.equity
-        if not primed:
+        if not primed or self._primed_now:  # priming took this loop's reference: reconciled from the next loop on
+            self._primed_now = False
             return equity
         seen = {int(t) for t, _ in st.cash_tickets}
-        new = sorted((f for f in scan.flows if int(f.ticket) not in seen), key=lambda f: (f.time, f.ticket))
+        unseen = sorted((f for f in scan.flows if int(f.ticket) not in seen), key=lambda f: (f.time, f.ticket))
+        if scan.money is None or scan.deals is None:  # no balance / deal list from this broker: by ticket at once
+            self._apply_flows(unseen, equity)
+            return equity
+        now = time.monotonic()
+        if scan.scan_money is not None and abs(scan.money - scan.scan_money) >= 0.005:
+            return self._pending(now, equity, f"balance + credit {scan.scan_money:.2f} -> {scan.money:.2f} during "
+                                              f"the history read")
+        if st.cash_money_ref is None:  # state of an older version: this read is the reference (no priming again)
+            self._apply_flows(unseen, equity)
+            self._set_ref(scan.money, scan.deals)
+            self._pending_since, self._first_recon = None, False
+            log.info("cash-flow reconciliation reference taken: balance + credit %.2f, newest deal %s", scan.money,
+                     st.cash_deal_ref or "-")
+            return equity
+        return self._reconcile(scan, unseen, equity, now)
+
+    def _reconcile(self, scan, unseen: list, equity: float, now: float) -> float:
+        st = self.state
         money = scan.money
-        if money is not None:  # the broker knows balance + credit and the deal tickets: lag guard
-            now = time.monotonic()
-            expired = self._pending_since is not None and now - self._pending_since > FLOW_PENDING_SECONDS
-            if scan.scan_money is not None and abs(money - scan.scan_money) >= 0.005 and not expired:
-                # a deal was booked between the history read and the account read: the equity may contain a flow
-                # the scan missed -> nothing is applied, decided on the next loop
-                return self._pending(now, money, equity)
-            if self._money_ref is not None and abs(money - self._money_ref) < 0.005:
-                self._pending_since = None
-                return equity  # nothing changed: a cash deal seen before its balance change waits for it
-            fresh = scan.newest_deal is not None and (self._deal_ref is None or scan.newest_deal > self._deal_ref)
-            if not (new or fresh or self._money_ref is None or expired):
-                return self._pending(now, money, equity)
-            if not (new or fresh or self._money_ref is None):
-                self._alert(f"balance / credit changed by {money - self._money_ref:+,.2f} without a matching deal in "
-                            f"the history for {FLOW_PENDING_SECONDS:.0f} s: treated as profit/loss",
-                            key="flow-unexplained", every=600)
-            self._money_ref, self._deal_ref, self._pending_since = money, scan.newest_deal, None
-        if new:
-            self._mark_seen(new)
-            rest = sum(f.amount for f in new)
-            for f in new:  # in time order; E_i = equity without the flows booked after this one
-                rest -= f.amount
-                msg = self.risk.apply_cash_flow(f.amount, equity - rest)
-                self._alert(f"{msg} [deal {f.ticket}{' ' + f.comment if f.comment else ''}]")
+        self._prune_absorbed()
+        delta = money - st.cash_money_ref
+        total = sum(d.effect for d in scan.deals)
+        tol = max(0.02, 1e-6 * abs(money))
+        late: list = []
+        if abs(delta - total) > tol:
+            late = self._match_absorbed(unseen, delta - total, tol)
+            if late is None:
+                window = self._flow_window()
+                if self._pending_since is None or now - self._pending_since <= window:
+                    return self._pending(now, equity, f"balance + credit {st.cash_money_ref:.2f} -> {money:.2f}, "
+                                                      f"the {len(scan.deals)} new deals explain {total:+.2f}")
+                rest = delta - total
+                self._alert(f"balance / credit changed by {rest:+,.2f} without a matching deal in the history for "
+                            f"{window:.0f} s: treated as profit/loss")
+                self._absorb(rest)
+                late = []
+        if late:
+            for f, rec in late:
+                when = datetime.fromtimestamp(rec[1], timezone.utc)
+                self._alert(f"late cash deal {f.amount:+,.2f} [deal {f.ticket}{' ' + f.comment if f.comment else ''}]: "
+                            f"already counted as profit/loss on {when:%Y-%m-%d %H:%M} UTC, not applied again")
+            st.cash_absorbed = [r for r in st.cash_absorbed if not any(r is rec for _, rec in late)]
+            self._mark_seen([f for f, _ in late])
+        done = {int(f.ticket) for f, _ in late}
+        self._apply_flows([f for f in unseen if int(f.ticket) not in done], equity)
+        self._set_ref(money, scan.deals)
+        self._pending_since, self._first_recon = None, False
         return equity
 
-    def _pending(self, now: float, money: float, equity: float) -> float:
+    def _apply_flows(self, flows: list, equity: float) -> None:
+        """Apply cash flows (in time order) to the equity baselines: E_i = equity without the flows booked after
+        this one, so the product of the k_i equals E / (E - sum F)."""
+        if not flows:
+            return
+        self._mark_seen(flows)
+        rest = sum(f.amount for f in flows)
+        for f in flows:
+            rest -= f.amount
+            msg = self.risk.apply_cash_flow(f.amount, equity - rest)
+            self._alert(f"{msg} [deal {f.ticket}{' ' + f.comment if f.comment else ''}]")
+
+    def _match_absorbed(self, cash: list, diff: float, tol: float) -> list | None:
+        """Late deals: the smallest set of new cash deals (earliest first) that each match a different absorbed
+        record and without which the remaining deals explain the change (diff + their sum ~ 0). None = no such set."""
+        recs = list(self.state.cash_absorbed)
+        cands = [f for f in cash if any(abs(r[0] - f.amount) <= tol for r in recs)][:12]
+        for n in range(1, len(cands) + 1):
+            for combo in itertools.combinations(cands, n):
+                if abs(diff + sum(f.amount for f in combo)) > tol:
+                    continue
+                used: list = []
+                for f in combo:
+                    r = next((r for r in recs if abs(r[0] - f.amount) <= tol and not any(r is u for u in used)), None)
+                    if r is None:
+                        break
+                    used.append(r)
+                if len(used) == n:
+                    return list(zip(combo, used))
+        return None
+
+    def _absorb(self, amount: float) -> None:
+        st = self.state
+        st.cash_absorbed = (st.cash_absorbed + [[round(float(amount), 2), _epoch(self._utcnow())]])[-ABSORBED_MAX:]
+
+    def _prune_absorbed(self) -> None:
+        st = self.state
+        if st.cash_absorbed:
+            keep = [r for r in st.cash_absorbed if r[1] >= _epoch(self._utcnow()) - ABSORBED_DAYS * 86400]
+            if keep != st.cash_absorbed:
+                st.cash_absorbed = keep
+
+    def _set_ref(self, money: float, deals: list) -> None:
+        st = self.state
+        st.cash_money_ref = float(money)
+        if deals:
+            d = max(deals, key=lambda d: d.ticket)
+            st.cash_deal_ref, st.cash_deal_ref_time = int(d.ticket), _epoch(d.time)
+        elif not st.cash_deal_ref_time:  # no deal at all yet: later deals are newer than this reconciliation
+            now = self.broker.server_time()
+            st.cash_deal_ref_time = _epoch(now) if now is not None else 0.0
+
+    def _ref_time(self) -> datetime | None:
+        """Server time of the reference deal (the broker reads the history from a day before it); None = no
+        reference yet (the broker reads the last 30 days)."""
+        st = self.state
+        if st.cash_money_ref is None or not st.cash_deal_ref_time:
+            return None
+        return datetime.fromtimestamp(st.cash_deal_ref_time, timezone.utc).replace(tzinfo=None)
+
+    def _flow_window(self) -> float:
+        return FLOW_FIRST_SECONDS if self._first_recon else FLOW_PENDING_SECONDS
+
+    def _history_unreadable(self) -> float:
+        """The deal history cannot be read: no deal is visible, so a changed balance + credit is pending with the
+        usual timer (no peak raise, no stop decision on an unexplained change; closes and stops in force run). On
+        expiry the change counts as profit/loss and is kept as an absorbed record (its deal, once readable, is then
+        a late deal: not applied again). Unchanged: nothing to decide (new entries wait via _cash_problem)."""
+        equity = self.broker.account_equity()
+        st = self.state
+        money = self.broker.account_money()
+        if money is None or st.cash_money_ref is None or not st.cash_init:
+            return equity
+        if abs(money - st.cash_money_ref) <= max(0.02, 1e-6 * abs(money)):
+            self._pending_since = None
+            return equity
+        now, window = time.monotonic(), self._flow_window()
+        if self._pending_since is None or now - self._pending_since <= window:
+            return self._pending(now, equity, f"balance + credit {st.cash_money_ref:.2f} -> {money:.2f} while the "
+                                              f"deal history cannot be read")
+        rest = money - st.cash_money_ref
+        self._alert(f"balance / credit changed by {rest:+,.2f} without a matching deal in the history for "
+                    f"{window:.0f} s (the deal history cannot be read): treated as profit/loss")
+        self._absorb(rest)
+        st.cash_money_ref = float(money)
+        self._pending_since, self._first_recon = None, False
+        return equity
+
+    def _pending(self, now: float, equity: float, why: str) -> float:
         if self._pending_since is None:
             self._pending_since = now
-            log.warning("balance + credit %s -> %.2f but no new deal in the history yet: cash flow pending (no peak "
-                        "raise, no stop decision, no entry; at most %.0f s)",
-                        "?" if self._money_ref is None else f"{self._money_ref:.2f}", money, FLOW_PENDING_SECONDS)
+            log.warning("cash flow pending: %s, not explained by the deal history yet (no peak raise, no stop "
+                        "decision, no entry; at most %.0f s)", why, self._flow_window())
         self._flow_pending = True
         return equity
 
     def _mark_seen(self, flows: list) -> None:
-        """Remember cash deal tickets (60 days: the broker scan looks back 30)."""
+        """Remember cash deal tickets (60 days)."""
         st = self.state
         seen = {int(t) for t, _ in st.cash_tickets}
         add = []
@@ -626,8 +811,10 @@ class LiveEngine:
         """First run (no cash-flow cursor yet): the deals already in the history are history, not new flows - but
         they are marked as seen only once the history looks complete (shared rule with the EA): the whole history
         adds up to the balance (credit deals to the credit), or the set of cash deals stayed the same for
-        PRIME_STABLE_SECONDS. After PRIME_MAX_SECONDS it is primed anyway, with a warning. Until then new entries
-        wait (closes, time stops and the guards keep working). A broker that cannot check it primes at once."""
+        PRIME_STABLE_SECONDS - never an EMPTY set while balance or credit is not zero (that cannot be the whole
+        history). After PRIME_MAX_SECONDS it is primed anyway. Priming without matching sums is always notified.
+        Until then new entries wait (closes, time stops and the guards keep working). A broker that cannot check it
+        primes at once. The priming read is the reconciliation reference (balance + credit, newest deal)."""
         now = time.monotonic()
         if self._prime_start is None:
             self._prime_start = now
@@ -635,7 +822,8 @@ class LiveEngine:
         tickets = frozenset(int(f.ticket) for f in hc.flows)
         if self._prime_ref is None or self._prime_ref[0] != tickets:
             self._prime_ref = (tickets, now)
-        stable = now - self._prime_ref[1] >= PRIME_STABLE_SECONDS
+        empty = not tickets and hc.money is not None and abs(hc.money) >= 0.005
+        stable = not empty and now - self._prime_ref[1] >= PRIME_STABLE_SECONDS
         late = now - self._prime_start >= PRIME_MAX_SECONDS
         if hc.complete is False and not stable and not late:
             if not self._prime_note:
@@ -650,25 +838,43 @@ class LiveEngine:
             hc.complete, "the cash deals were unchanged for 60 s" if stable else "NOT confirmed")
         log.info("cash-flow tracking started: %d existing balance/credit/bonus deals marked as seen, not applied (%s)",
                  len(tickets), how)
-        if hc.complete is False and not stable:
-            self._alert(f"WARNING: the deal history was not confirmed complete within {PRIME_MAX_SECONDS / 60:.0f} min "
-                        f"({hc.detail}). Its {len(tickets)} cash deals are marked as seen anyway: a deposit or "
-                        f"withdrawal that reaches the history later is treated as a new cash flow", level=logging.ERROR)
-        self._money_ref = self._deal_ref = None  # the check of this loop takes balance + credit as the reference
+        if hc.complete is False:  # notified on both paths (the deals do not add up to the balance)
+            when = (f"(its cash deals were unchanged for {PRIME_STABLE_SECONDS:.0f} s)" if stable else
+                    f"within {PRIME_MAX_SECONDS / 60:.0f} min")
+            self._alert(f"WARNING: the deal history was not confirmed complete {when} ({hc.detail}). Its "
+                        f"{len(tickets)} cash deals are marked as seen anyway: a deposit or withdrawal that reaches the "
+                        f"history later is treated as a new cash flow - check the account history", level=logging.ERROR)
+        if hc.money is not None:  # the reconciliation reference: this priming read
+            st.cash_money_ref = float(hc.money)
+            st.cash_deal_ref = int(hc.newest_deal or 0)
+            srv = self.broker.server_time()
+            st.cash_deal_ref_time = (_epoch(hc.newest_time) if hc.newest_time is not None else
+                                     _epoch(srv) if srv is not None else 0.0)
+        else:
+            st.cash_money_ref = None
+        st.cash_absorbed = []
+        self._primed_now = True
+        self._pending_since, self._first_recon = None, False
         self._prime_start = self._prime_ref = None
         return True
 
-    def _apply_reset_request(self, equity: float) -> None:
+    def _apply_reset_request(self, equity: float) -> str:
         """`reset-halt` request stored in the state: applied after the cash-flow check of this start, so that a
-        deposit made while the engine was stopped has already been applied to the old peak."""
+        deposit made while the engine was stopped has already been applied to the old peak. Returns the request
+        applied ("clear" | "rebase" | "" = none). The monthly hard stop is not cleared (it ends with the month)."""
         st = self.state
-        if not st.reset_request:
-            return
-        msg = self.risk.reset_halt(equity if st.reset_request == "rebase" else None)
+        req = st.reset_request
+        if not req:
+            return ""
+        msg = self.risk.reset_halt(equity if req == "rebase" else None)
         st.reset_request = ""
-        self._alert(f"RESET HALT (python main.py reset-halt, applied after the cash-flow check): {msg}")
+        if st.month_halted:
+            msg += "; the monthly hard stop stays in force until the month ends (a reset does not clear it)"
+        self._alert(f"RESET HALT (python main.py reset-halt{' --rebase-peak' if req == 'rebase' else ''}, applied "
+                    f"after the cash-flow check): {msg}")
         self.journal.trade({"event": "reset_halt", "time_utc": f"{self._utcnow():%Y-%m-%d %H:%M:%S}",
                             "reason": f"applied by the engine: {msg}"})
+        return req
 
     # ------------------------------------------------------------------ monitoring
     def _new_day(self, before: tuple, utc: datetime) -> None:
@@ -695,7 +901,7 @@ class LiveEngine:
                      f"DD {dd:.1%}", f"month-to-date {mret:+.2%} (flow-adjusted)",
                      f"trades opened {opens} / closed {closes}"]
             if st.halted:
-                parts.append(f"HALTED ({st.halt_reason}) -> python main.py reset-halt")
+                parts.append(f"HALTED ({st.halt_reason}) -> 7_reset_halt.bat (python main.py reset-halt --rebase-peak)")
             if st.month_halted or st.day_halted:
                 parts.append(f"stopped: {self.risk.hard_stop_active()}")
             if block:
@@ -837,24 +1043,33 @@ class LiveEngine:
             self._alert(f"{sym}: no price from the terminal (symbol hidden from Market Watch?)", key=f"notick-{sym}",
                         every=3600)
             return
-        # cheap check: has a new M15 bar closed since we last looked?
-        bar_open_now = now_server.replace(minute=(now_server.minute // 15) * 15, second=0, microsecond=0)
-        last_closed_open = bar_open_now - M15
+        # cheap check: has a new M15 bar closed since we last looked? A bar is closed by TIME (EA: same rule): at its
+        # open + 15 min + BAR_SETTLE, whether or not this pair has ticked in the next bar yet, so every pair's bar is
+        # decided in the same loop, in alphabetical order (the guard capacity no longer goes to the first ticker)
+        t = now_server - BAR_SETTLE
+        last_closed_open = t.replace(minute=(t.minute // 15) * 15, second=0, microsecond=0) - M15
         if self.last_bar.get(sym) == last_closed_open:
             return
         df = self.broker.rates(sym, "M15", self.cfg.engine.history_bars)
+        df = df[df.index <= last_closed_open]  # the broker's rule too; this loop's server time decides
         if df.empty:
             return
         bar_time = df.index[-1].to_pydatetime()
         if self.last_bar.get(sym) == bar_time:
             return
         c = self.cfg.night_reversion
-        if not self._gap_free(df, max(c.bb_period, c.atr_period + 1) + 1, M15):
+        need = max(c.bb_period, c.atr_period + 1) + 1
+        if len(df) < need:
             if self._gap_logged.get(sym) != bar_time:
                 self._gap_logged[sym] = bar_time
-                log.warning("%s: history gap in the last bars before %s: indicators not computed, retrying", sym,
-                            bar_time)
+                log.warning("%s: only %d M15 bars before %s (%d needed): retrying", sym, len(df), bar_time, need)
             return  # last_bar is not set: checked again on the next loop
+        if not self._gap_free(df, need, M15) and self._gap_logged.get(sym) != bar_time:
+            # logged only (once per bar): the EA and the backtester compute the indicators over the bars as they are,
+            # and the TP management must never stop for a missing bar
+            self._gap_logged[sym] = bar_time
+            log.warning("%s: history gap in the last %d M15 bars before %s (outside the weekend / Dec 25 / Jan 1): "
+                        "indicators computed over the bars as they are", sym, need, bar_time)
         first_time = sym not in self.last_bar
         self.last_bar[sym] = bar_time
         prep = self.nr.prepare(df)
@@ -862,10 +1077,12 @@ class LiveEngine:
         bar = {k: float(row[k]) for k in ("close", "mid", "upper", "lower", "atr", "high", "low")}
         spec = self.broker.symbol_spec(sym)
 
-        # manage existing NR position on this symbol (TP -> SMA, time stop)
+        # manage existing NR position on this symbol (TP -> SMA, time stop); a new TP inside the stops level (+2
+        # points) cannot be placed: the position is closed at market instead (EA: same rule)
         positions = self.broker.positions(self.magics)
+        min_dist = (spec.stops_level_points + 2) * spec.point
         for p in [p for p in positions if p.strategy == "NR" and p.symbol == sym]:
-            for act in self.nr.manage_on_bar(p, bar, now_server, tick.bid, tick.ask):
+            for act in self.nr.manage_on_bar(p, bar, now_server, tick.bid, tick.ask, min_dist):
                 self._apply(act, p)
 
         # new entry only on a fresh bar close
@@ -874,13 +1091,49 @@ class LiveEngine:
         if now_server - (bar_time + M15) > FRESH_SIGNAL:
             log.debug("%s bar %s is stale, skip entry check", sym, bar_time)
             return
-        bar_mkt = self.clock.server_to_market(bar_time)
+        self._nr_entry(sym, bar, bar_time, self.clock.server_to_market(bar_time), equity)
+
+    def _nr_entry(self, sym: str, bar: dict, bar_time: datetime, bar_mkt: datetime, equity: float,
+                  deferred: bool = False) -> None:
+        """Entry check of a fresh closed bar with the current quote (spread / cost filter, then every guard).
+        A signal that an entry gate blocks (cash flow pending, deal history not complete / unreadable, server clock
+        waiting / mismatch) is deferred, not dropped (EA: same rule): retried on the next loops while the bar is
+        fresh (FRESH_SIGNAL after its close), see _retry_deferred."""
+        tick = self.broker.tick(sym)
+        if tick is None:
+            return
+        spec = self.broker.symbol_spec(sym)
         spread_pips = (tick.ask - tick.bid) / spec.pip
         commission_pips = self._commission_pips(sym, tick)
         req = self.nr.entry_signal(sym, bar, bar_time, bar_mkt, spec.pip, spread_pips, commission_pips)
-        if req is not None:
-            positions = self.broker.positions(self.magics)
-            self._enter(req, positions, equity)
+        if req is None:
+            if deferred:
+                log.info("NR %s deferred signal of the %s bar: no signal any more at the current spread / cost, "
+                         "dropped", sym, bar_time)
+            return
+        block = self.entry_block()
+        if block:
+            if sym not in self._deferred:
+                log.info("NR %s signal of the %s bar deferred: %s (retried until %s)", sym, bar_time, block,
+                         bar_time + M15 + FRESH_SIGNAL)
+            self._deferred[sym] = (bar, bar_time, bar_mkt)
+            return
+        self._enter(req, self.broker.positions(self.magics), equity)
+
+    def _retry_deferred(self, sym: str, now_server: datetime, equity: float) -> None:
+        """A deferred NR signal: dropped (logged) once its bar is older than FRESH_SIGNAL; taken - with the current
+        quote and every guard checked again - as soon as no entry gate blocks it."""
+        bar, bar_time, bar_mkt = self._deferred[sym]
+        if now_server - (bar_time + M15) > FRESH_SIGNAL or sym in self.disabled:
+            del self._deferred[sym]
+            log.warning("NR %s signal of the %s bar dropped: not taken within %.0f s of the bar close (%s)", sym,
+                        bar_time, FRESH_SIGNAL.total_seconds(), self.entry_block() or "symbol unavailable")
+            return
+        if self.entry_block():
+            return  # still blocked: tried again on the next loop
+        del self._deferred[sym]
+        log.info("NR %s deferred signal of the %s bar: entry gate open again, checking it now", sym, bar_time)
+        self._nr_entry(sym, bar, bar_time, bar_mkt, equity, deferred=True)
 
     def _commission_pips(self, sym: str, tick) -> float:
         c = self.cfg.broker.commission_per_lot
@@ -912,9 +1165,12 @@ class LiveEngine:
             return
         spec = self.broker.symbol_spec(c.symbol)
         h1 = self.broker.rates(c.symbol, "H1", c.atr_period_h1 + 30)
-        if not self._gap_free(h1, c.atr_period_h1 + 1, H1):
-            log.warning("ES: history gap in the last H1 bars of %s, retrying", c.symbol)
+        if len(h1) < c.atr_period_h1 + 1:
+            log.warning("ES: only %d H1 bars of %s (%d needed): retrying", len(h1), c.symbol, c.atr_period_h1 + 1)
             return
+        if not self._gap_free(h1, c.atr_period_h1 + 1, H1):  # logged only, as for NR (EA / backtester: no gap check)
+            log.warning("ES: history gap in the last %d H1 bars of %s: ATR computed over the bars as they are",
+                        c.atr_period_h1 + 1, c.symbol)
         a = atr(h1["high"], h1["low"], h1["close"], c.atr_period_h1).iloc[-1]
         spread_pips = (tick.ask - tick.bid) / spec.pip
         req = self.es.entry_signal(now_utc, now_server, float(a), spec.pip, spread_pips)
@@ -1046,8 +1302,9 @@ class LiveEngine:
                 # the TP can never be placed: a fresh quote is already past it -> take the profit at market
                 self._close(CloseRequest(act.ticket, act.symbol, "price beyond TP (TP not placeable)"))
             else:
-                # any other failure (too many requests, no connection, a lost reply, stops / freeze level, ...): the
-                # position keeps its SL and the time stop, the TP is sent again on the next bar (EA: same rule)
+                # any other failure (too many requests, no connection, a lost reply, freeze level, ...): the position
+                # keeps its SL and the time stop, the TP is sent again on the next bar (EA: same rule). A TP inside the
+                # stops level never gets here: manage_on_bar closes the position instead ('price at moving average')
                 log.warning("modify failed %s ticket=%s: %s (SL kept, TP retried next bar)", act.symbol, act.ticket,
                             res.message)
 
