@@ -110,6 +110,7 @@ input bool   InpResetHalt   = false; // Clear the max-DD halt once at start (pea
 
 //--- constants
 #define GT_FRESH_SEC        150     // act on a closed M15 bar only within this many seconds of its close (Python FRESH_SIGNAL)
+#define GT_BAR_SETTLE_SEC   2       // live: a bar counts as closed this long after its end (late ticks of the old bar)
 #define GT_CLOCK_TOL_SEC    120     // a valid observation: server - UTC within this of a whole half-hour offset
 #define GT_CLOCK_ADV_SEC    30      // clock observations only while the server time advanced within this many seconds
 #define GT_CLOCK_OBS_SEC    60      // spacing of counted clock observations
@@ -133,6 +134,12 @@ CTrade   g_trade;
 string   g_sym[];      // broker symbol names (NR)
 string   g_base[];     // base names (NR)
 datetime g_lastBar[];  // last processed closed M15 bar per NR symbol
+bool     g_defOn[];    // NR signal deferred by an entry gate, per NR symbol (retried while its bar is fresh)
+MqlRates g_defBar[];   // ... its bar and indicators
+double   g_defMid[];
+double   g_defUp[];
+double   g_defLo[];
+double   g_defAtr[];
 int      g_nsym = 0;
 string   g_esSym = "";
 bool     g_esOk = false;
@@ -1585,12 +1592,42 @@ bool ClosePos(const ulong ticket, const string reason)
 //+------------------------------------------------------------------+
 //| Indicators (computed from closed bars, identical to Python)       |
 //+------------------------------------------------------------------+
-bool NRIndicators(const string sym, MqlRates &last, double &mid, double &upper, double &lower, double &atrv)
+// the newest CLOSED bars of sym, newest first (r[0] = last closed bar; r is not a series array). Live: a bar is
+// closed by TIME (shared rule with the Python engine): once the server time (newest quote of any symbol) has
+// reached its open + its length + GT_BAR_SETTLE_SEC, whether or not this symbol has ticked in the next bar yet (MT5
+// forms a bar only at its first tick), so every pair's just-closed bar is decided in the same cycle, in
+// alphabetical order. Strategy Tester: the bar before the newest one, as before (tester results unchanged).
+// Returns the number of bars in r[].
+int ClosedRates(const string sym, const ENUM_TIMEFRAMES tf, const int count, const datetime nowSrv, MqlRates &r[])
+  {
+   ArrayResize(r, 0);
+   MqlRates a[];
+   ArraySetAsSeries(a, true);
+   int got = g_tester ? CopyRates(sym, tf, 1, count, a) : CopyRates(sym, tf, 0, count + 2, a);
+   if(got <= 0)
+      return 0;
+   int skip = 0;
+   if(!g_tester)
+     {
+      long len = (long)PeriodSeconds(tf);
+      while(skip < got && (long)a[skip].time + len + GT_BAR_SETTLE_SEC > (long)nowSrv)
+         skip++;
+     }
+   int n = got - skip;
+   if(n > count)
+      n = count;
+   ArrayResize(r, n);
+   for(int k = 0; k < n; k++)
+      r[k] = a[skip + k];
+   return n;
+  }
+
+bool NRIndicators(const string sym, const datetime nowSrv, MqlRates &last, double &mid, double &upper, double &lower,
+                  double &atrv)
   {
    MqlRates r[];
-   ArraySetAsSeries(r, true);
    int need = (int)MathMax(InpBBPeriod, InpATRPeriod + 1) + 2;
-   int got = CopyRates(sym, PERIOD_M15, 1, need, r);   // shift 1 = last closed bar
+   int got = ClosedRates(sym, PERIOD_M15, need, nowSrv, r);   // r[0] = last closed bar
    if(got < need)
       return false;
    last = r[0];
@@ -1615,12 +1652,11 @@ bool NRIndicators(const string sym, MqlRates &last, double &mid, double &upper, 
    return true;
   }
 
-double ATRH1(const string sym, const int period)
+double ATRH1(const string sym, const int period, const datetime nowSrv)
   {
    MqlRates r[];
-   ArraySetAsSeries(r, true);
    int need = period + 1;
-   int got = CopyRates(sym, PERIOD_H1, 1, need, r);
+   int got = ClosedRates(sym, PERIOD_H1, need, nowSrv, r);   // r[0] = last closed H1 bar
    if(got < need)
       return -1.0;
    double s = 0.0;
@@ -1739,46 +1775,85 @@ void NRManage(const string sym, const double mid, const datetime nowSrv)
      }
   }
 
-void NREntry(const string sym, const MqlRates &bar, const double mid, const double upper, const double lower,
-             const double atrv, const double eq)
+// NR entry signal of a closed bar with the CURRENT quote: entry window, spread, cost and news filters, band signal,
+// TP on the profitable side outside the stops level. Returns false when there is no signal.
+bool NRSignal(const string sym, const MqlRates &bar, const double mid, const double upper, const double lower,
+              const double atrv, int &dir, double &entry, double &sl, double &tp, double &cost)
   {
+   dir = 0;
    datetime barMkt = ServerToMarket(bar.time);
    if(!InNRWindow(barMkt))
-      return;
+      return false;
    MqlTick tick;
    if(!SymbolInfoTick(sym, tick) || tick.bid <= 0.0 || tick.ask <= 0.0)
-      return;
+      return false;
    double pip = SymPip(sym);
    double spread = (tick.ask - tick.bid) / pip;
    if(spread > InpNRMaxSpreadPips)
-      return;
-   double cost = spread + CommissionPips(sym, tick.ask) + InpNRSlippagePips;
+      return false;
+   cost = spread + CommissionPips(sym, tick.ask) + InpNRSlippagePips;
    if(atrv / pip < InpATRCostMult * cost)
-      return;
+      return false;
    double sd = (InpBBDev > 0.0) ? (upper - mid) / InpBBDev : 0.0;
    if(InpMaxBandZ > 0.0 && sd > 0.0 && MathAbs(bar.close - mid) > InpMaxBandZ * sd)
-      return;
+      return false;
    if(InpMaxBarRangeATR > 0.0 && (bar.high - bar.low) > InpMaxBarRangeATR * atrv)
-      return;
-   int dir = 0;
+      return false;
    if(bar.close > upper)
       dir = -1;
    else
       if(bar.close < lower)
          dir = 1;
    if(dir == 0)
-      return;
+      return false;
    int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
    double point = SymbolInfoDouble(sym, SYMBOL_POINT);
    long stops = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
-   double entry = (dir > 0) ? tick.ask : tick.bid;
-   double sl = NormalizeDouble(entry - dir * InpSLATRMult * atrv, digits);
-   double tp = FavorableTP(dir, entry, mid);
+   entry = (dir > 0) ? tick.ask : tick.bid;
+   sl = NormalizeDouble(entry - dir * InpSLATRMult * atrv, digits);
+   tp = FavorableTP(dir, entry, mid);
    if(tp <= 0.0)
-      return;
+      return false;
    tp = NormalizeDouble(tp, digits);
    if(MathAbs(tp - entry) < (stops + 2) * point)
+      return false;
+   return true;
+  }
+
+// NR entry of symbol g_sym[i] on a closed bar. A signal that an entry gate blocks (broker clock waiting / mismatch,
+// first-run deal history, cash flow pending, deal history unreadable) is deferred, not dropped (shared rule with
+// the Python engine): retried on the next cycles while its bar is fresh (RetryDeferred), with the current quote
+// and every guard checked again.
+void NREntry(const int i, const MqlRates &bar, const double mid, const double upper, const double lower,
+             const double atrv, const double eq, const bool deferred)
+  {
+   string sym = g_sym[i];
+   int dir = 0;
+   double entry = 0.0, sl = 0.0, tp = 0.0, cost = 0.0;
+   if(!NRSignal(sym, bar, mid, upper, lower, atrv, dir, entry, sl, tp, cost))
+     {
+      if(deferred)
+         Log(StringFormat("NR %s deferred signal of the %s bar: no signal any more at the current quote, dropped", sym,
+                          TimeToString(bar.time, TIME_DATE | TIME_MINUTES)));
       return;
+     }
+   string gate;
+   if(!EntryGateOpen(gate))
+     {
+      if(!g_defOn[i] || g_defBar[i].time != bar.time)
+         Log(StringFormat("NR %s signal of the %s bar deferred: %s (retried until %s)", sym,
+                          TimeToString(bar.time, TIME_DATE | TIME_MINUTES), gate,
+                          TimeToString((datetime)((long)bar.time + 900 + GT_FRESH_SEC), TIME_DATE | TIME_SECONDS)));
+      g_defOn[i] = true;
+      g_defBar[i] = bar;
+      g_defMid[i] = mid;
+      g_defUp[i] = upper;
+      g_defLo[i] = lower;
+      g_defAtr[i] = atrv;
+      return;
+     }
+   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   double pip = SymPip(sym);
    double rf = RiskFraction(true, eq) * SymbolMult(sym);
    double rawRisk = eq * rf;
    double lossLot = LossPerLot(sym, dir, entry, sl);
@@ -1817,26 +1892,59 @@ void NREntry(const string sym, const MqlRates &bar, const double mid, const doub
       Log("ORDER FAILED " + desc + ": " + err, true);
   }
 
+// NR signals deferred by an entry gate: retried in symbol (alphabetical) order before the new bars of the cycle,
+// while their bar is fresh (GT_FRESH_SEC after its close); then dropped (logged)
+void RetryDeferred(const datetime nowSrv, const double eq)
+  {
+   for(int i = 0; i < g_nsym; i++)
+     {
+      if(!g_defOn[i])
+         continue;
+      string gate;
+      bool open = EntryGateOpen(gate);
+      if(nowSrv - (g_defBar[i].time + 900) > GT_FRESH_SEC)
+        {
+         g_defOn[i] = false;
+         Log(StringFormat("NR %s signal of the %s bar dropped: not taken within %d s of the bar close (%s)", g_sym[i],
+                          TimeToString(g_defBar[i].time, TIME_DATE | TIME_MINUTES), GT_FRESH_SEC,
+                          open ? "entry gate open, no new check" : gate));
+         continue;
+        }
+      if(!open)
+         continue;   // still blocked: tried again on the next cycle
+      g_defOn[i] = false;
+      Log(StringFormat("NR %s deferred signal of the %s bar: entry gate open again, checking it now", g_sym[i],
+                       TimeToString(g_defBar[i].time, TIME_DATE | TIME_MINUTES)));
+      NREntry(i, g_defBar[i], g_defMid[i], g_defUp[i], g_defLo[i], g_defAtr[i], eq, true);
+     }
+  }
+
 void ProcessNR(const datetime nowSrv, const double eq)
   {
    NRTimeStops(nowSrv);
+   RetryDeferred(nowSrv, eq);
+   // the last closed M15 bar: live by TIME (open + 15 min + GT_BAR_SETTLE_SEC <= server time, see ClosedRates), the
+   // same bar for every pair; Strategy Tester by position (the bar before the newest one), as before
+   datetime lastClosed = Floor15((datetime)((long)nowSrv - GT_BAR_SETTLE_SEC)) - 900;
    for(int i = 0; i < g_nsym; i++)
      {
       string sym = g_sym[i];
-      datetime t1 = iTime(sym, PERIOD_M15, 1);      // open time of last closed bar
+      datetime t1 = g_tester ? iTime(sym, PERIOD_M15, 1) : lastClosed;   // open time of the last closed bar
       if(t1 <= 0 || t1 == g_lastBar[i])
          continue;
       MqlRates bar;
       double mid, upper, lower, atrv;
-      if(!NRIndicators(sym, bar, mid, upper, lower, atrv))
+      if(!NRIndicators(sym, nowSrv, bar, mid, upper, lower, atrv))
          continue;
+      if(bar.time <= g_lastBar[i])
+         continue;   // live: this pair has no bar in the just-closed slot (no tick in it): nothing new
       g_lastBar[i] = bar.time;
       NRManage(sym, mid, nowSrv);
       // entries only on a fresh bar close (avoid acting on stale bars after restarts / data gaps);
       // the same 150 s window as Python (engine.py FRESH_SIGNAL), also for the first bar after a start
       if(nowSrv - (bar.time + 900) > GT_FRESH_SEC)
          continue;
-      NREntry(sym, bar, mid, upper, lower, atrv, eq);
+      NREntry(i, bar, mid, upper, lower, atrv, eq, false);
      }
   }
 
@@ -1876,13 +1984,15 @@ void ProcessES(const datetime nowSrv, const double eq)
       return;   // decide only on a verified broker clock and settled cash flows (the day stays open meanwhile)
    if(HasESPosition())
       return;
+   if(!g_tester && ((long)nowSrv % 3600) < GT_BAR_SETTLE_SEC)
+      return;   // live: the H1 bar that just ended counts as closed GT_BAR_SETTLE_SEC after its end (ClosedRates)
    MqlTick tick;
    if(!SymbolInfoTick(g_esSym, tick) || tick.bid <= 0.0)
       return;
    g_lastESDay = uday;   // one decision per day
    double pip = SymPip(g_esSym);
    double spread = (tick.ask - tick.bid) / pip;
-   double a = ATRH1(g_esSym, InpESATRPeriodH1);
+   double a = ATRH1(g_esSym, InpESATRPeriodH1, nowSrv);
    if(a <= 0.0 || spread > InpESMaxSpreadPips)
      {
       Log(StringFormat("ES: no entry today (spread %.1fp, ATR %.1fp)", spread, a / pip));
@@ -3276,8 +3386,17 @@ int OnInit()
          g_sym[j] = ts;
         }
    ArrayResize(g_lastBar, g_nsym);
+   ArrayResize(g_defOn, g_nsym);
+   ArrayResize(g_defBar, g_nsym);
+   ArrayResize(g_defMid, g_nsym);
+   ArrayResize(g_defUp, g_nsym);
+   ArrayResize(g_defLo, g_nsym);
+   ArrayResize(g_defAtr, g_nsym);
    for(int i = 0; i < g_nsym; i++)
+     {
       g_lastBar[i] = 0;
+      g_defOn[i] = false;
+     }
 
    string eb = InpESSymbol;
    StringToUpper(eb);
