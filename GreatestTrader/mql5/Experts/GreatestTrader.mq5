@@ -110,17 +110,22 @@ input bool   InpResetHalt   = false; // Clear the max-DD halt once at start (pea
 
 //--- constants
 #define GT_FRESH_SEC        150     // act on a closed M15 bar only within this many seconds of its close (Python FRESH_SIGNAL)
+#define GT_BAR_SETTLE_SEC   2       // live: a bar counts as closed this long after its end (late ticks of the old bar)
 #define GT_CLOCK_TOL_SEC    120     // a valid observation: server - UTC within this of a whole half-hour offset
 #define GT_CLOCK_ADV_SEC    30      // clock observations only while the server time advanced within this many seconds
 #define GT_CLOCK_OBS_SEC    60      // spacing of counted clock observations
 #define GT_CLOCK_CONFIRM    3       // identical observations to adopt / mismatches to block / off-grid PC clock to alert
-#define GT_FLOW_PENDING_SEC 60      // a balance change without a new deal in the history waits at most this long
+#define GT_FLOW_PENDING_SEC 60      // a balance / credit change the new deals do not explain waits at most this long
+#define GT_FLOW_START_SEC   300     // ... at the first reconciliation after a start / re-init (history may still sync)
+#define GT_ABSORB_MAX       5       // changes counted as profit / loss at the limit, kept to recognise a late cash deal
+#define GT_ABSORB_KEEP_SEC  604800  // ... for 7 days
 #define GT_PRIME_STABLE_SEC 60      // first run: the cash-flow deals of the history unchanged this long = complete
 #define GT_PRIME_MAX_SEC    600     // first run: start the cash-flow tracking after this long anyway (warning)
 #define GT_LOCK_STALE_SEC   60      // instance lock: heartbeat older than this = holder gone
 #define GT_LOCK_BEAT_SEC    10      // instance lock: heartbeat interval
 #define GT_REPEAT_SEC       21600   // repeat a standing alert at most every 6 hours
 #define GT_STALE_FEED_SEC   900     // no new quote for this long while the market is open = stale feed
+#define GT_SESSION_GRACE_SEC 600    // ... the first quote of a session (Monday, after Dec 25 / Jan 1) may come this late
 #define GT_NOTIFY_MAX       30      // push queue length
 #define GT_FAR_FUTURE       D'2100.01.01 00:00:00'
 
@@ -129,6 +134,12 @@ CTrade   g_trade;
 string   g_sym[];      // broker symbol names (NR)
 string   g_base[];     // base names (NR)
 datetime g_lastBar[];  // last processed closed M15 bar per NR symbol
+bool     g_defOn[];    // NR signal deferred by an entry gate, per NR symbol (retried while its bar is fresh)
+MqlRates g_defBar[];   // ... its bar and indicators
+double   g_defMid[];
+double   g_defUp[];
+double   g_defLo[];
+double   g_defAtr[];
 int      g_nsym = 0;
 string   g_esSym = "";
 bool     g_esOk = false;
@@ -160,17 +171,30 @@ datetime g_lastFlush = 0;
 bool     g_gvWritten = false;    // a global variable was written since the last flush
 bool     g_gvRefresh = false;    // rewrite every value this time (manual deletion / 4-week expiry)
 datetime g_gvRefreshAt = 0;
-string   g_gvName[];             // cache of the values last written, to write only on change
+string   g_gvName[];             // every persisted value: global variable name, key, current value and whether
+string   g_gvKey[];              // ... the global variable holds it (written only on change or a full refresh)
 double   g_gvVal[];
+bool     g_gvOk[];
+long     g_stateLogin = 0;       // account of the loaded state (state file name)
+bool     g_fileDirty = false;    // a persisted value changed since the state file was last written
+datetime g_fileNote = 0;         // last 'state file cannot be written' notice
 bool     g_resetHaltDone = false; // InpResetHalt already applied (persisted; re-armed when InpResetHalt=false)
 bool     g_resetDue = false;     // InpResetHalt is evaluated after the first cash-flow scan of the session
 
-//--- cash flows (deposits / withdrawals / credit / bonus)
-ulong    g_flowTicket = 0;       // newest cash-flow deal ticket already applied (persisted "flowtk")
-datetime g_flowScan = 0;         // server time of the last history scan (persisted "flowtm")
-ulong    g_allTicket = 0;        // newest deal ticket of any type seen (in memory)
-double   g_lastBalCred = 0.0;    // balance + credit at the last explained change (0 = scan at the next cycle)
-datetime g_pendingSince = 0;     // balance changed but no new deal in the history yet
+//--- cash flows (deposits / withdrawals / credit / bonus): amount-based reconciliation (shared rule with Python)
+ulong    g_flowTicket = 0;       // newest cash-flow deal ticket applied or marked as seen (persisted "flowtk")
+datetime g_flowScan = 0;         // server time the reconciliation reference last moved (persisted "flowtm"; the
+                                 // history window of a state of an earlier 1.2 build without a reference)
+bool     g_refKnown = false;     // a reconciliation reference exists (persisted "flowmref" / "flowdref" / "flowdtm")
+double   g_moneyRef = 0.0;       // balance + credit at the last reconciliation
+ulong    g_dealRef = 0;          // newest deal (any type) included in the last reconciliation
+datetime g_dealRefTime = 0;      // ... its time (start of the history window)
+double   g_absAmt[];             // changes counted as profit / loss at the pending limit (persisted "absa<i>")
+datetime g_absTime[];            // ... server time when they were counted (persisted "abst<i>"), oldest first
+datetime g_pendingSince = 0;     // local time when the current unexplained change was first seen
+int      g_pendingWin = 0;       // ... its limit: GT_FLOW_PENDING_SEC, or GT_FLOW_START_SEC after a start
+bool     g_firstRecon = true;    // the first reconciliation after a start / re-init has not happened yet
+bool     g_histBad = false;      // this cycle: the deal history cannot be read (no new entry)
 bool     g_flowPending = false;  // this cycle: balance change not explained yet (no guard decision, no entry)
 bool     g_flowPrimed = true;    // false on a first run until the existing deals are marked as seen
 datetime g_primeStart = 0;       // first run: local time of the first priming attempt
@@ -185,6 +209,7 @@ datetime g_primeTry = 0;         // ... last priming attempt (the whole history 
 ENUM_GT_SERVER_TIME g_clockMode = GT_SERVER_NY7; // effective mode (AUTO -> NY7 in the tester)
 long     g_clkOffset = 0;        // AUTO: adopted server - UTC offset in seconds (persisted "clkoff")
 bool     g_clkHave = false;      // AUTO: an adopted offset exists
+bool     g_clkNY7 = false;       // AUTO: the adopted offset matched the NY7 rule: the clock follows US DST ("clkny7")
 bool     g_clkVerified = false;  // a valid observation confirmed the clock since start-up
 bool     g_clkBlocked = false;   // repeated mismatches: new entries blocked
 int      g_clkMismatch = 0;      // consecutive observations that disagree with the clock in use
@@ -213,6 +238,8 @@ datetime g_staleNote = 0;
 datetime g_startLocal = 0;
 string   g_capSym[];             // lot-cap notices: once per market day per symbol
 datetime g_capDay[];
+ulong    g_noSLTk[];             // own positions without a stop loss already notified ...
+datetime g_noSLNote[];           // ... and when (at most every GT_REPEAT_SEC per ticket; pruned in PruneFails)
 
 //--- close back-off (bounded by the open positions, see PruneFails)
 ulong    g_failTk[];
@@ -335,18 +362,31 @@ bool IsUSDST(const datetime utc)
    return (utc >= st && utc < en);
   }
 
-// server time -> UTC with the clock in use. AUTO uses the adopted (measured or persisted) offset and the NY7 rule
-// until one exists; entries stay blocked until a live observation confirms the clock (CheckClock / CanOpen).
-datetime ServerToUTC(const datetime srv)
+// server time -> UTC with the NY7 rule (server time = market time: UTC+3 in US summer, UTC+2 otherwise)
+datetime NY7ServerToUTC(const datetime srv)
   {
-   if(g_clockMode == GT_SERVER_FIXED)
-      return srv - (int)MathRound(InpServerGMTOffset * 3600.0);
-   if(g_clockMode == GT_SERVER_AUTO && g_clkHave)
-      return (datetime)((long)srv - g_clkOffset);
    datetime cand = srv - 3 * 3600;
    if(IsUSDST(cand))
       return cand;
    return srv - 2 * 3600;
+  }
+
+// server - UTC in seconds under the NY7 rule at server time srv
+long NY7Offset(const datetime srv)
+  {
+   return (long)srv - (long)NY7ServerToUTC(srv);
+  }
+
+// server time -> UTC with the clock in use. AUTO: an adopted offset that matched the NY7 rule is kept as the NY7
+// rule (follows US DST, like Python's detect_server_mode); any other adopted offset is a fixed number of seconds;
+// the NY7 rule until one exists. Entries stay blocked until a live observation confirms the clock (CheckClock).
+datetime ServerToUTC(const datetime srv)
+  {
+   if(g_clockMode == GT_SERVER_FIXED)
+      return srv - (int)MathRound(InpServerGMTOffset * 3600.0);
+   if(g_clockMode == GT_SERVER_AUTO && g_clkHave && !g_clkNY7)
+      return (datetime)((long)srv - g_clkOffset);
+   return NY7ServerToUTC(srv);
   }
 
 datetime UTCToMarket(const datetime utc)
@@ -356,9 +396,19 @@ datetime UTCToMarket(const datetime utc)
 
 datetime ServerToMarket(const datetime srv)
   {
-   if(g_clockMode == GT_SERVER_NY7 || (g_clockMode == GT_SERVER_AUTO && !g_clkHave))
+   if(g_clockMode == GT_SERVER_NY7 || (g_clockMode == GT_SERVER_AUTO && (!g_clkHave || g_clkNY7)))
       return srv;
    return UTCToMarket(ServerToUTC(srv));
+  }
+
+// the clock in use, for log and status texts
+string ClockText()
+  {
+   if(g_clockMode == GT_SERVER_FIXED)
+      return StringFormat("fixed UTC%+.1f h", InpServerGMTOffset);
+   if(g_clockMode == GT_SERVER_AUTO && g_clkHave && !g_clkNY7)
+      return StringFormat("UTC%+.1f h (fixed)", g_clkOffset / 3600.0);
+   return "NY7 rule (UTC+3 in US summer, UTC+2 otherwise)";
   }
 
 datetime DayStart(const datetime t)
@@ -398,7 +448,8 @@ double SymPip(const string sym)
 //+------------------------------------------------------------------+
 //| Risk state (persisted in terminal global variables GT_<login>_*)  |
 //+------------------------------------------------------------------+
-// writes one value only when it differs from the value last written (or on a full refresh)
+// records a persisted value (state file mirror) and writes its global variable only when it differs from the value
+// last written successfully (or on a full refresh)
 void GVPut(const string key, const double v)
   {
    string name = g_gvPrefix + key;
@@ -410,22 +461,204 @@ void GVPut(const string key, const double v)
          idx = i;
          break;
         }
-   if(idx >= 0 && g_gvVal[idx] == v && !g_gvRefresh)
-      return;
-   if(GlobalVariableSet(name, v) == 0)
-     {
-      Print("[GT] could not write global variable ", name, " (error ", GetLastError(), ")");
-      return;
-     }
-   g_gvWritten = true;
    if(idx < 0)
      {
       idx = n;
       ArrayResize(g_gvName, n + 1);
+      ArrayResize(g_gvKey, n + 1);
       ArrayResize(g_gvVal, n + 1);
+      ArrayResize(g_gvOk, n + 1);
       g_gvName[idx] = name;
+      g_gvKey[idx] = key;
+      g_gvVal[idx] = v;
+      g_gvOk[idx] = false;
+      g_fileDirty = true;
      }
-   g_gvVal[idx] = v;
+   else
+      if(g_gvVal[idx] != v)
+        {
+         g_gvVal[idx] = v;
+         g_gvOk[idx] = false;
+         g_fileDirty = true;
+        }
+      else
+         if(g_gvOk[idx] && !g_gvRefresh)
+            return;
+   if(GlobalVariableSet(name, v) == 0)
+     {
+      Print("[GT] could not write global variable ", name, " (error ", GetLastError(), ")");
+      return;   // tried again at the next save
+     }
+   g_gvOk[idx] = true;
+   g_gvWritten = true;
+  }
+
+//+------------------------------------------------------------------+
+//| State file: mirror of the global variables (4-week expiry)        |
+//+------------------------------------------------------------------+
+// MT5 deletes a terminal global variable 4 weeks after its last access. Every persisted value is mirrored to
+// MQL5\Files\GreatestTrader_<login>.state (ASCII key=value lines, written atomically: a temporary file, then
+// FileMove with FILE_REWRITE) whenever the state is flushed after a change, and at the hourly full refresh. When
+// the global variables of the account are missing at a start, the file of the same login restores them (notified).
+// Never in the Strategy Tester.
+string StateFileName(const long login)
+  {
+   return "GreatestTrader_" + IntegerToString(login) + ".state";
+  }
+
+void StateFileProblem(const string msg)
+  {
+   datetime now = TimeLocal();
+   if(g_fileNote != 0 && Secs(now, g_fileNote) < GT_REPEAT_SEC && Secs(now, g_fileNote) >= 0)
+     {
+      if(InpVerbose)
+         Log(msg);
+      return;   // logged and notified at most every GT_REPEAT_SEC; tried again at every flush
+     }
+   g_fileNote = now;
+   Log(msg + " - the state is still kept in the terminal global variables", true);
+  }
+
+bool WriteStateFile()
+  {
+   if(g_tester || g_stateLogin <= 0)
+      return false;
+   string fn = StateFileName(g_stateLogin);
+   string tmp = fn + ".tmp";
+   string s = "# GreatestTrader EA state: mirror of the terminal global variables " + g_gvPrefix + "*\r\n";
+   s += "# saved " + TimeToString(TimeLocal(), TIME_DATE | TIME_SECONDS) + " (local time)\r\n";
+   s += "login=" + IntegerToString(g_stateLogin) + "\r\n";
+   for(int i = 0; i < ArraySize(g_gvKey); i++)
+      s += g_gvKey[i] + "=" + DoubleToString(g_gvVal[i], 8) + "\r\n";
+   ResetLastError();
+   int h = FileOpen(tmp, FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE)
+     {
+      StateFileProblem(StringFormat("state file %s cannot be written (error %d)", tmp, GetLastError()));
+      return false;
+     }
+   uint written = FileWriteString(h, s);
+   FileClose(h);
+   if(written == 0)
+     {
+      StateFileProblem(StringFormat("state file %s cannot be written (error %d)", tmp, GetLastError()));
+      FileDelete(tmp);
+      return false;
+     }
+   ResetLastError();
+   if(!FileMove(tmp, 0, fn, FILE_REWRITE))
+     {
+      StateFileProblem(StringFormat("state file %s cannot be replaced (error %d)", fn, GetLastError()));
+      FileDelete(tmp);
+      return false;
+     }
+   g_fileDirty = false;
+   return true;
+  }
+
+// a key of the state file: lower-case letters and digits only
+bool IsStateKey(const string k)
+  {
+   int n = StringLen(k);
+   if(n < 1 || n > 20)
+      return false;
+   for(int i = 0; i < n; i++)
+     {
+      ushort c = StringGetCharacter(k, i);
+      if(!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
+         return false;
+     }
+   return true;
+  }
+
+// a value of the state file: optional '-', digits, at most one '.'
+bool IsStateNumber(const string v)
+  {
+   int n = StringLen(v);
+   int start = (n > 0 && StringGetCharacter(v, 0) == '-') ? 1 : 0;
+   int digits = 0, dots = 0;
+   for(int i = start; i < n; i++)
+     {
+      ushort c = StringGetCharacter(v, i);
+      if(c >= '0' && c <= '9')
+         digits++;
+      else
+         if(c == '.')
+            dots++;
+         else
+            return false;
+     }
+   return (digits > 0 && dots <= 1);
+  }
+
+// the global variables of the account are missing (4-week expiry or deleted): restores them from the state file of
+// the same login, before LoadState. Returns true when restored.
+bool RestoreStateFile(const long login)
+  {
+   string fn = StateFileName(login);
+   if(!FileIsExist(fn))
+      return false;
+   ResetLastError();
+   int h = FileOpen(fn, FILE_READ | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE)
+     {
+      Log(StringFormat("the terminal global variables %s* are missing and the state file %s cannot be read (error "
+                       "%d): the EA starts with a fresh state", g_gvPrefix, fn, GetLastError()), true);
+      return false;
+     }
+   string keys[];
+   double vals[];
+   int n = 0;
+   long fileLogin = -1;
+   bool hasPeak = false;
+   string saved = "?";
+   while(!FileIsEnding(h))
+     {
+      string line = FileReadString(h);
+      StringTrimLeft(line);
+      StringTrimRight(line);
+      if(StringLen(line) == 0)
+         continue;
+      if(StringGetCharacter(line, 0) == '#')
+        {
+         if(StringFind(line, "# saved ") == 0)
+            saved = StringSubstr(line, 8);
+         continue;
+        }
+      int p = StringFind(line, "=");
+      if(p <= 0)
+         continue;
+      string k = StringSubstr(line, 0, p);
+      string v = StringSubstr(line, p + 1);
+      if(k == "login")
+        {
+         fileLogin = StringToInteger(v);
+         continue;
+        }
+      if(!IsStateKey(k) || !IsStateNumber(v) || n >= 200)
+         continue;
+      ArrayResize(keys, n + 1);
+      ArrayResize(vals, n + 1);
+      keys[n] = k;
+      vals[n] = StringToDouble(v);
+      if(k == "peak")
+         hasPeak = true;
+      n++;
+     }
+   FileClose(h);
+   if(fileLogin != login || !hasPeak)
+     {
+      Log(StringFormat("state file %s ignored (account %s, peak %s): the EA starts with a fresh state", fn,
+                       IntegerToString(fileLogin), hasPeak ? "present" : "missing"), true);
+      return false;
+     }
+   for(int i = 0; i < n; i++)
+      GlobalVariableSet(g_gvPrefix + keys[i], vals[i]);
+   GlobalVariablesFlush();
+   Log(StringFormat("state RESTORED from MQL5\\Files\\%s (saved %s, %d values): the terminal global variables %s* "
+                    "were missing (MT5 deletes them 4 weeks after their last access, or they were deleted). To start "
+                    "with a fresh state, delete this file as well.", fn, saved, n, g_gvPrefix), true);
+   return true;
   }
 
 void SaveState(const bool force = false)
@@ -435,7 +668,10 @@ void SaveState(const bool force = false)
    datetime now = TimeLocal();
    g_gvRefresh = (force || now >= g_gvRefreshAt);
    if(g_gvRefresh)
+     {
       g_gvRefreshAt = now + 3600;
+      g_fileDirty = true;   // the state file is rewritten at the full refresh too (deleted by hand meanwhile?)
+     }
    GVPut("peak", g_peak);
    GVPut("day", (double)g_day);
    GVPut("dayeq", g_dayStartEq);
@@ -455,9 +691,26 @@ void SaveState(const bool force = false)
       // only a primed cursor is persisted: a restart before the first-run priming primes again
       GVPut("flowtk", (double)g_flowTicket);   // deal tickets are far below 2^53: exact in a double
       GVPut("flowtm", (double)g_flowScan);
+      if(g_refKnown)
+        {
+         // the reconciliation reference: a restart reconciles against it like a running cycle
+         GVPut("flowmref", g_moneyRef);
+         GVPut("flowdref", (double)g_dealRef);
+         GVPut("flowdtm", (double)g_dealRefTime);
+        }
+      int na = ArraySize(g_absAmt);
+      GVPut("absn", (double)na);
+      for(int i = 0; i < na; i++)
+        {
+         GVPut("absa" + IntegerToString(i), g_absAmt[i]);
+         GVPut("abst" + IntegerToString(i), (double)g_absTime[i]);
+        }
      }
    if(g_clkHave)
+     {
       GVPut("clkoff", (double)g_clkOffset);
+      GVPut("clkny7", g_clkNY7 ? 1.0 : 0.0);
+     }
    GVPut("ddalert", (double)g_ddAlertDay);
    GVPut("rsthalt", g_resetHaltDone ? 1.0 : 0.0);
    g_gvRefresh = false;
@@ -469,6 +722,8 @@ void SaveState(const bool force = false)
       g_lastFlush = now;
       g_stateDirty = false;
       g_gvWritten = false;
+      if(g_fileDirty)
+         WriteStateFile();   // the 4-week-expiry mirror, at most as often as the global variables are flushed
      }
   }
 
@@ -488,9 +743,16 @@ void ResetStateVars()
    g_adaptMult = 1.0;
    g_flowTicket = 0;
    g_flowScan = 0;
-   g_allTicket = 0;
-   g_lastBalCred = 0.0;
+   g_refKnown = false;
+   g_moneyRef = 0.0;
+   g_dealRef = 0;
+   g_dealRefTime = 0;
+   ArrayResize(g_absAmt, 0);
+   ArrayResize(g_absTime, 0);
    g_pendingSince = 0;
+   g_pendingWin = 0;
+   g_firstRecon = true;
+   g_histBad = false;
    g_flowPending = false;
    g_flowPrimed = true;
    g_primeStart = 0;
@@ -502,6 +764,7 @@ void ResetStateVars()
    g_primeTry = 0;
    g_clkHave = false;
    g_clkOffset = 0;
+   g_clkNY7 = false;
    g_ddAlertDay = 0;
    g_resetHaltDone = false;
    g_resetDue = false;
@@ -549,6 +812,33 @@ void LoadState()
       g_flowTicket = (ulong)GlobalVariableGet(g_gvPrefix + "flowtk");
    if(GlobalVariableCheck(g_gvPrefix + "flowtm"))
       g_flowScan = (datetime)GlobalVariableGet(g_gvPrefix + "flowtm");
+   // reconciliation reference (missing in a state of an earlier 1.2 build: taken from the first read, no priming)
+   if(GlobalVariableCheck(g_gvPrefix + "flowmref") && GlobalVariableCheck(g_gvPrefix + "flowdref"))
+     {
+      g_moneyRef = GlobalVariableGet(g_gvPrefix + "flowmref");
+      g_dealRef = (ulong)GlobalVariableGet(g_gvPrefix + "flowdref");
+      if(GlobalVariableCheck(g_gvPrefix + "flowdtm"))
+         g_dealRefTime = (datetime)GlobalVariableGet(g_gvPrefix + "flowdtm");
+      g_refKnown = true;
+     }
+   if(GlobalVariableCheck(g_gvPrefix + "absn"))
+     {
+      int na = (int)GlobalVariableGet(g_gvPrefix + "absn");
+      if(na > GT_ABSORB_MAX)
+         na = GT_ABSORB_MAX;
+      for(int i = 0; i < na; i++)
+        {
+         string an = g_gvPrefix + "absa" + IntegerToString(i);
+         string tn = g_gvPrefix + "abst" + IntegerToString(i);
+         if(!GlobalVariableCheck(an) || !GlobalVariableCheck(tn))
+            break;
+         int k = ArraySize(g_absAmt);
+         ArrayResize(g_absAmt, k + 1);
+         ArrayResize(g_absTime, k + 1);
+         g_absAmt[k] = GlobalVariableGet(an);
+         g_absTime[k] = (datetime)GlobalVariableGet(tn);
+        }
+     }
    if(GlobalVariableCheck(g_gvPrefix + "clkoff"))
      {
       long off = (long)MathRound(GlobalVariableGet(g_gvPrefix + "clkoff"));
@@ -556,6 +846,15 @@ void LoadState()
         {
          g_clkOffset = off;
          g_clkHave = true;
+         if(GlobalVariableCheck(g_gvPrefix + "clkny7"))
+            g_clkNY7 = (GlobalVariableGet(g_gvPrefix + "clkny7") > 0.5);
+         else
+           {
+            // state of an earlier build (a number only): an offset equal to the current NY7 offset is the NY7 rule
+            datetime srv = TimeCurrent();
+            long ny7 = (srv > 0) ? NY7Offset(srv) : (long)(IsUSDST(TimeGMT()) ? 3 : 2) * 3600;
+            g_clkNY7 = (off == ny7);
+           }
         }
      }
    if(GlobalVariableCheck(g_gvPrefix + "ddalert"))
@@ -654,8 +953,19 @@ void UpdateEquityState(const double eq, const datetime nowSrv)
       return;   // an equity reading of 0 (terminal not ready) must never set a halt, a stop or a baseline
    if(eq > g_peak)
       g_peak = eq;
-   datetime mkt = ServerToMarket(nowSrv);
-   datetime mday = DayStart(mkt);
+   datetime mday = DayStart(ServerToMarket(nowSrv));
+   MqlDateTime ms;
+   TimeToStruct(mday, ms);
+   if(ms.day_of_week == 0 || ms.day_of_week == 6)
+     {
+      // market days are Monday to Friday (shared rule with the Python engine): a Saturday / Sunday market date
+      // (an unconfirmed broker clock change around a DST switch, weekend quotes) keeps the current market day and
+      // month - no daily summary, daily equity point or day-stop reference for a weekend day
+      if(g_day != 0)
+         mday = g_day;
+      else
+         mday -= (ms.day_of_week == 6 ? 1 : 2) * 86400;   // first run on a weekend: the Friday before
+     }
    if(mday != g_day)
      {
       if(g_day != 0 && g_lastEq > 0.0)
@@ -690,7 +1000,7 @@ void UpdateEquityState(const double eq, const datetime nowSrv)
       g_stateDirty = true;
      }
    g_lastEq = eq;
-   datetime mmon = MonthStart(mkt);
+   datetime mmon = MonthStart(mday);
    if(mmon != g_month)
      {
       g_month = mmon;
@@ -922,37 +1232,87 @@ bool HasESPosition()
    return false;
   }
 
+// own position without a stop loss: pushed per ticket, at most every GT_REPEAT_SEC (Python key nosl-<ticket>)
+void NoSLNotice(const ulong tk, const string sym, const long magic)
+  {
+   datetime now = TimeLocal();
+   int n = ArraySize(g_noSLTk);
+   int idx = -1;
+   for(int i = 0; i < n; i++)
+      if(g_noSLTk[i] == tk)
+         idx = i;
+   if(idx >= 0 && Secs(now, g_noSLNote[idx]) < GT_REPEAT_SEC && Secs(now, g_noSLNote[idx]) >= 0)
+     {
+      if(InpVerbose)
+         Log(StringFormat("%s ticket=%s has no stop loss: open risk treated as unlimited", sym, IntegerToString((long)tk)));
+      return;
+     }
+   if(idx < 0)
+     {
+      idx = n;
+      ArrayResize(g_noSLTk, n + 1);
+      ArrayResize(g_noSLNote, n + 1);
+      g_noSLTk[idx] = tk;
+     }
+   g_noSLNote[idx] = now;
+   Log(StringFormat("%s %s ticket=%s has NO stop loss: open risk counts as unlimited, the total-risk cap blocks new "
+                    "entries until it has a stop or is closed", (magic == InpNRMagic) ? "NR" : "ES", sym,
+                    IntegerToString((long)tk)), true);
+  }
+
+// remaining risk (entry to stop, account currency) of the own positions; fail closed: a position without a stop
+// loss or whose risk cannot be priced counts as unlimited and fills the total-risk cap
 double OpenRiskTotal()
   {
    double total = 0.0;
+   bool unlimited = false;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong tk = PositionGetTicket(i);
       if(tk == 0)
          continue;
-      if(!IsOurMagic(PositionGetInteger(POSITION_MAGIC)))
+      long magic = PositionGetInteger(POSITION_MAGIC);
+      if(!IsOurMagic(magic))
          continue;
+      string sym = PositionGetString(POSITION_SYMBOL);
       int dir = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
       double op = PositionGetDouble(POSITION_PRICE_OPEN);
       double sl = PositionGetDouble(POSITION_SL);
+      double vol = PositionGetDouble(POSITION_VOLUME);
       if(sl <= 0.0)
         {
-         // fail closed: an own position without a stop loss has unlimited risk and fills the total-risk cap
-         Log("open position without stop loss on " + PositionGetString(POSITION_SYMBOL) + ": open risk treated as unlimited");
-         return 1e300;
+         NoSLNotice(tk, sym, magic);
+         unlimited = true;
+         continue;
         }
       if((dir > 0 && sl >= op) || (dir < 0 && sl <= op))
          continue;   // stop at or beyond the entry price: no remaining risk
-      double l = LossPerLot(PositionGetString(POSITION_SYMBOL), dir, op, sl);
+      double l = LossPerLot(sym, dir, op, sl);
       if(l <= 0.0)
         {
-         // fail closed: a position whose risk cannot be priced fills the total-risk cap
-         Log("cannot price open risk of " + PositionGetString(POSITION_SYMBOL) + ": treated as unlimited");
-         return 1e300;
+         Log("cannot price open risk of " + sym + ": treated as unlimited");
+         unlimited = true;
+         continue;
         }
-      total += l * PositionGetDouble(POSITION_VOLUME);
+      total += l * vol;
      }
-   return total;
+   return unlimited ? 1e300 : total;
+  }
+
+// an own position without a stop loss while the total-risk cap is on (it blocks every new entry): status texts
+bool NoSLBlocks()
+  {
+   if(InpMaxTotalRisk <= 0.0)
+      return false;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0)
+         continue;
+      if(IsOurMagic(PositionGetInteger(POSITION_MAGIC)) && PositionGetDouble(POSITION_SL) <= 0.0)
+         return true;
+     }
+   return false;
   }
 
 // number of open positions that are long (sign=+1) or short (sign=-1) the currency ccy
@@ -1325,12 +1685,18 @@ void DropFail(const int i)
    ArrayRemove(g_failNote, i, 1);
   }
 
-// once per cycle: forget back-off entries of positions that no longer exist
+// once per cycle: forget back-off entries and no-SL notices of positions that no longer exist
 void PruneFails()
   {
    for(int i = ArraySize(g_failTk) - 1; i >= 0; i--)
       if(!PositionSelectByTicket(g_failTk[i]))
          DropFail(i);
+   for(int i = ArraySize(g_noSLTk) - 1; i >= 0; i--)
+      if(!PositionSelectByTicket(g_noSLTk[i]))
+        {
+         ArrayRemove(g_noSLTk, i, 1);
+         ArrayRemove(g_noSLNote, i, 1);
+        }
   }
 
 // returns true when the position is gone. A failed close is retried with a back-off per ticket (20 s, or 300 s
@@ -1420,12 +1786,42 @@ bool ClosePos(const ulong ticket, const string reason)
 //+------------------------------------------------------------------+
 //| Indicators (computed from closed bars, identical to Python)       |
 //+------------------------------------------------------------------+
-bool NRIndicators(const string sym, MqlRates &last, double &mid, double &upper, double &lower, double &atrv)
+// the newest CLOSED bars of sym, newest first (r[0] = last closed bar; r is not a series array). Live: a bar is
+// closed by TIME (shared rule with the Python engine): once the server time (newest quote of any symbol) has
+// reached its open + its length + GT_BAR_SETTLE_SEC, whether or not this symbol has ticked in the next bar yet (MT5
+// forms a bar only at its first tick), so every pair's just-closed bar is decided in the same cycle, in
+// alphabetical order. Strategy Tester: the bar before the newest one, as before (tester results unchanged).
+// Returns the number of bars in r[].
+int ClosedRates(const string sym, const ENUM_TIMEFRAMES tf, const int count, const datetime nowSrv, MqlRates &r[])
+  {
+   ArrayResize(r, 0);
+   MqlRates a[];
+   ArraySetAsSeries(a, true);
+   int got = g_tester ? CopyRates(sym, tf, 1, count, a) : CopyRates(sym, tf, 0, count + 2, a);
+   if(got <= 0)
+      return 0;
+   int skip = 0;
+   if(!g_tester)
+     {
+      long len = (long)PeriodSeconds(tf);
+      while(skip < got && (long)a[skip].time + len + GT_BAR_SETTLE_SEC > (long)nowSrv)
+         skip++;
+     }
+   int n = got - skip;
+   if(n > count)
+      n = count;
+   ArrayResize(r, n);
+   for(int k = 0; k < n; k++)
+      r[k] = a[skip + k];
+   return n;
+  }
+
+bool NRIndicators(const string sym, const datetime nowSrv, MqlRates &last, double &mid, double &upper, double &lower,
+                  double &atrv)
   {
    MqlRates r[];
-   ArraySetAsSeries(r, true);
    int need = (int)MathMax(InpBBPeriod, InpATRPeriod + 1) + 2;
-   int got = CopyRates(sym, PERIOD_M15, 1, need, r);   // shift 1 = last closed bar
+   int got = ClosedRates(sym, PERIOD_M15, need, nowSrv, r);   // r[0] = last closed bar
    if(got < need)
       return false;
    last = r[0];
@@ -1450,12 +1846,11 @@ bool NRIndicators(const string sym, MqlRates &last, double &mid, double &upper, 
    return true;
   }
 
-double ATRH1(const string sym, const int period)
+double ATRH1(const string sym, const int period, const datetime nowSrv)
   {
    MqlRates r[];
-   ArraySetAsSeries(r, true);
    int need = period + 1;
-   int got = CopyRates(sym, PERIOD_H1, 1, need, r);
+   int got = ClosedRates(sym, PERIOD_H1, need, nowSrv, r);   // r[0] = last closed H1 bar
    if(got < need)
       return -1.0;
    double s = 0.0;
@@ -1574,46 +1969,85 @@ void NRManage(const string sym, const double mid, const datetime nowSrv)
      }
   }
 
-void NREntry(const string sym, const MqlRates &bar, const double mid, const double upper, const double lower,
-             const double atrv, const double eq)
+// NR entry signal of a closed bar with the CURRENT quote: entry window, spread, cost and news filters, band signal,
+// TP on the profitable side outside the stops level. Returns false when there is no signal.
+bool NRSignal(const string sym, const MqlRates &bar, const double mid, const double upper, const double lower,
+              const double atrv, int &dir, double &entry, double &sl, double &tp, double &cost)
   {
+   dir = 0;
    datetime barMkt = ServerToMarket(bar.time);
    if(!InNRWindow(barMkt))
-      return;
+      return false;
    MqlTick tick;
    if(!SymbolInfoTick(sym, tick) || tick.bid <= 0.0 || tick.ask <= 0.0)
-      return;
+      return false;
    double pip = SymPip(sym);
    double spread = (tick.ask - tick.bid) / pip;
    if(spread > InpNRMaxSpreadPips)
-      return;
-   double cost = spread + CommissionPips(sym, tick.ask) + InpNRSlippagePips;
+      return false;
+   cost = spread + CommissionPips(sym, tick.ask) + InpNRSlippagePips;
    if(atrv / pip < InpATRCostMult * cost)
-      return;
+      return false;
    double sd = (InpBBDev > 0.0) ? (upper - mid) / InpBBDev : 0.0;
    if(InpMaxBandZ > 0.0 && sd > 0.0 && MathAbs(bar.close - mid) > InpMaxBandZ * sd)
-      return;
+      return false;
    if(InpMaxBarRangeATR > 0.0 && (bar.high - bar.low) > InpMaxBarRangeATR * atrv)
-      return;
-   int dir = 0;
+      return false;
    if(bar.close > upper)
       dir = -1;
    else
       if(bar.close < lower)
          dir = 1;
    if(dir == 0)
-      return;
+      return false;
    int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
    double point = SymbolInfoDouble(sym, SYMBOL_POINT);
    long stops = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
-   double entry = (dir > 0) ? tick.ask : tick.bid;
-   double sl = NormalizeDouble(entry - dir * InpSLATRMult * atrv, digits);
-   double tp = FavorableTP(dir, entry, mid);
+   entry = (dir > 0) ? tick.ask : tick.bid;
+   sl = NormalizeDouble(entry - dir * InpSLATRMult * atrv, digits);
+   tp = FavorableTP(dir, entry, mid);
    if(tp <= 0.0)
-      return;
+      return false;
    tp = NormalizeDouble(tp, digits);
    if(MathAbs(tp - entry) < (stops + 2) * point)
+      return false;
+   return true;
+  }
+
+// NR entry of symbol g_sym[i] on a closed bar. A signal that an entry gate blocks (broker clock waiting / mismatch,
+// first-run deal history, cash flow pending, deal history unreadable) is deferred, not dropped (shared rule with
+// the Python engine): retried on the next cycles while its bar is fresh (RetryDeferred), with the current quote
+// and every guard checked again.
+void NREntry(const int i, const MqlRates &bar, const double mid, const double upper, const double lower,
+             const double atrv, const double eq, const bool deferred)
+  {
+   string sym = g_sym[i];
+   int dir = 0;
+   double entry = 0.0, sl = 0.0, tp = 0.0, cost = 0.0;
+   if(!NRSignal(sym, bar, mid, upper, lower, atrv, dir, entry, sl, tp, cost))
+     {
+      if(deferred)
+         Log(StringFormat("NR %s deferred signal of the %s bar: no signal any more at the current quote, dropped", sym,
+                          TimeToString(bar.time, TIME_DATE | TIME_MINUTES)));
       return;
+     }
+   string gate;
+   if(!EntryGateOpen(gate))
+     {
+      if(!g_defOn[i] || g_defBar[i].time != bar.time)
+         Log(StringFormat("NR %s signal of the %s bar deferred: %s (retried until %s)", sym,
+                          TimeToString(bar.time, TIME_DATE | TIME_MINUTES), gate,
+                          TimeToString((datetime)((long)bar.time + 900 + GT_FRESH_SEC), TIME_DATE | TIME_SECONDS)));
+      g_defOn[i] = true;
+      g_defBar[i] = bar;
+      g_defMid[i] = mid;
+      g_defUp[i] = upper;
+      g_defLo[i] = lower;
+      g_defAtr[i] = atrv;
+      return;
+     }
+   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   double pip = SymPip(sym);
    double rf = RiskFraction(true, eq) * SymbolMult(sym);
    double rawRisk = eq * rf;
    double lossLot = LossPerLot(sym, dir, entry, sl);
@@ -1652,26 +2086,59 @@ void NREntry(const string sym, const MqlRates &bar, const double mid, const doub
       Log("ORDER FAILED " + desc + ": " + err, true);
   }
 
+// NR signals deferred by an entry gate: retried in symbol (alphabetical) order before the new bars of the cycle,
+// while their bar is fresh (GT_FRESH_SEC after its close); then dropped (logged)
+void RetryDeferred(const datetime nowSrv, const double eq)
+  {
+   for(int i = 0; i < g_nsym; i++)
+     {
+      if(!g_defOn[i])
+         continue;
+      string gate;
+      bool open = EntryGateOpen(gate);
+      if(nowSrv - (g_defBar[i].time + 900) > GT_FRESH_SEC)
+        {
+         g_defOn[i] = false;
+         Log(StringFormat("NR %s signal of the %s bar dropped: not taken within %d s of the bar close (%s)", g_sym[i],
+                          TimeToString(g_defBar[i].time, TIME_DATE | TIME_MINUTES), GT_FRESH_SEC,
+                          open ? "entry gate open, no new check" : gate));
+         continue;
+        }
+      if(!open)
+         continue;   // still blocked: tried again on the next cycle
+      g_defOn[i] = false;
+      Log(StringFormat("NR %s deferred signal of the %s bar: entry gate open again, checking it now", g_sym[i],
+                       TimeToString(g_defBar[i].time, TIME_DATE | TIME_MINUTES)));
+      NREntry(i, g_defBar[i], g_defMid[i], g_defUp[i], g_defLo[i], g_defAtr[i], eq, true);
+     }
+  }
+
 void ProcessNR(const datetime nowSrv, const double eq)
   {
    NRTimeStops(nowSrv);
+   RetryDeferred(nowSrv, eq);
+   // the last closed M15 bar: live by TIME (open + 15 min + GT_BAR_SETTLE_SEC <= server time, see ClosedRates), the
+   // same bar for every pair; Strategy Tester by position (the bar before the newest one), as before
+   datetime lastClosed = Floor15((datetime)((long)nowSrv - GT_BAR_SETTLE_SEC)) - 900;
    for(int i = 0; i < g_nsym; i++)
      {
       string sym = g_sym[i];
-      datetime t1 = iTime(sym, PERIOD_M15, 1);      // open time of last closed bar
+      datetime t1 = g_tester ? iTime(sym, PERIOD_M15, 1) : lastClosed;   // open time of the last closed bar
       if(t1 <= 0 || t1 == g_lastBar[i])
          continue;
       MqlRates bar;
       double mid, upper, lower, atrv;
-      if(!NRIndicators(sym, bar, mid, upper, lower, atrv))
+      if(!NRIndicators(sym, nowSrv, bar, mid, upper, lower, atrv))
          continue;
+      if(bar.time <= g_lastBar[i])
+         continue;   // live: this pair has no bar in the just-closed slot (no tick in it): nothing new
       g_lastBar[i] = bar.time;
       NRManage(sym, mid, nowSrv);
       // entries only on a fresh bar close (avoid acting on stale bars after restarts / data gaps);
       // the same 150 s window as Python (engine.py FRESH_SIGNAL), also for the first bar after a start
       if(nowSrv - (bar.time + 900) > GT_FRESH_SEC)
          continue;
-      NREntry(sym, bar, mid, upper, lower, atrv, eq);
+      NREntry(i, bar, mid, upper, lower, atrv, eq, false);
      }
   }
 
@@ -1711,13 +2178,15 @@ void ProcessES(const datetime nowSrv, const double eq)
       return;   // decide only on a verified broker clock and settled cash flows (the day stays open meanwhile)
    if(HasESPosition())
       return;
+   if(!g_tester && ((long)nowSrv % 3600) < GT_BAR_SETTLE_SEC)
+      return;   // live: the H1 bar that just ended counts as closed GT_BAR_SETTLE_SEC after its end (ClosedRates)
    MqlTick tick;
    if(!SymbolInfoTick(g_esSym, tick) || tick.bid <= 0.0)
       return;
    g_lastESDay = uday;   // one decision per day
    double pip = SymPip(g_esSym);
    double spread = (tick.ask - tick.bid) / pip;
-   double a = ATRH1(g_esSym, InpESATRPeriodH1);
+   double a = ATRH1(g_esSym, InpESATRPeriodH1, nowSrv);
    if(a <= 0.0 || spread > InpESMaxSpreadPips)
      {
       Log(StringFormat("ES: no entry today (spread %.1fp, ATR %.1fp)", spread, a / pip));
@@ -1773,9 +2242,11 @@ bool IsCashFlow(const long dealType)
 
 // first run (no persisted cursor): every deal already in the history counts as seen and is NOT applied - but
 // only once the history looks complete: the deals sum to the balance (credit deals to the credit) within
-// max(1, 0.1%), or the set of cash-flow deals stayed the same for GT_PRIME_STABLE_SEC. After GT_PRIME_MAX_SEC
-// the cursor is primed anyway (warning). Until then new entries wait; closes, stops and the guards keep working.
-// Returns true when the cursor is primed. Live only (shared contract with the Python engine).
+// max(1, 0.1%), or the set of cash-flow deals stayed the same for GT_PRIME_STABLE_SEC (an empty set while balance
+// or credit is not zero never counts). After GT_PRIME_MAX_SEC the cursor is primed anyway. Priming without matching
+// sums is notified (warning). Until then new entries wait; closes, stops and the guards keep working. The read
+// becomes the reconciliation reference (balance + credit, newest deal). Returns true when the cursor is primed.
+// Live only (shared contract with the Python engine).
 bool TryPrimeFlowCursor()
   {
    if(g_flowPrimed)
@@ -1787,6 +2258,7 @@ bool TryPrimeFlowCursor()
       return false;
    g_primeTry = now;
    bool late = (Secs(now, g_primeStart) >= GT_PRIME_MAX_SEC);
+   double bc0 = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT);
    if(!HistorySelect(0, GT_FAR_FUTURE))
      {
       if(late && (g_primeNote == 0 || Secs(now, g_primeNote) >= GT_REPEAT_SEC || Secs(now, g_primeNote) < 0))
@@ -1798,6 +2270,7 @@ bool TryPrimeFlowCursor()
      }
    int n = HistoryDealsTotal();
    ulong mx = 0;
+   datetime mxTime = 0;
    double sumBal = 0.0;
    double sumCred = 0.0;
    int nCash = 0;
@@ -1809,7 +2282,10 @@ bool TryPrimeFlowCursor()
       if(tk == 0)
          continue;
       if(tk > mx)
+        {
          mx = tk;
+         mxTime = (datetime)HistoryDealGetInteger(tk, DEAL_TIME);
+        }
       long type = HistoryDealGetInteger(tk, DEAL_TYPE);
       double amt = HistoryDealGetDouble(tk, DEAL_PROFIT) + HistoryDealGetDouble(tk, DEAL_COMMISSION) +
                    HistoryDealGetDouble(tk, DEAL_SWAP) + HistoryDealGetDouble(tk, DEAL_FEE);
@@ -1826,6 +2302,8 @@ bool TryPrimeFlowCursor()
      }
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
    double cred = AccountInfoDouble(ACCOUNT_CREDIT);
+   if(MathAbs(bal + cred - bc0) >= 0.005)
+      return false;   // a deal was booked during the read: tried again (the read and the balance must agree)
    bool sums = (MathAbs(sumBal - bal) <= MathMax(1.0, 0.001 * MathAbs(bal)) &&
                 MathAbs(sumCred - cred) <= MathMax(1.0, 0.001 * MathAbs(cred)));
    bool same = (g_primeRefAt != 0 && nCash == g_primeRefN && cashSum == g_primeRefSum && cashXor == g_primeRefXor);
@@ -1837,14 +2315,19 @@ bool TryPrimeFlowCursor()
       g_primeRefSum = cashSum;
       g_primeRefXor = cashXor;
      }
-   bool stable = (same && Secs(now, g_primeRefAt) >= GT_PRIME_STABLE_SEC);
+   // an EMPTY set of cash deals while balance or credit is non-zero is never a complete history (no 'stable')
+   bool emptyCash = (nCash == 0 && (MathAbs(bal) >= 0.005 || MathAbs(cred) >= 0.005));
+   bool stable = (same && !emptyCash && Secs(now, g_primeRefAt) >= GT_PRIME_STABLE_SEC);
    if(!sums && !stable && !late)
       return false;
    g_flowTicket = mx;
-   g_allTicket = mx;
    g_flowScan = TimeCurrent();
    g_flowPrimed = true;
-   g_lastBalCred = 0.0;   // the first scan (same cycle) takes balance + credit as the reference
+   // the reconciliation reference: this read (balance + credit read after it, newest deal of any type)
+   g_moneyRef = bal + cred;
+   g_dealRef = mx;
+   g_dealRefTime = (mx > 0 && mxTime > 0) ? mxTime : TimeCurrent();
+   g_refKnown = true;
    g_pendingSince = 0;
    g_stateDirty = true;
    string how = "NOT confirmed";
@@ -1855,70 +2338,232 @@ bool TryPrimeFlowCursor()
          how = StringFormat("cash-flow deals unchanged for %d s", GT_PRIME_STABLE_SEC);
    Log(StringFormat("cash-flow tracking started: %d existing deals marked as seen (cursor #%s, %s)", n,
                     IntegerToString((long)mx), how));
-   if(!sums && !stable)
-      Log(StringFormat("WARNING: the deal history was not confirmed complete within %d min (deals sum to %.2f, "
-                       "balance %.2f; credit deals %.2f, credit %.2f). Existing deals are marked as seen anyway: a "
-                       "deposit or withdrawal that reaches the history later is treated as a new cash flow.",
-                       GT_PRIME_MAX_SEC / 60, sumBal, bal, sumCred, cred), true);
+   if(!sums)
+      Log(StringFormat("WARNING: the deal history was not confirmed complete (%s; deals sum to %.2f, balance %.2f; "
+                       "credit deals %.2f, credit %.2f). Existing deals are marked as seen anyway: a deposit or "
+                       "withdrawal that reaches the history later is checked against the balance like any new deal.",
+                       stable ? StringFormat("cash-flow deals unchanged for %d s", GT_PRIME_STABLE_SEC) :
+                       StringFormat("not within %d min", GT_PRIME_MAX_SEC / 60), sumBal, bal, sumCred, cred), true);
    return true;
   }
 
-// sums new cash-flow deals (ticket > cursor). Returns true when the history holds any deal newer than the
-// newest one seen before (the balance change is explained).
-bool ScanDeals(double &flow, int &count)
+// effect of a deal on balance + credit (a CREDIT deal moves the credit)
+double DealEffect(const ulong tk)
   {
-   flow = 0.0;
-   count = 0;
-   datetime base = (g_flowScan > 0) ? g_flowScan : TimeCurrent();
-   long fromL = (long)base - 2 * 86400;          // overlap; de-duplicated by ticket
+   return HistoryDealGetDouble(tk, DEAL_PROFIT) + HistoryDealGetDouble(tk, DEAL_COMMISSION) +
+          HistoryDealGetDouble(tk, DEAL_SWAP) + HistoryDealGetDouble(tk, DEAL_FEE);
+  }
+
+// the deals (any type) newer than the reconciliation reference deal, oldest first (time, then ticket). The window
+// starts 1 day before the reference deal's time (at least the last 2 days); without a reference (state of an
+// earlier 1.2 build) 2 days before the last read. Returns false when the deal history cannot be read.
+bool ReadNewDeals(ulong &tk[], long &type[], double &eff[], datetime &tm[])
+  {
+   ArrayResize(tk, 0);
+   ArrayResize(type, 0);
+   ArrayResize(eff, 0);
+   ArrayResize(tm, 0);
+   long fromL = (long)TimeCurrent() - 2 * 86400;
+   if(g_refKnown)
+     {
+      if((long)g_dealRefTime - 86400 < fromL)
+         fromL = (long)g_dealRefTime - 86400;
+     }
+   else
+      if(g_flowScan > 0 && (long)g_flowScan - 2 * 86400 < fromL)
+         fromL = (long)g_flowScan - 2 * 86400;
    if(fromL < 0)
       fromL = 0;
    if(!HistorySelect((datetime)fromL, GT_FAR_FUTURE))
       return false;
-   bool fresh = false;
-   ulong maxFlow = g_flowTicket;
    int n = HistoryDealsTotal();
+   int m = 0;
    for(int i = 0; i < n; i++)
      {
-      ulong tk = HistoryDealGetTicket(i);
-      if(tk == 0)
+      ulong t = HistoryDealGetTicket(i);
+      if(t == 0 || (g_refKnown && t <= g_dealRef))
          continue;
-      if(tk > g_allTicket)
+      datetime dt = (datetime)HistoryDealGetInteger(t, DEAL_TIME);
+      ArrayResize(tk, m + 1);
+      ArrayResize(type, m + 1);
+      ArrayResize(eff, m + 1);
+      ArrayResize(tm, m + 1);
+      int j = m;
+      while(j > 0 && (tm[j - 1] > dt || (tm[j - 1] == dt && tk[j - 1] > t)))
         {
-         g_allTicket = tk;
-         fresh = true;
+         tk[j] = tk[j - 1];
+         type[j] = type[j - 1];
+         eff[j] = eff[j - 1];
+         tm[j] = tm[j - 1];
+         j--;
         }
-      if(tk <= g_flowTicket)
-         continue;
-      if(!IsCashFlow(HistoryDealGetInteger(tk, DEAL_TYPE)))
-         continue;
-      flow += HistoryDealGetDouble(tk, DEAL_PROFIT);
-      count++;
-      if(tk > maxFlow)
-         maxFlow = tk;
+      tk[j] = t;
+      type[j] = HistoryDealGetInteger(t, DEAL_TYPE);
+      eff[j] = DealEffect(t);
+      tm[j] = dt;
+      m++;
      }
-   g_flowTicket = maxFlow;
-   g_flowScan = TimeCurrent();
-   return fresh;
+   return true;
   }
 
-// keeps the newest deal ticket of any type current while the balance does not change, so that "a new deal" in
-// HandleCashFlows means one booked since the previous cycle (an entry deal booked an hour ago, which does not
-// change the balance, must not explain a later deposit or withdrawal)
-void TrackNewestDeal()
+// absorbed records (changes counted as profit / loss at the pending limit) are kept GT_ABSORB_KEEP_SEC
+void PruneAbsorbed()
   {
-   long fromL = (long)TimeCurrent() - 2 * 86400;
-   if(fromL < 0)
-      fromL = 0;
-   if(!HistorySelect((datetime)fromL, GT_FAR_FUTURE))
-      return;
-   int n = HistoryDealsTotal();
-   for(int i = 0; i < n; i++)
+   long nowL = (long)TimeCurrent();
+   for(int i = ArraySize(g_absAmt) - 1; i >= 0; i--)
+      if(nowL - (long)g_absTime[i] > GT_ABSORB_KEEP_SEC)
+        {
+         ArrayRemove(g_absAmt, i, 1);
+         ArrayRemove(g_absTime, i, 1);
+         g_stateDirty = true;
+        }
+  }
+
+void AddAbsorbed(const double amt)
+  {
+   PruneAbsorbed();
+   if(ArraySize(g_absAmt) >= GT_ABSORB_MAX)
      {
-      ulong tk = HistoryDealGetTicket(i);
-      if(tk > g_allTicket)
-         g_allTicket = tk;
+      ArrayRemove(g_absAmt, 0, 1);
+      ArrayRemove(g_absTime, 0, 1);
      }
+   int n = ArraySize(g_absAmt);
+   ArrayResize(g_absAmt, n + 1);
+   ArrayResize(g_absTime, n + 1);
+   g_absAmt[n] = amt;
+   g_absTime[n] = TimeCurrent();
+   g_stateDirty = true;
+  }
+
+// new cash deals that each match a different absorbed record (within tol) and, left out of the sum, make the new
+// deals explain the change (within tol per deal left out) are LATE deals of a change already counted as profit /
+// loss: late[] = 1 for them, the matched records are removed (notified). Smallest such set first, earliest deals
+// first; at most 10 candidates (oldest first). Returns false when there is none.
+bool MatchLateDeals(const ulong &tk[], const long &type[], const double &eff[], const datetime &tm[],
+                    const double delta, const double sum, const double tol, int &late[])
+  {
+   int na = ArraySize(g_absAmt);
+   if(na == 0)
+      return false;
+   int cand[];
+   int nc = 0;
+   for(int i = 0; i < ArraySize(tk) && nc < 10; i++)
+     {
+      if(!IsCashFlow(type[i]) || tk[i] <= g_flowTicket)
+         continue;
+      bool fits = false;
+      for(int r = 0; r < na && !fits; r++)
+         if(MathAbs(eff[i] - g_absAmt[r]) <= tol)
+            fits = true;
+      if(!fits)
+         continue;
+      ArrayResize(cand, nc + 1);
+      cand[nc] = i;
+      nc++;
+     }
+   if(nc == 0)
+      return false;
+   int maxSize = (nc < na) ? nc : na;
+   int pick[];
+   ArrayResize(pick, nc);
+   for(int size = 1; size <= maxSize; size++)
+      for(int mask = 1; mask < (1 << nc); mask++)
+        {
+         int bits = 0;
+         for(int b = 0; b < nc; b++)
+            if((mask & (1 << b)) != 0)
+               bits++;
+         if(bits != size)
+            continue;
+         bool ok = true;
+         double sx = 0.0;
+         for(int b = 0; b < nc; b++)
+           {
+            pick[b] = -1;
+            if((mask & (1 << b)) == 0 || !ok)
+               continue;
+            for(int r = 0; r < na && pick[b] < 0; r++)
+              {
+               bool taken = false;
+               for(int q = 0; q < b; q++)
+                  if(pick[q] == r)
+                     taken = true;
+               if(!taken && MathAbs(eff[cand[b]] - g_absAmt[r]) <= tol)
+                  pick[b] = r;
+              }
+            if(pick[b] < 0)
+               ok = false;
+            else
+               sx += eff[cand[b]];
+           }
+         if(!ok || MathAbs(delta - (sum - sx)) > tol * size)
+            continue;
+         int rm[];
+         ArrayResize(rm, na);
+         ArrayInitialize(rm, 0);
+         for(int b = 0; b < nc; b++)
+           {
+            if(pick[b] < 0)
+               continue;
+            late[cand[b]] = 1;
+            rm[pick[b]] = 1;
+            Log(StringFormat("late cash deal #%s %+.2f (booked %s): already counted as profit/loss on %s - not applied "
+                             "again", IntegerToString((long)tk[cand[b]]), eff[cand[b]],
+                             TimeToString(tm[cand[b]], TIME_DATE | TIME_MINUTES),
+                             TimeToString(g_absTime[pick[b]], TIME_DATE | TIME_MINUTES)), true);
+           }
+         for(int r = na - 1; r >= 0; r--)
+            if(rm[r] != 0)
+              {
+               ArrayRemove(g_absAmt, r, 1);
+               ArrayRemove(g_absTime, r, 1);
+              }
+         g_stateDirty = true;
+         return true;
+        }
+   return false;
+  }
+
+// applies the new cash deals newer than the cursor that are not late (one cash flow); the cursor moves past every
+// new cash deal
+void ApplyNewCash(const ulong &tk[], const long &type[], const double &eff[], const int &late[], const double eq)
+  {
+   double flow = 0.0;
+   int count = 0;
+   ulong mx = g_flowTicket;
+   for(int i = 0; i < ArraySize(tk); i++)
+     {
+      if(!IsCashFlow(type[i]) || tk[i] <= g_flowTicket)
+         continue;
+      if(tk[i] > mx)
+         mx = tk[i];
+      if(late[i] != 0)
+         continue;
+      flow += eff[i];
+      count++;
+     }
+   if(count > 0)
+      ApplyCashFlow(flow, count, eq);
+   if(mx != g_flowTicket)
+     {
+      g_flowTicket = mx;
+      g_stateDirty = true;
+     }
+  }
+
+// the reconciliation reference moves to balance + credit 'money' and the newest deal of this read
+void SetFlowReference(const double money, const ulong newest, const datetime newestTime)
+  {
+   if(!g_refKnown || money != g_moneyRef || newest > g_dealRef)
+      g_flowScan = TimeCurrent();   // only when the reference moves (no persisted change while nothing happens)
+   g_moneyRef = money;
+   if(!g_refKnown || newest > g_dealRef)
+     {
+      if(newest > g_dealRef)
+         g_dealRef = newest;
+      g_dealRefTime = (newestTime > 0) ? newestTime : TimeCurrent();
+     }
+   g_refKnown = true;
   }
 
 // rescale every equity baseline by k = E / (E - F) so that the percentage guards (DD scaling, max-DD halt,
@@ -1959,65 +2604,117 @@ void ApplyCashFlow(const double flow, const int count, const double eq)
    Log(StringFormat("CASH FLOW %+.2f detected, guards rebased (%s)", flow, how), true);
   }
 
-// Returns false ("pending") while a balance / credit change is not yet explained by any new deal (trade or cash,
-// newer than the newest deal seen in the previous cycle) in the history: in that cycle the peak is not raised, no
-// halt / month / day stop is evaluated and nothing is
-// opened; closes, time stops and TP management continue. Pending lasts at most GT_FLOW_PENDING_SEC, then the
-// change counts as profit / loss. eq is read again AFTER the deal scan, so that k and this cycle's guards use an
-// equity that contains every flow the scan found. Live only (shared contract with the Python engine).
+// Amount-based reconciliation (shared rule with the Python engine). Every cycle (live only):
+//  1. the deals newer than the reference deal are read (any type); balance + credit M is read before and after
+//     the read: when it moved meanwhile the cycle is pending and decided on the next one
+//  2. reconciled when M - reference money equals the sum of their effects (profit + commission + swap + fee)
+//     within max(0.02, 1e-6 x M): the new cash deals (balance / credit / bonus) are applied as cash flows (k =
+//     E / (E - F), E read after the deal read), trade deals are profit / loss; the reference moves to M and the
+//     newest deal
+//  3. else new cash deals that match a change counted as profit / loss earlier (absorbed record) and, left out,
+//     make the sums agree are late deals of that change: marked as seen, not applied again (notified)
+//  4. else pending (returns false): no peak raise, no halt / month / day stop, no DD alert / day roll, no new
+//     entry; closes, time stops, TP management and stops in force continue. After GT_FLOW_PENDING_SEC (the first
+//     reconciliation after a start: GT_FLOW_START_SEC) the new cash deals are applied and the rest of the change
+//     counts as profit / loss (an absorbed record is kept 7 days, at most GT_ABSORB_MAX)
+// A deal history that cannot be read shows no deal: a changed M is pending with the same limit, an unchanged M
+// needs nothing (new entries wait while the history cannot be read). eq is read again after the deal read.
 bool HandleCashFlows(double &eq)
   {
+   g_histBad = false;
    if(g_tester)
       return true;
    double bc = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT);
-   if(g_lastBalCred != 0.0 && MathAbs(bc - g_lastBalCred) < 0.005)
-     {
-      g_pendingSince = 0;
-      ulong allTk = g_allTicket;
-      TrackNewestDeal();
-      if(MathAbs(AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT) - bc) >= 0.005)
-         g_allTicket = allTk;   // a deal was booked during the read: it explains the change on the next cycle
-      return true;
-     }
-   double flow = 0.0;
-   int count = 0;
-   ulong flowTk0 = g_flowTicket;
-   ulong allTk0 = g_allTicket;
-   datetime scan0 = g_flowScan;
-   bool fresh = ScanDeals(flow, count);
+   ulong tk[];
+   long type[];
+   double eff[];
+   datetime tm[];
+   bool readable = ReadNewDeals(tk, type, eff, tm);
    double eqNow = AccountInfoDouble(ACCOUNT_EQUITY);
-   double bcNow = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT);
-   if(MathAbs(bcNow - bc) >= 0.005)
-     {
-      // a deal was booked while the history was scanned (eq may contain a flow the scan missed): nothing is
-      // applied, the same scan is repeated on the next cycle
-      g_flowTicket = flowTk0;
-      g_allTicket = allTk0;
-      g_flowScan = scan0;
-      return false;
-     }
+   double money = AccountInfoDouble(ACCOUNT_BALANCE) + AccountInfoDouble(ACCOUNT_CREDIT);
+   if(MathAbs(money - bc) >= 0.005)
+      return false;   // a deal was booked during the read: nothing is decided, the read is repeated next cycle
    if(eqNow > 0.0)
       eq = eqNow;
-   if(count > 0)
-      ApplyCashFlow(flow, count, eq);
-   if(fresh || count > 0 || g_lastBalCred == 0.0)
+   if(!readable)
      {
-      g_lastBalCred = bc;
+      g_histBad = true;
+      if(!g_refKnown)
+         return true;   // no reference yet: taken from the first readable read (new entries wait meanwhile)
+     }
+   int n = ArraySize(tk);
+   ulong newest = 0;
+   datetime newestTime = 0;
+   double sum = 0.0;
+   for(int i = 0; i < n; i++)
+     {
+      sum += eff[i];
+      if(tk[i] > newest)
+        {
+         newest = tk[i];
+         newestTime = tm[i];
+        }
+     }
+   int late[];
+   ArrayResize(late, n);
+   if(n > 0)
+      ArrayInitialize(late, 0);
+   if(!g_refKnown)
+     {
+      // state of an earlier 1.2 build (cursor, no reference): the cash deals newer than the cursor are applied
+      // as before and this read becomes the reference (no priming again)
+      ApplyNewCash(tk, type, eff, late, eq);
+      if(newest > g_flowTicket)
+         SetFlowReference(money, newest, newestTime);
+      else
+         SetFlowReference(money, g_flowTicket, 0);
       g_pendingSince = 0;
+      g_firstRecon = false;
+      g_stateDirty = true;
+      Log(StringFormat("cash-flow reference taken: balance + credit %.2f, deal #%s", money,
+                       IntegerToString((long)g_dealRef)));
       return true;
      }
+   PruneAbsorbed();
+   double delta = money - g_moneyRef;
+   double tol = MathMax(0.02, 1e-6 * MathAbs(money));
+   bool ok = (MathAbs(delta - sum) <= tol);
+   if(!ok && readable)
+      ok = MatchLateDeals(tk, type, eff, tm, delta, sum, tol, late);
    datetime now = TimeLocal();
-   if(g_pendingSince == 0)
-      g_pendingSince = now;
-   if(Secs(now, g_pendingSince) > GT_FLOW_PENDING_SEC || Secs(now, g_pendingSince) < 0)
+   if(ok)
      {
-      Log(StringFormat("balance changed by %+.2f without a matching deal in the history: treated as profit/loss",
-                       bc - g_lastBalCred), true);
-      g_lastBalCred = bc;
+      if(g_pendingSince != 0)
+         Log(StringFormat("balance/credit change %+.2f explained by the deal history after %d s", delta,
+                          (int)Secs(now, g_pendingSince)));
+      ApplyNewCash(tk, type, eff, late, eq);
+      SetFlowReference(money, newest, newestTime);
       g_pendingSince = 0;
+      if(readable)
+         g_firstRecon = false;
       return true;
      }
-   return false;
+   if(g_pendingSince == 0 || Secs(now, g_pendingSince) < 0)
+     {
+      g_pendingSince = now;
+      g_pendingWin = g_firstRecon ? GT_FLOW_START_SEC : GT_FLOW_PENDING_SEC;
+      Log(StringFormat("balance/credit changed by %+.2f, the new deals explain %+.2f%s: waiting up to %d s for the "
+                       "matching deal (no stop decision and no new entry meanwhile)", delta, sum,
+                       readable ? "" : " (the deal history cannot be read)", g_pendingWin));
+     }
+   if(Secs(now, g_pendingSince) <= g_pendingWin)
+      return false;
+   // limit reached: the new cash deals are applied, the rest of the change counts as profit / loss
+   ApplyNewCash(tk, type, eff, late, eq);
+   double unexplained = delta - sum;
+   Log(StringFormat("balance/credit changed by %+.2f without a matching deal in the history: treated as profit/loss",
+                    unexplained), true);
+   AddAbsorbed(unexplained);
+   SetFlowReference(money, newest, newestTime);
+   g_pendingSince = 0;
+   if(readable)
+      g_firstRecon = false;   // (an unreadable history keeps the start-up window, as in the Python engine)
+   return true;
   }
 
 //+------------------------------------------------------------------+
@@ -2093,28 +2790,35 @@ bool EntryGateOpen(string &why)
       if(!g_flowPrimed)
          why = "deal history not confirmed complete yet (first run)";
       else
-         if(g_flowPending)
-            why = "balance change not in the deal history yet (cash flow pending)";
+         if(g_histBad)
+            why = "the deal history cannot be read";
+         else
+            if(g_flowPending)
+               why = "balance change not in the deal history yet (cash flow pending)";
    return (why == "");
   }
 
+// AUTO: adopts an observed offset. When it equals the NY7 rule's offset at this moment, the NY7 rule itself is
+// adopted (the clock then follows US DST without a mismatch at each switch, as Python's detect_server_mode);
+// any other offset is kept as a fixed number of seconds
 void AdoptOffset(const long obs, const string how)
   {
    bool had = g_clkHave;
-   long old = g_clkOffset;
+   string old = ClockText();
    g_clkOffset = obs;
    g_clkHave = true;
+   g_clkNY7 = (obs == NY7Offset(TimeCurrent()));
    g_clkVerified = true;
    g_clkBlocked = false;
    g_clkMismatch = 0;
    g_clkCandN = 0;
    g_stateDirty = true;
    if(!had)
-      Log(StringFormat("broker clock measured: server = UTC%+.1f h (AUTO, %s); new entries enabled", obs / 3600.0, how),
-          true);
+      Log(StringFormat("broker clock measured: server = UTC%+.1f h now, clock in use: %s (AUTO, %s); new entries "
+                       "enabled", obs / 3600.0, ClockText(), how), true);
    else
-      Log(StringFormat("broker clock offset changed: UTC%+.1f h -> UTC%+.1f h (AUTO, %s)", old / 3600.0, obs / 3600.0,
-                       how), true);
+      Log(StringFormat("broker clock changed: %s -> %s (server = UTC%+.1f h now; AUTO, %s)", old, ClockText(),
+                       obs / 3600.0, how), true);
   }
 
 void ClockMatch(const long obs)
@@ -2126,10 +2830,12 @@ void ClockMatch(const long obs)
    g_clkMismatch = 0;
    g_clkCandN = 0;
    if(wasBlocked)
-      Log(StringFormat("broker clock matches again (UTC%+.1f h): new entries re-enabled", obs / 3600.0), true);
+      Log(StringFormat("broker clock matches again (UTC%+.1f h, %s): new entries re-enabled", obs / 3600.0,
+                       ClockText()), true);
    else
       if(!wasVerified)
-         Log(StringFormat("broker clock verified: server = UTC%+.1f h (%s)", obs / 3600.0, EnumToString(g_clockMode)));
+         Log(StringFormat("broker clock verified: server = UTC%+.1f h (%s, %s)", obs / 3600.0, EnumToString(g_clockMode),
+                          ClockText()));
   }
 
 // a fresh tick off the half-hour grid is no observation of the broker clock: the PC clock is off. Reported after
@@ -2156,8 +2862,9 @@ void ClockOffGrid(const long diff)
 // one counted observation per minute (the first one at once), only from a fresh tick. Gating of new entries
 // (shared rule with the Python engine, spec section 3):
 //  - AUTO: new entries wait until a valid observation after start-up confirms the clock in use (the adopted /
-//    persisted offset, or the NY7 rule when there is none). A different offset is adopted after GT_CLOCK_CONFIRM
-//    identical observations - the first offset too, unless it matches the NY7 rule.
+//    persisted clock, or the NY7 rule when there is none). A different offset is adopted after GT_CLOCK_CONFIRM
+//    identical observations - the first offset too, unless it matches the NY7 rule. An adopted offset that equals
+//    the NY7 rule's offset at that moment is kept as the NY7 rule (follows US DST), any other as fixed seconds.
 //  - NY7 / Fixed: new entries are allowed from the start.
 //  - every mode: GT_CLOCK_CONFIRM consecutive mismatches that are not adopted block new entries until the clock
 //    matches again.
@@ -2202,8 +2909,8 @@ void CheckClock()
          g_clkCand = obs;
          g_clkCandN = 1;
         }
-      Log(StringFormat("broker clock observation UTC%+.1f h differs from UTC%+.1f h in use (%d/%d identical)",
-                       obs / 3600.0, expected / 3600.0, g_clkCandN, GT_CLOCK_CONFIRM));
+      Log(StringFormat("broker clock observation UTC%+.1f h differs from UTC%+.1f h in use (%s; %d/%d identical)",
+                       obs / 3600.0, expected / 3600.0, ClockText(), g_clkCandN, GT_CLOCK_CONFIRM));
       if(g_clkCandN >= GT_CLOCK_CONFIRM)
         {
          AdoptOffset(obs, IntegerToString(GT_CLOCK_CONFIRM) + " identical observations");
@@ -2316,6 +3023,8 @@ string StatusText()
    string gate;
    if(!EntryGateOpen(gate))
       s += ", entries blocked: " + gate;
+   if(NoSLBlocks())
+      s += ", entries blocked: own position without stop loss";
    if(g_permit == 0)
       s += ", trading blocked";
    if(s == "")
@@ -2406,34 +3115,54 @@ void DailySummary(const double eq)
                     opened, closed, pl, StatusText()), true);
   }
 
-// FX market hours in market time (NY+7): Monday 00:00 to Friday 24:00, without Dec 25 and Jan 1
-bool MarketOpenNow()
+// FX market days in market time (NY+7): Monday to Friday, without Dec 25 and Jan 1
+bool IsMarketDay(const datetime mkt)
   {
-   datetime mkt = UTCToMarket(TimeGMT());
    MqlDateTime s;
    TimeToStruct(mkt, s);
    if(s.day_of_week == 0 || s.day_of_week == 6)
       return false;
-   if((s.mon == 12 && s.day == 25) || (s.mon == 1 && s.day == 1))
-      return false;
-   if(s.day_of_week == 1 && s.hour == 0 && s.min < 30)
-      return false;   // weekly open: some brokers start quoting late
-   return true;
+   return !((s.mon == 12 && s.day == 25) || (s.mon == 1 && s.day == 1));
   }
 
+bool MarketOpenNow()
+  {
+   return IsMarketDay(UTCToMarket(TimeGMT()));
+  }
+
+// local time of 00:00 market time of the current market day when the market was closed the day before (Monday
+// after the weekend, the day after Dec 25 / Jan 1), else 0 (Python _session_open_utc)
+datetime SessionOpenLocal()
+  {
+   datetime mkt = UTCToMarket(TimeGMT());
+   if(IsMarketDay(mkt - 86400))
+      return 0;
+   return (datetime)((long)TimeLocal() - ((long)mkt - (long)DayStart(mkt)));
+  }
+
+// stale-feed watchdog (shared rule with the Python engine): no new quote for GT_STALE_FEED_SEC on a market day,
+// counted from the last advance of the server time (or the start) - but on the first market day after a closed day
+// never from before that day's 00:00 market time, plus GT_SESSION_GRACE_SEC for a late first quote
 void CheckStaleFeed()
   {
    if(g_tester || TerminalInfoInteger(TERMINAL_CONNECTED) == 0)
       return;
    datetime now = TimeLocal();
-   datetime ref = (g_srvAdvAt > g_startLocal) ? g_srvAdvAt : g_startLocal;
+   datetime since = (g_srvAdvAt > g_startLocal) ? g_srvAdvAt : g_startLocal;
+   datetime ref = since;
+   datetime opened = SessionOpenLocal();
+   if(opened != 0 && since < opened)
+     {
+      since = opened;
+      ref = (datetime)((long)opened + GT_SESSION_GRACE_SEC);
+     }
    bool stale = (Secs(now, ref) > GT_STALE_FEED_SEC && MarketOpenNow());
    if(stale)
      {
       if(!g_staleNotified || Secs(now, g_staleNote) >= GT_REPEAT_SEC)
         {
          Log(StringFormat("STALE FEED: no new quote for %d min while the market should be open (last server time %s)",
-                          (int)(Secs(now, ref) / 60), TimeToString(g_lastSrvSeen, TIME_DATE | TIME_MINUTES)), true);
+                          (int)(Secs(now, since) / 60), TimeToString(g_lastSrvSeen, TIME_DATE | TIME_MINUTES)), true);
          g_staleNotified = true;
          g_staleNote = now;
         }
@@ -2611,12 +3340,19 @@ bool EnsureState()
      }
    g_gvPrefix = "GT_" + IntegerToString(login) + "_";
    ArrayResize(g_gvName, 0);
+   ArrayResize(g_gvKey, 0);
    ArrayResize(g_gvVal, 0);
+   ArrayResize(g_gvOk, 0);
    g_gvRefreshAt = 0;
+   g_fileDirty = false;
    ResetStateVars();
    bool flowKnown = false;
    if(!g_tester)
      {
+      g_stateLogin = login;
+      // the global variables of this account are gone (4-week expiry, deleted): the state file restores them
+      if(!GlobalVariableCheck(g_gvPrefix + "peak"))
+         RestoreStateFile(login);
       flowKnown = GlobalVariableCheck(g_gvPrefix + "flowtk");
       LoadState();
      }
@@ -2631,8 +3367,8 @@ bool EnsureState()
      {
       string clk = "none";
       if(g_clkHave)
-         clk = "UTC" + DoubleToString(g_clkOffset / 3600.0, 1) + " h";
-      Log(StringFormat("state loaded (%s*): peak %.2f, DD %.1f%%, halted=%s, month stop=%s, persisted clock offset=%s",
+         clk = g_clkNY7 ? "NY7 rule" : "UTC" + DoubleToString(g_clkOffset / 3600.0, 1) + " h";
+      Log(StringFormat("state loaded (%s*): peak %.2f, DD %.1f%%, halted=%s, month stop=%s, persisted broker clock=%s",
                        g_gvPrefix, g_peak, Drawdown(eq) * 100.0, g_halted ? "yes" : "no", g_monthHalted ? "yes" : "no",
                        clk));
      }
@@ -2737,13 +3473,14 @@ void ProcessAll()
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    if(eq <= 0.0)
       return;
-   // cash flows are detected BEFORE the equity guards of this cycle (eq is read again after the deal scan).
-   // Pending (balance changed, no new deal in the history yet, at most GT_FLOW_PENDING_SEC): no peak raise, no
-   // halt / month / day stop decision and no new entry this cycle; closes, time stops and TP management run.
+   // cash flows are reconciled BEFORE the equity guards of this cycle (eq is read again after the deal read).
+   // Pending (the new deals do not explain the balance / credit change yet, at most GT_FLOW_PENDING_SEC, 300 s
+   // after a start): no peak raise, no halt / month / day stop decision and no new entry this cycle; closes, time
+   // stops and TP management run.
    if(!g_flowPrimed)
       TryPrimeFlowCursor();
    g_flowPending = (g_flowPrimed && !HandleCashFlows(eq));
-   if(g_resetDue && g_flowPrimed && !g_flowPending)
+   if(g_resetDue && g_flowPrimed && !g_flowPending && !g_histBad)
      {
       g_resetDue = false;
       ApplyResetHalt(eq);   // after the first cash-flow scan of the session
@@ -2850,8 +3587,17 @@ int OnInit()
          g_sym[j] = ts;
         }
    ArrayResize(g_lastBar, g_nsym);
+   ArrayResize(g_defOn, g_nsym);
+   ArrayResize(g_defBar, g_nsym);
+   ArrayResize(g_defMid, g_nsym);
+   ArrayResize(g_defUp, g_nsym);
+   ArrayResize(g_defLo, g_nsym);
+   ArrayResize(g_defAtr, g_nsym);
    for(int i = 0; i < g_nsym; i++)
+     {
       g_lastBar[i] = 0;
+      g_defOn[i] = false;
+     }
 
    string eb = InpESSymbol;
    StringToUpper(eb);
