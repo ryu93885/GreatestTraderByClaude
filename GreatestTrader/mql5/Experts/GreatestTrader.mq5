@@ -2024,23 +2024,33 @@ void AddAbsorbed(const double amt)
    g_stateDirty = true;
   }
 
-// new cash deals that each match an absorbed record (within tol) and, left out of the sum, make the new deals
-// explain the change are LATE deals of a change already counted as profit / loss: late[] = 1 for them, the
-// matched records are removed (notified). Smallest such set first. Returns false when there is none.
+// new cash deals that each match a different absorbed record (within tol) and, left out of the sum, make the new
+// deals explain the change (within tol per deal left out) are LATE deals of a change already counted as profit /
+// loss: late[] = 1 for them, the matched records are removed (notified). Smallest such set first, earliest deals
+// first; at most 10 candidates (oldest first). Returns false when there is none.
 bool MatchLateDeals(const ulong &tk[], const long &type[], const double &eff[], const datetime &tm[],
                     const double delta, const double sum, const double tol, int &late[])
   {
    int na = ArraySize(g_absAmt);
+   if(na == 0)
+      return false;
    int cand[];
    int nc = 0;
    for(int i = 0; i < ArraySize(tk) && nc < 10; i++)
-      if(IsCashFlow(type[i]) && tk[i] > g_flowTicket)
-        {
-         ArrayResize(cand, nc + 1);
-         cand[nc] = i;
-         nc++;
-        }
-   if(na == 0 || nc == 0)
+     {
+      if(!IsCashFlow(type[i]) || tk[i] <= g_flowTicket)
+         continue;
+      bool fits = false;
+      for(int r = 0; r < na && !fits; r++)
+         if(MathAbs(eff[i] - g_absAmt[r]) <= tol)
+            fits = true;
+      if(!fits)
+         continue;
+      ArrayResize(cand, nc + 1);
+      cand[nc] = i;
+      nc++;
+     }
+   if(nc == 0)
       return false;
    int maxSize = (nc < na) ? nc : na;
    int pick[];
@@ -2075,7 +2085,7 @@ bool MatchLateDeals(const ulong &tk[], const long &type[], const double &eff[], 
             else
                sx += eff[cand[b]];
            }
-         if(!ok || MathAbs(delta - (sum - sx)) > tol)
+         if(!ok || MathAbs(delta - (sum - sx)) > tol * size)
             continue;
          int rm[];
          ArrayResize(rm, na);
@@ -2291,7 +2301,8 @@ bool HandleCashFlows(double &eq)
    AddAbsorbed(unexplained);
    SetFlowReference(money, newest, newestTime);
    g_pendingSince = 0;
-   g_firstRecon = false;
+   if(readable)
+      g_firstRecon = false;   // (an unreadable history keeps the start-up window, as in the Python engine)
    return true;
   }
 
