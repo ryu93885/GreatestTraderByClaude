@@ -12,6 +12,7 @@ FX 自動売買システム **GreatestTrader v1.2.0（最終モデル）**（目
 | [`GreatestTrader/docs/04_月利年利検証報告書.md`](GreatestTrader/docs/04_月利年利検証報告書.md) | 月利・年利（各年）検証報告書 |
 | [`GreatestTrader/docs/05_安定化改修報告書.md`](GreatestTrader/docs/05_安定化改修報告書.md) | 安定化改修報告書（v1.1：ドローダウン抑制・プリセット） |
 | [`GreatestTrader/docs/06_長期運用評価報告書.md`](GreatestTrader/docs/06_長期運用評価報告書.md) | 長期運用評価報告書（v1.2：長期の再評価・口座規模の上限・運用手順） |
+| [`GreatestTrader/docs/07_実口座環境テスター検証報告書.md`](GreatestTrader/docs/07_実口座環境テスター検証報告書.md) | 実口座環境（XM・Exness）の MT5 テスター検証と推奨モデル（Exness Zero・中核 4 ペア） |
 
 | プリセット | 月利（口座が小さいうち） | 1 万ドルから 15 年（20 ロット上限込み） | 最大 DD | 最悪月 |
 |---|---|---|---|---|
